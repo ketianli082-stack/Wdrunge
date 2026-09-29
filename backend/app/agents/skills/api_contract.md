@@ -1,0 +1,1 @@
+API contract skill: Pydantic models are the source of truth for request validation and OpenAPI. Document SSE event names and payloads explicitly. When backend models change, tell the frontend specialist to regenerate the TypeScript client from backend/openapi.json.
