@@ -177,7 +177,7 @@ def test_batch_delegations_run_concurrently_and_show_public_summaries(monkeypatc
     events = asyncio.run(asyncio.wait_for(collect(), timeout=1))
     mentions = [payload for event, payload in events if event == "chat_message" and "mentions" in payload]
     assert len(mentions) == 1
-    assert mentions[0]["content"] == "@产品 给老板打个招呼\n@后端开发 给老板端茶倒水"
+    assert mentions[0]["content"] == "@顾知微（产品） 给老板打个招呼\n@陆野（后端开发） 给老板端茶倒水"
     assert [item["worker"] for item in mentions[0]["mentions"]] == ["product", "backend"]
     assert [(data["message_id"], data["reader"]) for event, data in events if event == "read_receipt"] == [
         (mentions[0]["id"], "product"), (mentions[0]["id"], "backend")

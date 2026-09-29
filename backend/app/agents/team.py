@@ -13,6 +13,7 @@ from pydantic import ValidationError
 
 from app.agents.base import AgentSpec, AgentStatus
 from app.agents.leader import LeaderAgent
+from app.agents.identity import member_name
 from app.agents.worker import WorkerAgent
 from app.tools.current_utc_time import current_utc_time
 from app.tools.checkpoint_context import ContextCheckpoint, checkpoint_context
@@ -29,35 +30,35 @@ from app.tools._workspace import active_workspace, workspace_root
 
 ROLE_CONFIG = {
     "product": {
-        "name": "产品",
+        "name": member_name("product"),
         "prompt": "product.md",
         "skills": ("requirements.md",),
         "read": ("docs", "README.md", "backend/openapi.json"),
         "write": ("docs/product",),
     },
     "backend": {
-        "name": "后端开发",
+        "name": member_name("backend"),
         "prompt": "backend.md",
         "skills": ("api_contract.md",),
         "read": ("docs", "backend/app", "backend/pyproject.toml", "backend/tests"),
         "write": ("backend/app", "docs/backend"),
     },
     "designer": {
-        "name": "美工",
+        "name": member_name("designer"),
         "prompt": "designer.md",
         "skills": ("visual_design.md",),
         "read": ("docs", "frontend/src", "frontend/public"),
         "write": ("frontend/src", "frontend/public", "docs/design"),
     },
     "frontend": {
-        "name": "前端开发",
+        "name": member_name("frontend"),
         "prompt": "frontend.md",
         "skills": ("api_contract.md",),
         "read": ("docs", "frontend/src", "frontend/public", "backend/openapi.json"),
         "write": ("frontend/src", "docs/frontend"),
     },
     "testing": {
-        "name": "测试",
+        "name": member_name("testing"),
         "prompt": "testing.md",
         "skills": ("test_strategy.md",),
         "read": ("docs", "backend/app", "backend/tests", "frontend/src", "backend/openapi.json"),
@@ -95,7 +96,7 @@ class Team:
     def __init__(self):
         self.leader = LeaderAgent(
             AgentSpec(
-                id="leader", name="Leader", prompt_file="leader.md", tools=(delegate_task, delegate_tasks, checkpoint_context)
+                id="leader", name=member_name("leader"), prompt_file="leader.md", tools=(delegate_task, delegate_tasks, checkpoint_context)
             )
         )
         self.workers: dict[str, WorkerAgent] = {}
