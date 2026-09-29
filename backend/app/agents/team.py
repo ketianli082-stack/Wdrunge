@@ -5,6 +5,7 @@ import logging
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from functools import lru_cache
+from pathlib import Path
 from uuid import uuid4
 
 from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage, ToolMessage
@@ -23,6 +24,7 @@ from app.tools.refresh_api_contract import refresh_api_contract
 from app.tools.refresh_frontend_client import refresh_frontend_client
 from app.tools.run_project_check import run_project_check
 from app.tools.write_project_file import make_write_project_file
+from app.tools._workspace import active_workspace, workspace_root
 
 
 ROLE_CONFIG = {
@@ -136,15 +138,18 @@ class Team:
         return {"total_tokens": sum(member["total_tokens"] for member in members), "agents": members}
 
     async def stream(
-        self, history: list[BaseMessage], *, conversation_id: str | None = None
+        self, history: list[BaseMessage], *, conversation_id: str | None = None,
+        workspace_path: Path | None = None,
     ) -> AsyncIterator[tuple[str, dict]]:
         """Let the Leader reply or function-call specialists as needed."""
         session_id = conversation_id or uuid4().hex
         async with self._lock:
+            token = active_workspace.set(workspace_path.resolve() if workspace_path else None)
             try:
                 async for event in self._run(history, session_id):
                     yield event
             finally:
+                active_workspace.reset(token)
                 for agent in (self.leader, *self.workers.values()):
                     if agent.status == AgentStatus.RUNNING:
                         agent.status = AgentStatus.IDLE
@@ -152,7 +157,7 @@ class Team:
     async def _run(self, history: list[BaseMessage], conversation_id: str) -> AsyncIterator[tuple[str, dict]]:
         self.leader.status = AgentStatus.RUNNING
         yield "status", {"id": "leader", "status": AgentStatus.RUNNING}
-        system = SystemMessage(content=self.leader.system_prompt())
+        system = SystemMessage(content=f"{self.leader.system_prompt()}\n\nCurrent project workspace: {workspace_root().resolve()}. Assignments and project files must stay in this workspace.")
         checkpoint = self._leader_checkpoints.get(conversation_id)
         if checkpoint and checkpoint.history_cutoff < len(history):
             messages: list[BaseMessage] = [
@@ -360,7 +365,7 @@ class Team:
                 assignment.task,
                 conversation_id=conversation_id,
                 context_mode=assignment.context_mode,
-                handoff=assignment.handoff,
+                handoff=f"Project workspace: {workspace_root().resolve()}\n{assignment.handoff}",
             ):
                 if event == "content":
                     output.append(payload["content"])

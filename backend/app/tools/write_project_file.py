@@ -8,7 +8,7 @@ from app.tools._workspace import resolve_allowed
 def make_write_project_file(allowed_roots: tuple[str, ...]):
     @tool("write_project_file")
     def write_project_file(path: str, content: str) -> str:
-        """Write a complete UTF-8 project file at a path relative to the repository root."""
+        """Write a complete UTF-8 project file at a path relative to the selected workspace."""
         target = resolve_allowed(path, allowed_roots)
         if len(content) > 100000:
             return "File is too large; keep content under 100000 characters."

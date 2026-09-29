@@ -54,6 +54,7 @@ class ChatMessage(BaseModel):
 class ChatRequest(BaseModel):
     messages: list[ChatMessage] = Field(min_length=1, max_length=500)
     conversation_id: str | None = Field(default=None, min_length=1, max_length=120)
+    workspace_path: str = Field(min_length=1, max_length=4096)
 
     @model_validator(mode="after")
     def last_message_is_user(self):
@@ -64,6 +65,24 @@ class ChatRequest(BaseModel):
 
 class HealthResponse(BaseModel):
     status: Literal["ok"]
+
+
+class WorkspaceRequest(BaseModel):
+    path: str = Field(min_length=1, max_length=4096)
+
+
+class WorkspaceResponse(BaseModel):
+    path: str
+
+
+def resolve_workspace(path: str) -> Path:
+    candidate = Path(path).expanduser()
+    if not candidate.is_absolute():
+        raise HTTPException(status_code=422, detail="Workspace must be an absolute directory path")
+    resolved = candidate.resolve()
+    if not resolved.is_dir():
+        raise HTTPException(status_code=422, detail="Workspace directory does not exist")
+    return resolved
 
 
 class TeamMemberResponse(BaseModel):
@@ -101,6 +120,11 @@ async def health():
     return HealthResponse(status="ok")
 
 
+@app.post("/api/workspaces/validate", response_model=WorkspaceResponse, tags=["System"])
+async def validate_workspace(body: WorkspaceRequest):
+    return WorkspaceResponse(path=str(resolve_workspace(body.path)))
+
+
 @app.get("/api/team", response_model=TeamStatusResponse, tags=["Agent"])
 async def team_status():
     """List every team member and its current state and capabilities."""
@@ -114,7 +138,8 @@ async def team_status():
     tags=["Agent"],
     summary="Stream a leader-coordinated team response",
     description=(
-        "Send the full conversation, ending with a user message. Supply the same `conversation_id` "
+        "Send the full conversation, ending with a user message, and the absolute `workspace_path` "
+        "selected for this conversation. Supply the same `conversation_id` "
         "to continue worker sessions and Leader checkpoints; omit it for an isolated request. "
         "`status` events report agent state; `chat_message` contains short team updates; "
         "`read_receipt` marks an @mention as read; `activity` describes tool use without arguments; "
@@ -134,6 +159,7 @@ async def chat_stream(
     body: ChatRequest,
     request: Request,
 ):
+    workspace = resolve_workspace(body.workspace_path)
     if not os.getenv("DASHSCOPE_API_KEY"):
         raise HTTPException(status_code=503, detail="DASHSCOPE_API_KEY is not configured")
     team = get_team()
@@ -147,7 +173,7 @@ async def chat_stream(
 
     async def events():
         try:
-            async with aclosing(team.stream(messages, conversation_id=body.conversation_id)) as team_events:
+            async with aclosing(team.stream(messages, conversation_id=body.conversation_id, workspace_path=workspace)) as team_events:
                 async for event, payload in team_events:
                     if await request.is_disconnected():
                         return

@@ -8,7 +8,7 @@ from app.tools._workspace import resolve_allowed
 def make_read_project_file(allowed_roots: tuple[str, ...]):
     @tool("read_project_file")
     def read_project_file(path: str) -> str:
-        """Read a project text file by its path relative to the repository root."""
+        """Read a project text file by its path relative to the selected workspace."""
         target = resolve_allowed(path, allowed_roots)
         if not target.is_file():
             return f"File not found: {path}"

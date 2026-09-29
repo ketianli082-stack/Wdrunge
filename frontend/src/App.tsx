@@ -2,12 +2,14 @@ import { useEffect, useRef, useState, type FormEvent } from "react";
 import {
   getTeamStatus,
   streamChat,
+  validateWorkspace,
   type Activity,
   type ChatMessage,
   type TeamChatMessage,
   type TeamMember,
   type TeamUsage,
 } from "./api";
+import OfficeScene from "./OfficeScene";
 import "./App.css";
 
 type VisibleMessage = TeamChatMessage & { read?: boolean; readBy?: string[]; completedBy?: string[]; time: string };
@@ -15,6 +17,7 @@ type VisibleActivity = Activity & { time: string };
 type Conversation = {
   id: string;
   title: string;
+  workspacePath: string;
   updatedAt: number;
   history: ChatMessage[];
   messages: VisibleMessage[];
@@ -32,20 +35,12 @@ const initialAgents: TeamMember[] = [
   { id: "frontend", name: "前端开发", status: "idle", tools: [], skills: [] },
   { id: "testing", name: "测试", status: "idle", tools: [], skills: [] },
 ];
-const roleNotes: Record<string, string> = {
-  leader: "协调团队与汇总进展",
-  product: "需求与产品设计",
-  backend: "服务与接口实现",
-  designer: "视觉与交互设计",
-  frontend: "页面与前端接入",
-  testing: "验证与质量检查",
-};
 const initials: Record<string, string> = {
   leader: "L", product: "产", backend: "后", designer: "美", frontend: "前", testing: "测", user: "我",
 };
 
 function newConversation(): Conversation {
-  return { id: crypto.randomUUID(), title: "新对话", updatedAt: Date.now(), history: [], messages: [], activities: [] };
+  return { id: crypto.randomUUID(), title: "新对话", workspacePath: "", updatedAt: Date.now(), history: [], messages: [], activities: [] };
 }
 function loadConversations(): Conversation[] {
   try {
@@ -54,7 +49,7 @@ function loadConversations(): Conversation[] {
       return saved.filter((item) =>
         item && typeof item.id === "string" && Array.isArray(item.history)
         && Array.isArray(item.messages) && Array.isArray(item.activities),
-      );
+      ).map((item) => ({ ...item, workspacePath: typeof item.workspacePath === "string" ? item.workspacePath : "" }));
     }
   } catch { /* A damaged local draft starts as a fresh conversation. */ }
   return [];
@@ -88,10 +83,13 @@ function App() {
   const [input, setInput] = useState("");
   const [streaming, setStreaming] = useState(false);
   const [error, setError] = useState("");
+  const [workspaceDialog, setWorkspaceDialog] = useState<"new" | "attach" | null>(null);
+  const [workspaceDraft, setWorkspaceDraft] = useState("");
+  const [workspaceError, setWorkspaceError] = useState("");
+  const [workspaceSaving, setWorkspaceSaving] = useState(false);
   const controller = useRef<AbortController | null>(null);
   const chatFeed = useRef<HTMLDivElement | null>(null);
   const active = conversations.find((item) => item.id === activeId) || conversations[0];
-  const runningCount = agents.filter((agent) => agent.status === "running").length;
   const nameOf = (id: string) => id === "user" ? "你" : agents.find((agent) => agent.id === id)?.name || id;
 
   useEffect(() => {
@@ -120,11 +118,31 @@ function App() {
   }
   function startConversation() {
     if (streaming) return;
-    if (active.messages.length === 0) { setPanel("chat"); return; }
-    const created = newConversation();
-    setConversations((current) => [created, ...current]);
-    setActiveId(created.id);
-    setPanel("chat"); setInput(""); setError("");
+    setWorkspaceDraft(active.workspacePath);
+    setWorkspaceError("");
+    setWorkspaceDialog(active.messages.length === 0 ? "attach" : "new");
+  }
+  async function saveWorkspace(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const path = workspaceDraft.trim();
+    if (!path || workspaceSaving || !workspaceDialog) return;
+    setWorkspaceSaving(true); setWorkspaceError("");
+    try {
+      const validated = await validateWorkspace(path);
+      if (workspaceDialog === "attach") {
+        updateConversation(active.id, (item) => ({ ...item, workspacePath: validated }));
+      } else {
+        const created = { ...newConversation(), workspacePath: validated };
+        setConversations((current) => [created, ...current]);
+        setActiveId(created.id);
+      }
+      setWorkspaceDialog(null);
+      setPanel("chat"); setInput(""); setError("");
+    } catch (cause) {
+      setWorkspaceError(cause instanceof Error ? cause.message : "工作区校验失败");
+    } finally {
+      setWorkspaceSaving(false);
+    }
   }
   function selectConversation(id: string) {
     if (streaming) return;
@@ -136,6 +154,10 @@ function App() {
     event.preventDefault();
     const content = input.trim();
     if (!content || streaming) return;
+    if (!active.workspacePath) {
+      setWorkspaceDraft(""); setWorkspaceError(""); setWorkspaceDialog("attach");
+      return;
+    }
     const sessionId = active.id;
     const requestHistory: ChatMessage[] = [...active.history, { role: "user", content }];
     const replyId = crypto.randomUUID();
@@ -151,7 +173,7 @@ function App() {
     const abort = new AbortController();
     controller.current = abort;
     try {
-      await streamChat(requestHistory, sessionId, {
+      await streamChat(requestHistory, sessionId, active.workspacePath, {
         onDelta: (delta) => {
           reply += delta;
           updateConversation(sessionId, (item) => ({
@@ -211,20 +233,14 @@ function App() {
         <div className="sidebar-label">最近的对话</div>
       </div>
       <nav className="history-list" aria-label="最近的对话">
-        {visibleConversations.map((item) => <button key={item.id} className={`history-item ${item.id === activeId ? "selected" : ""}`} onClick={() => selectConversation(item.id)} disabled={streaming} title={item.title}><span className="history-icon">◻</span><span>{item.title}</span></button>)}
+        {visibleConversations.map((item) => <button key={item.id} className={`history-item ${item.id === activeId ? "selected" : ""}`} onClick={() => selectConversation(item.id)} disabled={streaming} title={`${item.title}${item.workspacePath ? ` · ${item.workspacePath}` : " · 未设置工作区"}`}><span className="history-icon">◻</span><span>{item.title}</span></button>)}
         {visibleConversations.length === 0 && <p className="history-empty">没有匹配的对话</p>}
       </nav>
       <div className="sidebar-foot"><span className="foot-mark">W</span><span>Agent 团队<small>{agents.length} 位成员已就位</small></span></div>
     </aside>
 
     <section className="office" aria-label="Agent 办公室">
-      <header className="office-header"><span>Agent 办公室</span><span className="header-status"><i /> 团队在线</span></header>
-      <div className="office-content">
-        <div className="page-title"><div><span className="eyebrow">WORKSPACE / OFFICE</span><h1>团队办公室</h1><p>所有成员都在这里。Leader 会根据你的消息安排工作。</p></div><div className="online-count"><strong>{runningCount}</strong><span>正在工作</span></div></div>
-        <div className="section-heading"><span>团队工位</span><span>6 位成员</span></div>
-        <div className="desks">{agents.map((agent, index) => <AgentCard key={agent.id} agent={agent} note={roleNotes[agent.id]} index={index + 1} />)}</div>
-        <div className="office-footer"><span className="footer-icon">☷</span><div><strong>实时工作状态</strong><p>群聊查看团队交流；工作日志查看每次工具调用。</p></div></div>
-      </div>
+      <OfficeScene agents={agents} />
     </section>
 
     <aside className="right-rail" aria-label="团队交流与工作日志">
@@ -234,6 +250,7 @@ function App() {
       </div>
       {panel === "chat" ? <section className="chat-panel" role="tabpanel" aria-label="团队群聊">
         <header className="panel-heading"><div><strong>团队群聊</strong><span>Leader · 产品 · 后端 · 美工 · 前端 · 测试</span></div><span className="member-count">6 人</span></header>
+        <div className="workspace-banner"><span title={active.workspacePath}>{active.workspacePath ? `工作区 · ${active.workspacePath}` : "尚未设置工作区"}</span>{(!active.workspacePath || active.history.length === 0) && <button type="button" onClick={() => { setWorkspaceDraft(active.workspacePath); setWorkspaceError(""); setWorkspaceDialog("attach"); }}>{active.workspacePath ? "更改" : "设置工作区"}</button>}</div>
         <div className="chat-feed" ref={chatFeed}>
           {active.messages.length === 0 && <div className="chat-welcome"><span className="welcome-icon">W</span><strong>开始一段对话</strong><p>向 Leader 发送消息。需要协作时，成员会在这里回应。</p></div>}
           {active.messages.map((message) => <article className={`chat-message ${message.sender === "user" ? "mine" : ""}`} key={message.id}>
@@ -248,7 +265,7 @@ function App() {
           </article>)}
           {streaming && <div className="processing"><i /><i /><i /><span>团队正在处理</span></div>}
         </div>
-        <div className="composer-area">{error && <p className="error" role="alert">{error}</p>}<form className="composer" onSubmit={send}><textarea aria-label="发送消息" placeholder="给团队发消息…" value={input} onChange={(event) => setInput(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); event.currentTarget.form?.requestSubmit(); } }} rows={2} /><div className="composer-bottom"><span>Enter 发送 · Shift + Enter 换行</span>{streaming ? <button type="button" onClick={() => controller.current?.abort()} aria-label="停止生成">■</button> : <button type="submit" disabled={!input.trim()} aria-label="发送">↑</button>}</div></form></div>
+        <div className="composer-area">{error && <p className="error" role="alert">{error}</p>}<form className="composer" onSubmit={send}><textarea aria-label="发送消息" placeholder={active.workspacePath ? "给团队发消息…" : "请先设置工作区…"} value={input} onChange={(event) => setInput(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); event.currentTarget.form?.requestSubmit(); } }} rows={2} /><div className="composer-bottom"><span>Enter 发送 · Shift + Enter 换行</span>{streaming ? <button type="button" onClick={() => controller.current?.abort()} aria-label="停止生成">■</button> : <button type="submit" disabled={!input.trim() || !active.workspacePath} aria-label="发送">↑</button>}</div></form></div>
       </section> : <section className="log-panel" role="tabpanel" aria-label="工作日志">
         <div className="usage-dashboard">
           <div className="usage-total"><span>累计使用</span><strong>{usage.total_tokens.toLocaleString()}</strong><small>TOKENS</small></div>
@@ -262,15 +279,8 @@ function App() {
         <div className="activity-feed">{active.activities.length === 0 ? <div className="activity-empty">暂无工具调用记录</div> : <ol className="timeline">{[...active.activities].reverse().map((item) => <li key={item.id}><span className={`timeline-dot ${item.phase}`} /><div className="timeline-top"><strong>{nameOf(item.agent)}</strong><time>{item.time}</time></div><p>{item.description}</p><div className="timeline-foot"><code>{item.tool}</code><span className={`activity-phase ${item.phase}`}>{item.phase === "running" ? "进行中" : item.phase === "completed" ? "已完成" : "失败"}</span></div></li>)}</ol>}</div>
       </section>}
     </aside>
+    {workspaceDialog && <div className="workspace-dialog-backdrop" role="presentation"><form className="workspace-dialog" onSubmit={saveWorkspace} role="dialog" aria-modal="true" aria-label="设置工作区"><h2>{workspaceDialog === "new" ? "新建对话" : "设置工作区"}</h2><p>输入本机项目文件夹的绝对路径。团队会在这个目录中读取和修改文件。</p><label htmlFor="workspace-path">工作区目录</label><input id="workspace-path" autoFocus placeholder="/Users/you/Codes/project" value={workspaceDraft} onChange={(event) => setWorkspaceDraft(event.target.value)} />{workspaceError && <p className="workspace-dialog-error" role="alert">{workspaceError}</p>}<div className="workspace-dialog-actions"><button type="button" onClick={() => setWorkspaceDialog(null)} disabled={workspaceSaving}>取消</button><button type="submit" disabled={!workspaceDraft.trim() || workspaceSaving}>{workspaceSaving ? "检查中…" : "使用此工作区"}</button></div></form></div>}
   </main>;
-}
-
-function AgentCard({ agent, note, index }: { agent: TeamMember; note: string; index: number }) {
-  return <article className={`agent-card ${agent.status}`}>
-    <div className="card-top"><span className="desk-number">DESK / {String(index).padStart(2, "0")}</span><span className={`card-status ${agent.status}`}><i />{agent.status}</span></div>
-    <div className="desk-scene" aria-hidden="true"><span className="scene-glow" /><span className="desk-monitor"><i /><i /><i /></span><span className="desk-stand" /><span className="desk-surface"><i className="desk-keyboard" /><i className="desk-mug" /></span></div>
-    <div className="card-center"><span className={`card-avatar avatar-${agent.id}`}>{initials[agent.id] || "·"}</span><div><h3>{agent.name}</h3><p>{note}</p></div></div>
-  </article>;
 }
 
 export default App;

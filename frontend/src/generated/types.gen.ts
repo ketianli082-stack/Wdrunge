@@ -56,6 +56,10 @@ export type ChatRequest = {
      * Conversation Id
      */
     conversation_id?: string | null;
+    /**
+     * Workspace Path
+     */
+    workspace_path: string;
 };
 
 /**
@@ -157,6 +161,26 @@ export type ValidationError = {
     };
 };
 
+/**
+ * WorkspaceRequest
+ */
+export type WorkspaceRequest = {
+    /**
+     * Path
+     */
+    path: string;
+};
+
+/**
+ * WorkspaceResponse
+ */
+export type WorkspaceResponse = {
+    /**
+     * Path
+     */
+    path: string;
+};
+
 export type HealthApiHealthGetData = {
     body?: never;
     path?: never;
@@ -172,6 +196,31 @@ export type HealthApiHealthGetResponses = {
 };
 
 export type HealthApiHealthGetResponse = HealthApiHealthGetResponses[keyof HealthApiHealthGetResponses];
+
+export type ValidateWorkspaceApiWorkspacesValidatePostData = {
+    body: WorkspaceRequest;
+    path?: never;
+    query?: never;
+    url: '/api/workspaces/validate';
+};
+
+export type ValidateWorkspaceApiWorkspacesValidatePostErrors = {
+    /**
+     * Validation Error
+     */
+    422: HttpValidationError;
+};
+
+export type ValidateWorkspaceApiWorkspacesValidatePostError = ValidateWorkspaceApiWorkspacesValidatePostErrors[keyof ValidateWorkspaceApiWorkspacesValidatePostErrors];
+
+export type ValidateWorkspaceApiWorkspacesValidatePostResponses = {
+    /**
+     * Successful Response
+     */
+    200: WorkspaceResponse;
+};
+
+export type ValidateWorkspaceApiWorkspacesValidatePostResponse = ValidateWorkspaceApiWorkspacesValidatePostResponses[keyof ValidateWorkspaceApiWorkspacesValidatePostResponses];
 
 export type TeamStatusApiTeamGetData = {
     body?: never;
