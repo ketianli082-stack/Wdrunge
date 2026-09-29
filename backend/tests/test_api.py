@@ -48,8 +48,9 @@ def test_stream_emits_team_events_and_done(monkeypatch):
             assert history[-1].content == "hello"
             assert conversation_id == "chat-1"
             yield "status", {"id": "leader", "status": "running"}
-            yield "chat_message", {"id": "task1", "sender": "leader", "content": "@后端开发，请接手这部分工作。", "mention": "backend"}
+            yield "chat_message", {"id": "task1", "sender": "leader", "content": "@后端开发 请接手这部分工作。", "mentions": [{"worker": "backend", "name": "后端开发", "summary": "请接手这部分工作。"}]}
             yield "read_receipt", {"message_id": "task1", "reader": "backend"}
+            yield "message_reaction", {"message_id": "task1", "worker": "backend", "reaction": "done"}
             yield "activity", {"id": "tool1", "agent": "backend", "tool": "read_project_file", "description": "读取项目文件", "phase": "completed"}
             yield "delta", {"role": "leader", "content": "任务已完成"}
             yield "status", {"id": "backend", "status": "idle"}
@@ -64,6 +65,7 @@ def test_stream_emits_team_events_and_done(monkeypatch):
     assert response.headers["content-type"].startswith("text/event-stream")
     assert 'event: status\ndata: {"id": "leader", "status": "running"}\n\n' in response.text
     assert 'event: read_receipt\ndata: {"message_id": "task1", "reader": "backend"}\n\n' in response.text
+    assert 'event: message_reaction\ndata: {"message_id": "task1", "worker": "backend", "reaction": "done"}\n\n' in response.text
     assert 'event: delta\ndata: {"role": "leader", "content": "任务已完成"}\n\n' in response.text
     assert "event: activity" in response.text
     assert "event: done\ndata: {}\n\n" in response.text

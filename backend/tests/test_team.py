@@ -113,13 +113,17 @@ def test_leader_dispatches_and_receives_worker_results(monkeypatch):
     monkeypatch.setattr(team.workers["frontend"], "stream", frontend)
     events = run_team(team)
     assert [call[0] for call in calls] == ["designer", "frontend"]
-    mentions = [data for event, data in events if event == "chat_message" and "mention" in data]
-    assert [data["mention"] for data in mentions] == ["designer", "frontend"]
+    mentions = [data for event, data in events if event == "chat_message" and "mentions" in data]
+    assert [[item["worker"] for item in data["mentions"]] for data in mentions] == [["designer"], ["frontend"]]
     assert all("task" not in data for data in mentions)
     assert [data["message_id"] for event, data in events if event == "read_receipt"] == [
         data["id"] for data in mentions
     ]
     assert len({data["id"] for data in mentions}) == 2
+    assert [(data["message_id"], data["worker"]) for event, data in events if event == "message_reaction"] == [
+        (mentions[0]["id"], "designer"), (mentions[1]["id"], "frontend")
+    ]
+    assert not any(event == "chat_message" and data["content"] == "这部分已完成，交给 Leader 汇总。" for event, data in events)
     assert not any(event == "delta" and data.get("role") != "leader" for event, data in events)
     assert [data["tool"] for event, data in events if event == "activity" and data["phase"] == "completed"] == ["delegate_task", "delegate_task"]
     assert ("delta", {"role": "leader", "content": "设计和前端都已完成。"}) in events
@@ -170,10 +174,20 @@ def test_batch_delegations_run_concurrently_and_show_public_summaries(monkeypatc
         return [event async for event in team.stream([HumanMessage(content="请安排两件事")])]
 
     events = asyncio.run(asyncio.wait_for(collect(), timeout=1))
-    mentions = [payload for event, payload in events if event == "chat_message" and "mention" in payload]
-    assert [payload["content"] for payload in mentions] == [
-        "@产品 给老板打个招呼", "@后端开发 给老板端茶倒水"
+    mentions = [payload for event, payload in events if event == "chat_message" and "mentions" in payload]
+    assert len(mentions) == 1
+    assert mentions[0]["content"] == "@产品 给老板打个招呼\n@后端开发 给老板端茶倒水"
+    assert [item["worker"] for item in mentions[0]["mentions"]] == ["product", "backend"]
+    assert [(data["message_id"], data["reader"]) for event, data in events if event == "read_receipt"] == [
+        (mentions[0]["id"], "product"), (mentions[0]["id"], "backend")
     ]
+    assert {(data["message_id"], data["worker"], data["reaction"]) for event, data in events if event == "message_reaction"} == {
+        (mentions[0]["id"], "product", "done"), (mentions[0]["id"], "backend", "done")
+    }
+    chat_senders = [data["sender"] for event, data in events if event == "chat_message"]
+    assert chat_senders[0] == "leader"
+    assert set(chat_senders[1:]) == {"product", "backend"}
+    assert len(chat_senders) == 3
     assert "private" not in str(events)
     assert [payload["tool"] for event, payload in events if event == "activity" and payload["phase"] == "completed"] == ["delegate_tasks", "delegate_tasks"]
     assert ("delta", {"role": "leader", "content": "两位成员都完成了。"}) in events

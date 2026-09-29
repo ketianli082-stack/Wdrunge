@@ -136,11 +136,14 @@ button { cursor: pointer; }
 .bubble { position: relative; display: inline-block; max-width: 100%; padding: 9px 11px; border: 1px solid #e9e9e9; border-radius: 4px 11px 11px; background: #f6f6f6; color: #444; text-align: left; }
 .mine .bubble { border-color: #dedede; border-radius: 11px 4px 11px 11px; background: #e9e9e9; }
 .bubble p { margin: 0; color: inherit; font-size: 12px; line-height: 1.65; white-space: pre-wrap; overflow-wrap: anywhere; }
-.bubble.mentioned { padding-right: 23px; }
-.read-indicator { position: absolute; top: 8px; right: 8px; width: 7px; height: 7px; border-radius: 50%; }
+.bubble .mention-line + .mention-line { margin-top: 5px; }
+.mention-token { display: inline-flex; align-items: baseline; gap: 4px; white-space: nowrap; color: #333; font-weight: 600; }
+.read-indicator { display: inline-block; align-self: center; width: 6px; height: 6px; border-radius: 50%; }
 .read-indicator.unread { border: 1px solid #777; background: #fff; }
 .read-indicator.read { background: #555; }
-.read-caption { display: block; margin-top: 3px; color: #aaa; font-size: 9px; }
+.message-reactions { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 5px; }
+.done-reaction { display: inline-flex; align-items: center; gap: 4px; padding: 3px 7px; border: 1px solid #dedede; border-radius: 12px; background: #fafafa; color: #5e5e5e; font-size: 10px; line-height: 1.3; }
+.done-reaction span { display: grid; place-items: center; width: 13px; height: 13px; border-radius: 50%; background: #dcdcdc; color: #444; font-size: 9px; font-weight: 700; }
 .processing { display: flex; align-items: center; gap: 3px; margin: 0 0 14px 37px; color: #999; font-size: 10px; }
 .processing i { width: 4px; height: 4px; border-radius: 50%; background: #999; animation: pulse 1s infinite; }
 .processing i:nth-child(2) { animation-delay: .15s; }

@@ -4,7 +4,7 @@
 
 ## 消息投递
 
-用户消息以完整对话历史和固定的 `conversation_id` 发送给 `/api/chat/stream`。Leader 可直接回复、用 `delegate_task` 交给单个成员，或用 `delegate_tasks` 将互不依赖的任务同时交给多位成员。每项任务包含内部 `task`、私有 `handoff`、上下文模式 `context_mode`，以及对用户公开的简短 `summary`。群聊只显示 `@成员 summary`。成员开始处理时，同一 ID 的 `read_receipt` 将圆点从未读切为已读，并发送简短确认消息。批量成员并行处理，结果返回 Leader 后再由 Leader 汇总。
+用户消息以完整对话历史和固定的 `conversation_id` 发送给 `/api/chat/stream`。Leader 可直接回复、用 `delegate_task` 交给单个成员，或用 `delegate_tasks` 将互不依赖的任务同时交给多位成员。每项任务包含内部 `task`、私有 `handoff`、上下文模式 `context_mode`，以及对用户公开的简短 `summary`。同一次批量派活在群聊中合为一条 Leader 消息，每个 `@成员 summary` 占一行。每行已读圆点紧跟在对应的 `@成员` 后面。成员开始处理时，以群聊消息 ID 和成员 ID 发送 `read_receipt`，并发送简短确认消息。成员完成时，以 `message_reaction` 在原派活消息下面显示 `Done` 反应，不再发送完成聊天。批量成员并行处理，结果返回 Leader 后再由 Leader 汇总。
 
 目前的“已读”表示成员开始接收任务，不代表模型理解或完成任务。后续如需可靠投递，可增加持久化消息、队列、明确的接收确认和重试机制。
 
@@ -19,8 +19,9 @@ Leader 可在阶段节点单独调用 `checkpoint_context`，保存目标、约�
 | 事件 | 用途 | 关键字段 |
 | --- | --- | --- |
 | `status` | 更新工位状态 | `id`, `status` |
-| `chat_message` | 显示群聊文本 | `id`, `sender`, `content`, 可选 `mention` |
+| `chat_message` | 显示群聊文本；批量派活为一条多行消息 | `id`, `sender`, `content`, 可选 `mentions[]` |
 | `read_receipt` | 更新被 @ 消息的已读状态 | `message_id`, `reader` |
+| `message_reaction` | 在原派活消息下标记成员完成 | `message_id`, `worker`, `reaction: done` |
 | `activity` | 更新一次工具调用的时间线条目 | `id`, `agent`, `tool`, `description`, `phase` |
 | `usage` | 更新累计 Token 与成员上下文占比 | `total_tokens`, `agents` |
 | `delta` | Leader 的最终回复 | `role`, `content` |

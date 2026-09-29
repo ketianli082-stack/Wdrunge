@@ -10,15 +10,26 @@ import type {
 export type { ChatMessage };
 export type TeamMember = TeamMemberResponse;
 export type TeamUsage = TeamUsageResponse;
+export type TeamMention = {
+  worker: string;
+  name: string;
+  summary: string;
+};
 export type TeamChatMessage = {
   id: string;
   sender: string;
   content: string;
   mention?: string;
+  mentions?: TeamMention[];
 };
 export type ReadReceipt = {
   message_id: string;
   reader: string;
+};
+export type MessageReaction = {
+  message_id: string;
+  worker: string;
+  reaction: "done";
 };
 export type Activity = {
   id: string;
@@ -32,6 +43,7 @@ export type StreamCallbacks = {
   onStatus?: (status: Pick<TeamMember, "id" | "status">) => void;
   onMessage?: (message: TeamChatMessage) => void;
   onRead?: (receipt: ReadReceipt) => void;
+  onReaction?: (reaction: MessageReaction) => void;
   onActivity?: (activity: Activity) => void;
   onUsage?: (usage: TeamUsage) => void;
 };
@@ -94,8 +106,11 @@ export async function streamChat(
       status?: TeamMember["status"];
       sender?: string;
       mention?: string;
+      mentions?: TeamMention[];
       message_id?: string;
       reader?: string;
+      worker?: string;
+      reaction?: string;
       agent?: string;
       tool?: string;
       description?: string;
@@ -108,10 +123,13 @@ export async function streamChat(
       callbacks.onStatus?.({ id: payload.id, status: payload.status });
     }
     if (event === "chat_message" && payload.id && payload.sender && payload.content) {
-      callbacks.onMessage?.({ id: payload.id, sender: payload.sender, content: payload.content, mention: payload.mention });
+      callbacks.onMessage?.({ id: payload.id, sender: payload.sender, content: payload.content, mention: payload.mention, mentions: payload.mentions });
     }
     if (event === "read_receipt" && payload.message_id && payload.reader) {
       callbacks.onRead?.({ message_id: payload.message_id, reader: payload.reader });
+    }
+    if (event === "message_reaction" && payload.message_id && payload.worker && payload.reaction === "done") {
+      callbacks.onReaction?.({ message_id: payload.message_id, worker: payload.worker, reaction: "done" });
     }
     if (event === "activity" && payload.id && payload.agent && payload.tool && payload.description && payload.phase) {
       callbacks.onActivity?.({ id: payload.id, agent: payload.agent, tool: payload.tool, description: payload.description, phase: payload.phase });

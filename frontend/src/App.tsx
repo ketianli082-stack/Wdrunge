@@ -10,7 +10,7 @@ import {
 } from "./api";
 import "./App.css";
 
-type VisibleMessage = TeamChatMessage & { read?: boolean; time: string };
+type VisibleMessage = TeamChatMessage & { read?: boolean; readBy?: string[]; completedBy?: string[]; time: string };
 type VisibleActivity = Activity & { time: string };
 type Conversation = {
   id: string;
@@ -163,12 +163,17 @@ function App() {
         },
         onStatus: ({ id, status }) => setAgents((current) => current.map((agent) => agent.id === id ? { ...agent, status } : agent)),
         onMessage: (message) => updateConversation(sessionId, (item) => ({
-          ...item, messages: [...item.messages, { ...message, read: false, time: clockTime() }],
+          ...item, messages: [...item.messages, { ...message, readBy: [], completedBy: [], time: clockTime() }],
         })),
         onRead: ({ message_id, reader }) => updateConversation(sessionId, (item) => ({
           ...item,
-          messages: item.messages.map((message) => message.id === message_id && message.mention === reader
-            ? { ...message, read: true } : message),
+          messages: item.messages.map((message) => message.id === message_id
+            ? { ...message, read: message.mention === reader || message.read, readBy: [...new Set([...(message.readBy || []), reader])] } : message),
+        })),
+        onReaction: ({ message_id, worker }) => updateConversation(sessionId, (item) => ({
+          ...item,
+          messages: item.messages.map((message) => message.id === message_id
+            ? { ...message, completedBy: [...new Set([...(message.completedBy || []), worker])] } : message),
         })),
         onActivity: (activity) => updateConversation(sessionId, (item) => ({
           ...item,
@@ -233,10 +238,13 @@ function App() {
           {active.messages.length === 0 && <div className="chat-welcome"><span className="welcome-icon">W</span><strong>开始一段对话</strong><p>向 Leader 发送消息。需要协作时，成员会在这里回应。</p></div>}
           {active.messages.map((message) => <article className={`chat-message ${message.sender === "user" ? "mine" : ""}`} key={message.id}>
             <span className={`avatar avatar-${message.sender}`}>{initials[message.sender] || "·"}</span>
-            <div className="message-body"><div className="message-meta"><strong>{nameOf(message.sender)}</strong><time>{message.time}</time></div><div className={`bubble ${message.mention ? "mentioned" : ""}`}>
-              {message.mention && <span className={`read-indicator ${message.read ? "read" : "unread"}`} title={message.read ? `${nameOf(message.mention)}已读` : `等待${nameOf(message.mention)}阅读`} aria-label={message.read ? `${nameOf(message.mention)}已读` : `${nameOf(message.mention)}未读`} />}
-              <p>{message.content}</p>
-            </div>{message.mention && <span className="read-caption">{message.read ? "已读" : "未读"}</span>}</div>
+            <div className="message-body"><div className="message-meta"><strong>{nameOf(message.sender)}</strong><time>{message.time}</time></div><div className="bubble">
+              {message.mentions?.length ? message.mentions.map((mention) => <p className="mention-line" key={mention.worker}>
+                <span className="mention-token">@{mention.name}<span className={`read-indicator ${(message.readBy || []).includes(mention.worker) ? "read" : "unread"}`} title={`${mention.name}${(message.readBy || []).includes(mention.worker) ? "已读" : "未读"}`} aria-label={`${mention.name}${(message.readBy || []).includes(mention.worker) ? "已读" : "未读"}`} /></span>{" "}{mention.summary}
+              </p>) : message.mention && message.content.startsWith(`@${nameOf(message.mention)}`) ? <p>
+                <span className="mention-token">@{nameOf(message.mention)}<span className={`read-indicator ${message.read ? "read" : "unread"}`} title={message.read ? "已读" : "未读"} aria-label={`${nameOf(message.mention)}${message.read ? "已读" : "未读"}`} /></span>{message.content.slice(nameOf(message.mention).length + 1)}
+              </p> : <p>{message.content}</p>}
+            </div>{!!message.completedBy?.length && <div className="message-reactions" aria-label="任务完成状态">{message.completedBy.map((worker) => <span className="done-reaction" key={worker} title={`${nameOf(worker)}已完成`}><span aria-hidden="true">✓</span> Done · {nameOf(worker)}</span>)}</div>}</div>
           </article>)}
           {streaming && <div className="processing"><i /><i /><i /><span>团队正在处理</span></div>}
         </div>

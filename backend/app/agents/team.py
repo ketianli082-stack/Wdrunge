@@ -266,33 +266,39 @@ class Team:
             if not batches:
                 continue
 
+            message_id = uuid4().hex
             jobs: list[tuple[str, str, Delegation, str]] = []
+            mentions: list[dict[str, str]] = []
             for call_id, tool_name, assignments in batches:
                 for assignment in assignments:
                     count += 1
                     worker = self.workers[assignment.worker]
                     event_id = uuid4().hex
                     jobs.append((call_id, tool_name, assignment, event_id))
-                    yield "chat_message", {
-                        "id": event_id,
-                        "sender": "leader",
-                        "content": f"@{worker.spec.name} {assignment.summary}",
-                        "mention": assignment.worker,
-                    }
-                    yield "activity", {
-                        "id": event_id,
-                        "agent": "leader",
-                        "tool": tool_name,
-                        "description": f"将工作交给{worker.spec.name}",
-                        "phase": "running",
-                    }
-                    worker.status = AgentStatus.RUNNING
-                    yield "status", {"id": assignment.worker, "status": AgentStatus.RUNNING}
+                    mentions.append({"worker": assignment.worker, "name": worker.spec.name, "summary": assignment.summary})
+
+            yield "chat_message", {
+                "id": message_id,
+                "sender": "leader",
+                "content": "\n".join(f"@{item['name']} {item['summary']}" for item in mentions),
+                "mentions": mentions,
+            }
+            for _, tool_name, assignment, event_id in jobs:
+                worker = self.workers[assignment.worker]
+                yield "activity", {
+                    "id": event_id,
+                    "agent": "leader",
+                    "tool": tool_name,
+                    "description": f"将工作交给{worker.spec.name}",
+                    "phase": "running",
+                }
+                worker.status = AgentStatus.RUNNING
+                yield "status", {"id": assignment.worker, "status": AgentStatus.RUNNING}
 
             queue: asyncio.Queue[tuple[str, dict]] = asyncio.Queue()
             tasks = [
                 asyncio.create_task(
-                    self._run_assignment(call_id, tool_name, assignment, event_id, conversation_id, queue)
+                    self._run_assignment(call_id, tool_name, assignment, event_id, message_id, conversation_id, queue)
                 )
                 for call_id, tool_name, assignment, event_id in jobs
             ]
@@ -335,6 +341,7 @@ class Team:
         tool_name: str,
         assignment: Delegation,
         event_id: str,
+        message_id: str,
         conversation_id: str,
         queue: asyncio.Queue[tuple[str, dict]],
     ) -> None:
@@ -342,7 +349,7 @@ class Team:
         output: list[str] = []
         error: Exception | None = None
         context_label = "上下文准备中"
-        await queue.put(("read_receipt", {"message_id": event_id, "reader": assignment.worker}))
+        await queue.put(("read_receipt", {"message_id": message_id, "reader": assignment.worker}))
         await queue.put(("chat_message", {
             "id": f"{event_id}-ack",
             "sender": assignment.worker,
@@ -382,10 +389,10 @@ class Team:
         else:
             worker.status = AgentStatus.IDLE
             await queue.put(("status", {"id": assignment.worker, "status": AgentStatus.IDLE}))
-            await queue.put(("chat_message", {
-                "id": f"{event_id}-done",
-                "sender": assignment.worker,
-                "content": "这部分已完成，交给 Leader 汇总。",
+            await queue.put(("message_reaction", {
+                "message_id": message_id,
+                "worker": assignment.worker,
+                "reaction": "done",
             }))
         await queue.put(("activity", {
             "id": event_id,
