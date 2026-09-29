@@ -2,7 +2,7 @@
 
 from langchain_core.tools import tool
 
-from app.tools._workspace import WORKSPACE_ROOT
+from app.tools._workspace import effective_roots, workspace_root
 
 
 def make_list_project_files(allowed_roots: tuple[str, ...]):
@@ -10,19 +10,22 @@ def make_list_project_files(allowed_roots: tuple[str, ...]):
     def list_project_files() -> str:
         """List up to 150 files in your assigned project areas."""
         files: list[str] = []
-        for root in allowed_roots:
-            directory = WORKSPACE_ROOT / root
+        workspace = workspace_root().resolve()
+        for root in effective_roots(allowed_roots):
+            directory = (workspace / root).resolve()
+            if not directory.is_relative_to(workspace):
+                continue
             if directory.is_file():
-                files.append(root)
+                files.append(str(directory.relative_to(workspace)))
                 continue
             if not directory.exists():
                 continue
             for path in directory.rglob("*"):
-                if path.is_file() and not any(
+                if path.is_file() and path.resolve().is_relative_to(workspace) and not any(
                     part in {".git", ".venv", "node_modules", "dist", "__pycache__"}
                     for part in path.parts
                 ):
-                    files.append(str(path.relative_to(WORKSPACE_ROOT)))
+                    files.append(str(path.relative_to(workspace)))
         return "\n".join(sorted(set(files))[:150]) or "No files found."
 
     return list_project_files

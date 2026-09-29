@@ -2,7 +2,7 @@
 
 import type { Client, Options as Options2, TDataShape } from './client';
 import { client } from './client.gen';
-import type { ChatStreamApiChatStreamPostData, ChatStreamApiChatStreamPostErrors, ChatStreamApiChatStreamPostResponse, ChatStreamApiChatStreamPostResponses, HealthApiHealthGetData, HealthApiHealthGetResponses, TeamStatusApiTeamGetData, TeamStatusApiTeamGetResponses } from './types.gen';
+import type { ChatStreamApiChatStreamPostData, ChatStreamApiChatStreamPostErrors, ChatStreamApiChatStreamPostResponse, ChatStreamApiChatStreamPostResponses, HealthApiHealthGetData, HealthApiHealthGetResponses, TeamStatusApiTeamGetData, TeamStatusApiTeamGetResponses, ValidateWorkspaceApiWorkspacesValidatePostData, ValidateWorkspaceApiWorkspacesValidatePostErrors, ValidateWorkspaceApiWorkspacesValidatePostResponses } from './types.gen';
 
 export type Options<TData extends TDataShape = TDataShape, ThrowOnError extends boolean = boolean, TResponse = unknown> = Options2<TData, ThrowOnError, TResponse> & {
     /**
@@ -24,6 +24,18 @@ export type Options<TData extends TDataShape = TDataShape, ThrowOnError extends 
 export const healthApiHealthGet = <ThrowOnError extends boolean = false>(options?: Options<HealthApiHealthGetData, ThrowOnError>) => (options?.client ?? client).get<HealthApiHealthGetResponses, unknown, ThrowOnError>({ url: '/api/health', ...options });
 
 /**
+ * Validate Workspace
+ */
+export const validateWorkspaceApiWorkspacesValidatePost = <ThrowOnError extends boolean = false>(options: Options<ValidateWorkspaceApiWorkspacesValidatePostData, ThrowOnError>) => (options.client ?? client).post<ValidateWorkspaceApiWorkspacesValidatePostResponses, ValidateWorkspaceApiWorkspacesValidatePostErrors, ThrowOnError>({
+    url: '/api/workspaces/validate',
+    ...options,
+    headers: {
+        'Content-Type': 'application/json',
+        ...options.headers
+    }
+});
+
+/**
  * Team Status
  *
  * List every team member and its current state and capabilities.
@@ -33,7 +45,7 @@ export const teamStatusApiTeamGet = <ThrowOnError extends boolean = false>(optio
 /**
  * Stream a leader-coordinated team response
  *
- * Send the full conversation, ending with a user message. Supply the same `conversation_id` to continue worker sessions and Leader checkpoints; omit it for an isolated request. `status` events report agent state; `chat_message` contains short team updates; `read_receipt` marks an @mention as read; `activity` describes tool use without arguments; `usage` reports cumulative tokens and each agent's latest prompt context occupancy; `delta` contains the Leader's reply; `done` marks completion. Failures after streaming begins emit `error` with `{message}`.
+ * Send the full conversation, ending with a user message, and the absolute `workspace_path` selected for this conversation. Supply the same `conversation_id` to continue worker sessions and Leader checkpoints; omit it for an isolated request. `status` events report agent state; `chat_message` contains short team updates; `read_receipt` marks an @mention as read; `activity` describes tool use without arguments; `usage` reports cumulative tokens and each agent's latest prompt context occupancy; `delta` contains the Leader's reply; `done` marks completion. Failures after streaming begins emit `error` with `{message}`.
  */
 export const chatStreamApiChatStreamPost = <ThrowOnError extends boolean = false>(options: Options<ChatStreamApiChatStreamPostData, ThrowOnError, ChatStreamApiChatStreamPostResponse>) => (options.client ?? client).sse.post<ChatStreamApiChatStreamPostResponses, ChatStreamApiChatStreamPostErrors, ThrowOnError>({
     url: '/api/chat/stream',

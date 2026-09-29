@@ -6,7 +6,7 @@ from typing import Literal
 
 from langchain_core.tools import tool
 
-from app.tools._workspace import WORKSPACE_ROOT
+from app.tools._workspace import resolve_allowed
 
 
 @tool
@@ -14,10 +14,13 @@ async def run_project_check(check: Literal["backend_tests", "frontend_build"]) -
     """Run backend pytest or the frontend TypeScript/Vite build and return its result."""
     if check == "backend_tests":
         command = (sys.executable, "-m", "pytest", "-q")
-        directory = WORKSPACE_ROOT / "backend"
+        directory = resolve_allowed("backend", ("backend",))
     else:
         command = ("npm", "run", "build")
-        directory = WORKSPACE_ROOT / "frontend"
+        directory = resolve_allowed("frontend", ("frontend",))
+
+    if not directory.is_dir():
+        return f"{check} unavailable: {directory} does not exist."
 
     process = await asyncio.create_subprocess_exec(
         *command,

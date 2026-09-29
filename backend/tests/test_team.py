@@ -100,12 +100,13 @@ def test_leader_dispatches_and_receives_worker_results(monkeypatch):
 
     async def design(task, *, conversation_id, context_mode, handoff):
         calls.append(("designer", task))
-        assert handoff == "Design the requested UI"
+        assert handoff.endswith("Design the requested UI")
+        assert "Project workspace:" in handoff
         yield "content", {"content": "design complete"}
 
     async def frontend(task, *, conversation_id, context_mode, handoff):
         calls.append(("frontend", task))
-        assert handoff == "Use the completed design"
+        assert handoff.endswith("Use the completed design")
         yield "content", {"content": "frontend complete"}
 
     monkeypatch.setattr(team.leader, "next_message", next_message)
@@ -420,3 +421,50 @@ def test_file_tool_stays_within_role_scope(tmp_path, monkeypatch):
         write.invoke({"path": "../outside.md", "content": "no"})
     with pytest.raises(ValueError):
         write.invoke({"path": "backend/app/main.py", "content": "no"})
+
+
+def test_selected_workspace_is_used_by_file_tools(tmp_path):
+    from app.tools.list_project_files import make_list_project_files
+    from app.tools.read_project_file import make_read_project_file
+
+    token = _workspace.active_workspace.set(tmp_path)
+    try:
+        write = make_write_project_file(("docs/product",))
+        read = make_read_project_file(("docs/product",))
+        listing = make_list_project_files(("docs/product",))
+        assert "Wrote" in write.invoke({"path": "src/hello.txt", "content": "selected workspace"})
+        assert read.invoke({"path": "src/hello.txt"}) == "selected workspace"
+        assert "src/hello.txt" in listing.invoke({})
+        with pytest.raises(ValueError):
+            write.invoke({"path": "../outside.txt", "content": "no"})
+        (tmp_path / "link").symlink_to(tmp_path.parent, target_is_directory=True)
+        with pytest.raises(ValueError):
+            write.invoke({"path": "link/escape.txt", "content": "no"})
+    finally:
+        _workspace.active_workspace.reset(token)
+
+
+def test_team_stream_scopes_each_conversation_to_its_workspace(tmp_path, monkeypatch):
+    team = Team()
+    observed = []
+
+    async def answer(messages, *, allow_delegation=True):
+        observed.append((_workspace.workspace_root(), messages[0].content))
+        return AIMessage(content="done")
+
+    monkeypatch.setattr(team.leader, "next_message", answer)
+
+    async def collect(path, conversation_id):
+        return [event async for event in team.stream(
+            [HumanMessage(content="hello")], conversation_id=conversation_id, workspace_path=path,
+        )]
+
+    first = tmp_path / "one"
+    second = tmp_path / "two"
+    first.mkdir()
+    second.mkdir()
+    asyncio.run(collect(first, "one"))
+    asyncio.run(collect(second, "two"))
+    assert [path for path, _ in observed] == [first, second]
+    assert all(str(path) in prompt for path, prompt in observed)
+    assert _workspace.active_workspace.get() is None

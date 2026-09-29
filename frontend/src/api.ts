@@ -59,13 +59,26 @@ export async function getTeamStatus(signal?: AbortSignal): Promise<TeamStatusRes
   return (await response.json()) as TeamStatusResponse;
 }
 
+export async function validateWorkspace(path: string): Promise<string> {
+  const response = await fetch(`${API_BASE_URL}/api/workspaces/validate`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ path }),
+  });
+  const data = await response.json() as { path?: string; detail?: string };
+  if (!response.ok) throw new Error(typeof data.detail === "string" ? data.detail : `工作区校验失败 (${response.status})`);
+  if (!data.path) throw new Error("工作区校验未返回路径");
+  return data.path;
+}
+
 export async function streamChat(
   messages: ChatMessage[],
   conversationId: string,
+  workspacePath: string,
   callbacks: StreamCallbacks,
   signal: AbortSignal,
 ): Promise<void> {
-  const body: ChatRequest = { messages, conversation_id: conversationId };
+  const body: ChatRequest = { messages, conversation_id: conversationId, workspace_path: workspacePath };
   const response = await fetch(`${API_BASE_URL}${CHAT_URL}`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
