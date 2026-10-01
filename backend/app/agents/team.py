@@ -155,6 +155,19 @@ class Team:
         for worker in self.workers.values():
             await worker.configure_persistence(store, checkpointer)
 
+    def clear_runtime_memory(self):
+        """Called only after all coordinator and scheduler tasks have stopped."""
+        self._leader_checkpoints.clear()
+        self._pending_leader_receipts.clear()
+        for agent in (self.leader, *self.workers.values()):
+            agent.total_tokens = 0
+            agent.context_tokens = 0
+            agent.status = AgentStatus.IDLE
+        for worker in self.workers.values():
+            worker._threads.clear()
+            worker._context_by_session.clear()
+            worker._graph = None
+
     def snapshot(self) -> list[dict]:
         items = [self.leader.snapshot(), *(worker.snapshot() for worker in self.workers.values())]
         scheduler = getattr(self, 'scheduler', None)

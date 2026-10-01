@@ -19,6 +19,7 @@ from langchain_core.messages import AIMessage, HumanMessage
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from pydantic import BaseModel, Field, field_serializer, model_validator
 
+from app.record_reset import RecordsGate, RecordsGateMiddleware
 from app import conversation_title
 from app.collaboration.service import Collaboration
 from app.collaboration.runtime import Scheduler
@@ -33,6 +34,7 @@ store: ChatStore = get_store()
 _checkpoint_connection: aiosqlite.Connection | None = None
 _runtime_store_identity: int | None = None
 _collaboration_scheduler = None
+_records_gate = RecordsGate()
 
 
 async def ensure_runtime() -> None:
@@ -71,6 +73,8 @@ async def lifespan(app: FastAPI):
     try:
         yield
     finally:
+        if _records_gate.reset_task is not None:
+            await asyncio.shield(_records_gate.reset_task)
         if _collaboration_scheduler is not None:
             await _collaboration_scheduler.close()
             _collaboration_scheduler = None
@@ -89,6 +93,7 @@ app = FastAPI(
 )
 app.include_router(collaboration_api.router)
 app.include_router(delivery_router)
+app.add_middleware(RecordsGateMiddleware, gate=_records_gate)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -101,6 +106,54 @@ app.add_middleware(
     allow_methods=["GET", "POST"],
     allow_headers=["Content-Type"],
 )
+
+
+class ResetRecordsRequest(BaseModel):
+    confirmation: Literal['CLEAR_ALL_RECORDS']
+
+
+class ResetRecordsResponse(BaseModel):
+    cleared: bool
+    workspace_files_preserved: bool
+
+
+@app.post('/api/debug/records/reset', response_model=ResetRecordsResponse, tags=['Debug'])
+async def reset_records(body: ResetRecordsRequest):
+    """Stop local work and clear all app records, preserving project workspaces."""
+    if os.getenv('WDRUNGE_ENABLE_DEBUG_RESET', '1') != '1':
+        raise HTTPException(404, 'Debug reset is disabled')
+    if _records_gate.resetting:
+        raise HTTPException(409, '记录清除正在进行中')
+    _records_gate.resetting = True
+    # Keep reset alive if its HTTP caller disconnects after confirming.
+    task = asyncio.create_task(_clear_all_records())
+    _records_gate.reset_task = task
+    task.add_done_callback(lambda done: None if done.cancelled() else done.exception())
+    return await asyncio.shield(task)
+
+
+async def _clear_all_records():
+    global _checkpoint_connection, _runtime_store_identity, _collaboration_scheduler
+    try:
+        await _records_gate.drain()
+        if _collaboration_scheduler is not None:
+            await _collaboration_scheduler.close()
+            _collaboration_scheduler = None
+        if _checkpoint_connection is not None:
+            await _checkpoint_connection.close()
+            _checkpoint_connection = None
+        _runtime_store_identity = None
+        try:
+            await store.clear_records()
+            team = get_team()
+            if hasattr(team, 'clear_runtime_memory'):
+                team.clear_runtime_memory()
+        finally:
+            await ensure_runtime()
+        return {'cleared': True, 'workspace_files_preserved': True}
+    finally:
+        _records_gate.resetting = False
+        _records_gate.reset_task = None
 
 
 class ChatMessage(BaseModel):

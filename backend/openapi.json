@@ -341,6 +341,48 @@
         }
       }
     },
+    "/api/debug/records/reset": {
+      "post": {
+        "tags": [
+          "Debug"
+        ],
+        "summary": "Reset Records",
+        "description": "Stop local work and clear all app records, preserving project workspaces.",
+        "operationId": "reset_records_api_debug_records_reset_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ResetRecordsRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ResetRecordsResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/health": {
       "get": {
         "tags": [
@@ -1430,6 +1472,38 @@
           "updated_at"
         ],
         "title": "ProjectResponse"
+      },
+      "ResetRecordsRequest": {
+        "properties": {
+          "confirmation": {
+            "type": "string",
+            "const": "CLEAR_ALL_RECORDS",
+            "title": "Confirmation"
+          }
+        },
+        "type": "object",
+        "required": [
+          "confirmation"
+        ],
+        "title": "ResetRecordsRequest"
+      },
+      "ResetRecordsResponse": {
+        "properties": {
+          "cleared": {
+            "type": "boolean",
+            "title": "Cleared"
+          },
+          "workspace_files_preserved": {
+            "type": "boolean",
+            "title": "Workspace Files Preserved"
+          }
+        },
+        "type": "object",
+        "required": [
+          "cleared",
+          "workspace_files_preserved"
+        ],
+        "title": "ResetRecordsResponse"
       },
       "TeamMemberResponse": {
         "properties": {

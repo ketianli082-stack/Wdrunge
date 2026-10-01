@@ -29,6 +29,7 @@ from sqlalchemy import (
     event,
     insert,
     select,
+    text,
     update,
 )
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
@@ -214,6 +215,20 @@ class ChatStore:
         async with self.engine.begin() as connection:
             await connection.run_sync(metadata.create_all)
         self._initialized = True
+
+    async def clear_records(self) -> None:
+        """Clear app-owned rows atomically; never remove workspace files or schema."""
+        await self.initialize()
+        async with self.engine.begin() as connection:
+            existing = set(await connection.scalars(text("SELECT name FROM sqlite_master WHERE type='table'")))
+            # These SQLite tables belong to collaboration and LangGraph, not Alembic.
+            extra = ('collaboration_receipts', 'collaboration_events', 'collaboration_sections',
+                     'collaboration_records', 'writes', 'checkpoints')
+            for name in extra:
+                if name in existing:
+                    await connection.execute(text(f'DELETE FROM "{name}"'))
+            for table in reversed(metadata.sorted_tables):
+                await connection.execute(delete(table))
 
     async def close(self) -> None:
         await self.engine.dispose()

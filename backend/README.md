@@ -234,3 +234,24 @@ port, probes a requested HTTP path, captures bounded logs and stops its own proc
 group on success, failure or cancellation. Wdrunge smoke tests use a temporary DB.
 This does not install dependencies, automate a browser or deploy a production app;
 unsupported startup layouts must be reported and coordinated explicitly.
+
+
+### Debug record reset
+
+The sidebar's **清除所有记录** button asks for confirmation, then calls
+`POST /api/debug/records/reset` with `{"confirmation":"CLEAR_ALL_RECORDS"}`.
+In this local, single-process debugging setup, reset blocks new API work, drains
+in-flight requests and scheduler tasks (including cancellation cleanup), clears
+application/collaboration/checkpoint rows in one transaction, resets model memory
+and token counters, and restarts the scheduler. A disconnected caller does not
+interrupt an accepted reset. The UI then opens an empty project list.
+
+All projects, conversations, messages, logs, subscriptions, document revision
+metadata and collaboration requests are removed. Actual workspace files (including
+deliverables and isolated workspaces), configuration and database schema remain.
+Set `WDRUNGE_ENABLE_DEBUG_RESET=0` to disable the endpoint outside debugging.
+Do not enable this local debug operation across multiple API worker processes.
+
+Collaboration transitions validate `result` as plain text before publishing files
+or changing state. Malformed tool payloads return a correction error to the agent
+instead of terminating the whole request.

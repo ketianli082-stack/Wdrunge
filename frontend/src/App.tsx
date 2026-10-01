@@ -2,6 +2,7 @@ import { useEffect, useRef, useState, type FormEvent } from "react";
 import { isTauri } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import {
+  clearAllRecords,
   createConversation,
   createProject,
   getConversation,
@@ -81,6 +82,11 @@ function toConversationView(detail: ConversationDetail): ConversationView {
 }
 
 function App() {
+  const [generation, setGeneration] = useState(0);
+  return <Workspace key={generation} onRecordsCleared={() => setGeneration(value => value + 1)} />;
+}
+
+function Workspace({ onRecordsCleared }: { onRecordsCleared: () => void }) {
   const [projects, setProjects] = useState<ProjectSummary[]>([]);
   const [activeProjectId, setActiveProjectId] = useState<string | null>(null);
   const [active, setActive] = useState<ConversationView | null>(null);
@@ -102,6 +108,9 @@ function App() {
   const [workspaceDraft, setWorkspaceDraft] = useState("");
   const [projectError, setProjectError] = useState("");
   const [projectSaving, setProjectSaving] = useState(false);
+  const [resetDialog, setResetDialog] = useState(false);
+  const [resetting, setResetting] = useState(false);
+  const [resetError, setResetError] = useState("");
   const controller = useRef<AbortController | null>(null);
   const chatFeed = useRef<HTMLDivElement | null>(null);
 
@@ -258,6 +267,22 @@ function App() {
     }
   }
 
+  async function resetRecords() {
+    if (resetting) return;
+    setResetting(true);
+    setResetError("");
+    controller.current?.abort();
+    try {
+      await clearAllRecords();
+      // Remount all project state and subscriptions; old async responses belong
+      // to the discarded workspace and cannot restore deleted records.
+      onRecordsCleared();
+    } catch (cause) {
+      setResetError(cause instanceof Error ? cause.message : "清除失败，请重试");
+      setResetting(false);
+    }
+  }
+
   async function send(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     const content = input.trim();
@@ -321,9 +346,11 @@ function App() {
       controller.current = null;
       setStreaming(false);
       try {
+        if (abort.signal.aborted) return;
         const [detail, projectItems, team] = await Promise.all([
           getConversation(conversationId), listProjects(), getTeamStatus(),
         ]);
+        if (abort.signal.aborted) return;
         setActive(toConversationView(detail));
         setProjects(projectItems);
         setAgents(team.agents);
@@ -359,6 +386,7 @@ function App() {
         </section>)}
         {!loading && visibleProjects.length === 0 && <div className="history-empty">{search ? "没有匹配的项目或对话" : "还没有项目"}</div>}
       </nav>
+      <div className="debug-tools"><small>调试工具</small><button onClick={() => { setResetError(""); setResetDialog(true); }} disabled={loading || projectSaving}>清除所有记录</button></div>
       <div className="sidebar-foot"><span className="foot-mark">W</span><span>Agent 团队<small>{agents.length} 位成员已就位</small></span></div>
     </aside>
 
@@ -388,6 +416,7 @@ function App() {
       </section>}
     </aside>
 
+    {resetDialog && <div className="workspace-dialog-backdrop" role="presentation"><section className="workspace-dialog" role="alertdialog" aria-modal="true" aria-labelledby="reset-title" aria-describedby="reset-description"><h2 id="reset-title">清除所有记录？</h2><div id="reset-description"><p>将停止正在执行的任务，并清除所有项目、对话、工作日志、协作请求、文档版本与订阅、消息、模型记忆和 Token 统计。</p><p>工作区中的实际文件会保留。已清除的记录无法撤销。</p></div>{resetError && <p className="workspace-dialog-error" role="alert">{resetError}</p>}<div className="workspace-dialog-actions"><button autoFocus onClick={() => setResetDialog(false)} disabled={resetting}>取消</button><button className="reset-confirm" onClick={() => void resetRecords()} disabled={resetting}>{resetting ? "正在停止任务并清除…" : "确认清除全部记录"}</button></div></section></div>}
     {projectDialog && <div className="workspace-dialog-backdrop" role="presentation"><form className="workspace-dialog" onSubmit={saveProject} role="dialog" aria-modal="true" aria-label="新建项目"><h2>新建项目</h2><p>项目对应一个本机工作区，并可以包含多段独立对话。</p><label htmlFor="project-name">项目名称</label><input id="project-name" autoFocus placeholder="默认使用文件夹名称" value={projectName} onChange={(event) => setProjectName(event.target.value)} /><label htmlFor="workspace-path">工作区目录</label><div className="workspace-picker"><input id="workspace-path" placeholder="选择或输入项目文件夹" value={workspaceDraft} onChange={(event) => setWorkspaceDraft(event.target.value)} /><button type="button" onClick={() => void chooseWorkspace()} disabled={!isTauri() || projectSaving}>{isTauri() ? "选择文件夹…" : "浏览器不支持选择"}</button></div>{!isTauri() && <small className="workspace-browser-hint">浏览器无法读取文件夹的真实绝对路径，请手动输入；桌面版可直接选择。</small>}{projectError && <p className="workspace-dialog-error" role="alert">{projectError}</p>}<div className="workspace-dialog-actions"><button type="button" onClick={() => setProjectDialog(false)} disabled={projectSaving}>取消</button><button type="submit" disabled={!workspaceDraft.trim() || projectSaving}>{projectSaving ? "创建中…" : "创建项目"}</button></div></form></div>}
   </main>;
 }

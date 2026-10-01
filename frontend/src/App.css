@@ -249,3 +249,9 @@ button { cursor: pointer; }
   .office { height: 660px; }
   .right-rail { height: 72dvh; min-height: 470px; }
 }
+
+.debug-tools { display: grid; gap: 8px; padding: 12px 18px; border-top: 1px solid #e8e8ed; }
+.debug-tools small { color: #8a8791; font-size: 11px; }
+.debug-tools button { border: 1px solid #e6c7c7; background: #fff7f7; color: #a33a3a; border-radius: 8px; padding: 9px; cursor: pointer; }
+.debug-tools button:disabled { opacity: .5; cursor: default; }
+.workspace-dialog-actions .reset-confirm { background: #b43c3c; color: white; }

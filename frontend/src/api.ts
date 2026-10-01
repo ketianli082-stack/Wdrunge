@@ -241,3 +241,11 @@ export async function streamConversationMessage(
     reader.releaseLock();
   }
 }
+
+export function clearAllRecords(): Promise<{ cleared: boolean; workspace_files_preserved: boolean }> {
+  return requestJson("/api/debug/records/reset", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ confirmation: "CLEAR_ALL_RECORDS" }),
+  });
+}

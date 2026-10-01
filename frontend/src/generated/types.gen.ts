@@ -459,6 +459,30 @@ export type ProjectResponse = {
 };
 
 /**
+ * ResetRecordsRequest
+ */
+export type ResetRecordsRequest = {
+    /**
+     * Confirmation
+     */
+    confirmation: 'CLEAR_ALL_RECORDS';
+};
+
+/**
+ * ResetRecordsResponse
+ */
+export type ResetRecordsResponse = {
+    /**
+     * Cleared
+     */
+    cleared: boolean;
+    /**
+     * Workspace Files Preserved
+     */
+    workspace_files_preserved: boolean;
+};
+
+/**
  * TeamMemberResponse
  */
 export type TeamMemberResponse = {
@@ -770,6 +794,31 @@ export type EventsApiProjectsProjectIdDeliveryEventsGetResponses = {
      */
     200: unknown;
 };
+
+export type ResetRecordsApiDebugRecordsResetPostData = {
+    body: ResetRecordsRequest;
+    path?: never;
+    query?: never;
+    url: '/api/debug/records/reset';
+};
+
+export type ResetRecordsApiDebugRecordsResetPostErrors = {
+    /**
+     * Validation Error
+     */
+    422: HttpValidationError;
+};
+
+export type ResetRecordsApiDebugRecordsResetPostError = ResetRecordsApiDebugRecordsResetPostErrors[keyof ResetRecordsApiDebugRecordsResetPostErrors];
+
+export type ResetRecordsApiDebugRecordsResetPostResponses = {
+    /**
+     * Successful Response
+     */
+    200: ResetRecordsResponse;
+};
+
+export type ResetRecordsApiDebugRecordsResetPostResponse = ResetRecordsApiDebugRecordsResetPostResponses[keyof ResetRecordsApiDebugRecordsResetPostResponses];
 
 export type HealthApiHealthGetData = {
     body?: never;
