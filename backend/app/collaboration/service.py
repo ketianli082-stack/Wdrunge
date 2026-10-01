@@ -19,6 +19,7 @@ from sqlalchemy import text
 
 from app.collaboration.documents import digest, outline, section, edit_document, page
 from app.collaboration.schema import DDL
+from app.collaboration.payloads import TransitionPayload
 from app.collaboration.workspaces import merge_text, IsolatedWorkspace
 from app.storage import ChatStore, StorageConflictError, StorageNotFoundError
 
@@ -462,6 +463,7 @@ class Collaboration:
             return request
 
     async def transition(self, project, identifier, actor, state, result='', artifacts=None, based_on=None, summary=None):
+        TransitionPayload.model_validate(dict(identifier=identifier, state=state, result=result, artifacts=artifacts, based_on=based_on, summary=summary))
         public_summary = self._summary(summary, {'review': '已提交交付，请验收。', 'completed': '验收通过，可以继续后续工作。', 'queued': '请继续处理原任务并重新交付。', 'failed': '任务执行失败，需要处理后重试。', 'blocked': '当前任务等待依赖或问题处理。', 'cancelled': '这项任务已取消。', 'rejected': '暂不执行这项任务。'}.get(state, '任务状态已更新。'))
         async with self.transaction() as c:
             p = await self._project(c, project)

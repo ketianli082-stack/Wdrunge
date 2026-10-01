@@ -6,6 +6,7 @@ from typing import Literal
 from langchain_core.tools import tool
 
 from app.collaboration.service import Collaboration
+from app.collaboration.payloads import TransitionPayload
 
 
 @dataclass
@@ -39,7 +40,7 @@ async def collaborate(action: Literal['catalog', 'read', 'publish', 'subscribe',
     request: {recipient,goal,summary,key,based_on?,dependencies?,artifacts?,priority?:0..3,deadline?:Unix timestamp}; include
     acceptance criteria in goal. inspect_request: {identifier}. inspect_message: {identifier,offset?,limit?} reads full message previews.
     wait: {dependencies:[request_id]} suspends your current task until accepted
-    completion. transition: {identifier,state,result?,summary?,artifacts?,based_on?}; summary is a short public progress/reply, result contains full evidence;
+    completion. transition: {identifier,state,result?,summary?,artifacts?,based_on?}; summary is a short public progress/reply, result must be a plain text string containing full evidence, never an object/list;
     recipient delivers to review, sender accepts completed or requests queued
     rework. Use docs for enduring decisions, messages for short coordination.
     schedule: {identifier,priority?,deadline?}. dependencies: {} returns a graph.
@@ -122,6 +123,8 @@ async def collaborate(action: Literal['catalog', 'read', 'publish', 'subscribe',
                 raise ValueError('No active durable request to suspend')
             return await s.wait_for(p, ctx.request, payload['dependencies'], ctx.member)
         if action == 'transition':
+            # Reject malformed model arguments before updating references or merging files.
+            payload = TransitionPayload.model_validate(payload).model_dump(exclude_unset=True)
             if ctx.request == payload.get('identifier') and payload.get('state') == 'review' and ctx.instance_id:
                 if payload.get('based_on') is not None:
                     async with s.transaction() as c:

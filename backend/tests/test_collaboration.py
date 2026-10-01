@@ -550,3 +550,45 @@ def test_single_slot_scheduler_resumes_parent_after_child_review(tmp_path, monke
             await scheduler.close()
             await store.close()
     run(scenario())
+
+
+def test_malformed_delivery_result_is_recoverable_before_publication(tmp_path, monkeypatch):
+    from app.agents.team import Team
+    from app.agents.worker import WorkerAgent
+    from app.collaboration.runtime import Scheduler
+    from app.collaboration.tools import active
+    from langchain_core.messages import AIMessage, ToolMessage
+    from langgraph.checkpoint.memory import InMemorySaver
+    stages = []
+    class Model:
+        def bind_tools(self, tools): return self
+        async def ainvoke(self, messages):
+            ctx = active.get()
+            results = [m for m in messages if isinstance(m, ToolMessage)]
+            current = await ctx.service.get_request(ctx.project, ctx.request)
+            if not results:
+                stages.append('invalid')
+                result = {'status':'done', 'details':'Delivered'}
+            else:
+                assert 'result' in results[-1].content and 'valid string' in results[-1].content
+                assert current['state'] == 'running' and not current['workspace_published']
+                stages.append('corrected')
+                result = 'Delivered; verified requirements'
+            return AIMessage(content='', tool_calls=[{'id':f'delivery-{len(results)}','name':'collaborate','args':{'action':'transition','payload':{'identifier':ctx.request,'state':'review','result':result}}}])
+    monkeypatch.setattr(WorkerAgent, 'model', lambda self: Model())
+    async def scenario():
+        store, s, p, workspace = await setup(tmp_path)
+        team = Team()
+        await team.configure_persistence(store, InMemorySaver())
+        scheduler = Scheduler(s, team)
+        r = await s.create_request(p, 'leader', 'product', 'Deliver', 'malformed-result')
+        await scheduler.execute(*(await s.claim(scheduler.owner)))
+        final = await s.get_request(p, r['id'])
+        assert stages == ['invalid','corrected']
+        assert final['state'] == 'review' and final['result'] == 'Delivered; verified requirements'
+        assert final['workspace_published']
+        with pytest.raises(ValueError, match='valid string'):
+            await s.transition(p, r['id'], 'leader', 'completed', {'wrong':'type'})
+        assert (await s.get_request(p, r['id']))['state'] == 'review'
+        await store.close()
+    run(scenario())
