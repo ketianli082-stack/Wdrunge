@@ -6,6 +6,7 @@ from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
+from typing import TYPE_CHECKING
 from uuid import uuid4
 
 from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage, ToolMessage
@@ -13,6 +14,7 @@ from pydantic import ValidationError
 
 from app.agents.base import AgentSpec, AgentStatus
 from app.agents.leader import LeaderAgent
+from app.agents.identity import member_name
 from app.agents.worker import WorkerAgent
 from app.tools.current_utc_time import current_utc_time
 from app.tools.checkpoint_context import ContextCheckpoint, checkpoint_context
@@ -26,38 +28,42 @@ from app.tools.run_project_check import run_project_check
 from app.tools.write_project_file import make_write_project_file
 from app.tools._workspace import active_workspace, workspace_root
 
+if TYPE_CHECKING:
+    from langgraph.checkpoint.base import BaseCheckpointSaver
+    from app.storage import ChatStore
+
 
 ROLE_CONFIG = {
     "product": {
-        "name": "产品",
+        "name": member_name("product"),
         "prompt": "product.md",
         "skills": ("requirements.md",),
         "read": ("docs", "README.md", "backend/openapi.json"),
         "write": ("docs/product",),
     },
     "backend": {
-        "name": "后端开发",
+        "name": member_name("backend"),
         "prompt": "backend.md",
         "skills": ("api_contract.md",),
         "read": ("docs", "backend/app", "backend/pyproject.toml", "backend/tests"),
         "write": ("backend/app", "docs/backend"),
     },
     "designer": {
-        "name": "美工",
+        "name": member_name("designer"),
         "prompt": "designer.md",
         "skills": ("visual_design.md",),
         "read": ("docs", "frontend/src", "frontend/public"),
         "write": ("frontend/src", "frontend/public", "docs/design"),
     },
     "frontend": {
-        "name": "前端开发",
+        "name": member_name("frontend"),
         "prompt": "frontend.md",
         "skills": ("api_contract.md",),
         "read": ("docs", "frontend/src", "frontend/public", "backend/openapi.json"),
         "write": ("frontend/src", "docs/frontend"),
     },
     "testing": {
-        "name": "测试",
+        "name": member_name("testing"),
         "prompt": "testing.md",
         "skills": ("test_strategy.md",),
         "read": ("docs", "backend/app", "backend/tests", "frontend/src", "backend/openapi.json"),
@@ -95,7 +101,7 @@ class Team:
     def __init__(self):
         self.leader = LeaderAgent(
             AgentSpec(
-                id="leader", name="Leader", prompt_file="leader.md", tools=(delegate_task, delegate_tasks, checkpoint_context)
+                id="leader", name=member_name("leader"), prompt_file="leader.md", tools=(delegate_task, delegate_tasks, checkpoint_context)
             )
         )
         self.workers: dict[str, WorkerAgent] = {}
@@ -129,6 +135,20 @@ class Team:
         self.leader.system_prompt()
         self._lock = asyncio.Lock()
         self._leader_checkpoints: dict[str, LeaderCheckpoint] = {}
+        self._store: ChatStore | None = None
+
+    async def configure_persistence(
+        self, store: "ChatStore", checkpointer: "BaseCheckpointSaver"
+    ) -> None:
+        self._store = store
+        self._leader_checkpoints.clear()
+        for row in await store.load_leader_checkpoints():
+            self._leader_checkpoints[row["conversation_id"]] = LeaderCheckpoint(
+                handoff=ContextCheckpoint.model_validate(row["handoff_json"]),
+                history_cutoff=row["history_cutoff"],
+            )
+        for worker in self.workers.values():
+            await worker.configure_persistence(store, checkpointer)
 
     def snapshot(self) -> list[dict]:
         return [self.leader.snapshot(), *(worker.snapshot() for worker in self.workers.values())]
@@ -223,6 +243,12 @@ class Team:
                         handoff=reset_handoff,
                         history_cutoff=len(history),
                     )
+                    if self._store:
+                        await self._store.save_leader_checkpoint(
+                            conversation_id,
+                            len(history),
+                            reset_handoff.model_dump(mode="json"),
+                        )
                     tool_result = ToolMessage(content="Coordination checkpoint saved. Continue from the handoff.", tool_call_id=call_id)
                     messages = [
                         system,

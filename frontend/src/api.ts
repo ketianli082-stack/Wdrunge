@@ -1,13 +1,5 @@
-import type {
-  ChatMessage,
-  ChatRequest,
-  ChatStreamApiChatStreamPostData,
-  TeamMemberResponse,
-  TeamStatusResponse,
-  TeamUsageResponse,
-} from "./generated";
+import type { TeamMemberResponse, TeamStatusResponse, TeamUsageResponse } from "./generated";
 
-export type { ChatMessage };
 export type TeamMember = TeamMemberResponse;
 export type TeamUsage = TeamUsageResponse;
 export type TeamMention = {
@@ -39,19 +31,65 @@ export type Activity = {
   phase: "running" | "completed" | "failed";
 };
 export type StreamCallbacks = {
-  onDelta: (content: string) => void;
+  onDelta: (content: string, messageId?: string) => void;
   onStatus?: (status: Pick<TeamMember, "id" | "status">) => void;
   onMessage?: (message: TeamChatMessage) => void;
   onRead?: (receipt: ReadReceipt) => void;
   onReaction?: (reaction: MessageReaction) => void;
   onActivity?: (activity: Activity) => void;
   onUsage?: (usage: TeamUsage) => void;
+  onTitle?: (title: string) => void;
+};
+
+export type ConversationSummary = {
+  id: string;
+  project_id: string;
+  title: string;
+  status: string;
+  created_at: string;
+  updated_at: string;
+};
+
+export type ProjectSummary = {
+  id: string;
+  name: string;
+  workspace_path: string;
+  created_at: string;
+  updated_at: string;
+  conversations: ConversationSummary[];
+};
+
+export type PersistedMessage = TeamChatMessage & {
+  kind: string;
+  status: string;
+  sequence: number;
+  read_by: string[];
+  completed_by: string[];
+  created_at: string;
+};
+
+export type PersistedActivity = Activity & {
+  sequence: number;
+  created_at: string;
+};
+
+export type ConversationDetail = ConversationSummary & {
+  project_name: string;
+  workspace_path: string;
+  messages: PersistedMessage[];
+  activities: PersistedActivity[];
 };
 
 const API_BASE_URL = (
   import.meta.env.VITE_API_BASE_URL || "http://127.0.0.1:8000"
 ).replace(/\/$/, "");
-const CHAT_URL: ChatStreamApiChatStreamPostData["url"] = "/api/chat/stream";
+
+async function requestJson<T>(path: string, init?: RequestInit): Promise<T> {
+  const response = await fetch(`${API_BASE_URL}${path}`, init);
+  const data = await response.json().catch(() => ({})) as T & { detail?: string };
+  if (!response.ok) throw new Error(typeof data.detail === "string" ? data.detail : `Request failed (${response.status})`);
+  return data;
+}
 
 export async function getTeamStatus(signal?: AbortSignal): Promise<TeamStatusResponse> {
   const response = await fetch(`${API_BASE_URL}/api/team`, { signal });
@@ -71,18 +109,41 @@ export async function validateWorkspace(path: string): Promise<string> {
   return data.path;
 }
 
-export async function streamChat(
-  messages: ChatMessage[],
+export function listProjects(signal?: AbortSignal): Promise<ProjectSummary[]> {
+  return requestJson<ProjectSummary[]>("/api/projects", { signal });
+}
+
+export function createProject(name: string, workspacePath: string): Promise<ProjectSummary> {
+  return requestJson<ProjectSummary>("/api/projects", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ name: name.trim() || undefined, workspace_path: workspacePath }),
+  });
+}
+
+export function createConversation(projectId: string): Promise<ConversationSummary> {
+  return requestJson<ConversationSummary>(`/api/projects/${projectId}/conversations`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ title: "新对话" }),
+  });
+}
+
+export function getConversation(conversationId: string, signal?: AbortSignal): Promise<ConversationDetail> {
+  return requestJson<ConversationDetail>(`/api/conversations/${conversationId}`, { signal });
+}
+
+export async function streamConversationMessage(
   conversationId: string,
-  workspacePath: string,
+  content: string,
+  clientMessageId: string,
   callbacks: StreamCallbacks,
   signal: AbortSignal,
 ): Promise<void> {
-  const body: ChatRequest = { messages, conversation_id: conversationId, workspace_path: workspacePath };
-  const response = await fetch(`${API_BASE_URL}${CHAT_URL}`, {
+  const response = await fetch(`${API_BASE_URL}/api/conversations/${conversationId}/messages/stream`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
+    body: JSON.stringify({ content, client_message_id: clientMessageId }),
     signal,
   });
 
@@ -130,8 +191,9 @@ export async function streamChat(
       phase?: Activity["phase"];
       total_tokens?: number;
       agents?: TeamUsage["agents"];
+      title?: string;
     };
-    if (event === "delta" && payload.content) callbacks.onDelta(payload.content);
+    if (event === "delta" && payload.content) callbacks.onDelta(payload.content, payload.message_id);
     if (event === "status" && payload.id && payload.status) {
       callbacks.onStatus?.({ id: payload.id, status: payload.status });
     }
@@ -150,6 +212,7 @@ export async function streamChat(
     if (event === "usage" && typeof payload.total_tokens === "number" && Array.isArray(payload.agents)) {
       callbacks.onUsage?.({ total_tokens: payload.total_tokens, agents: payload.agents });
     }
+    if (event === "title" && payload.title) callbacks.onTitle?.(payload.title);
     if (event === "error") throw new Error(payload.message || "Agent request failed");
     if (event === "done") complete = true;
   }

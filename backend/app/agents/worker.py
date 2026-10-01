@@ -1,7 +1,7 @@
 """A specialist worker with its own prompt, skills, and LangGraph tool loop."""
 
 from collections.abc import AsyncIterator
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 from uuid import uuid4
 
 from langchain_core.messages import AIMessageChunk, BaseMessage, HumanMessage, SystemMessage
@@ -10,6 +10,10 @@ from langgraph.graph import END, START, MessagesState, StateGraph
 from langgraph.prebuilt import ToolNode, tools_condition
 
 from app.agents.base import Agent
+
+if TYPE_CHECKING:
+    from langgraph.checkpoint.base import BaseCheckpointSaver
+    from app.storage import ChatStore
 
 TOOL_LABELS = {
     "current_utc_time": "查看当前时间",
@@ -29,6 +33,21 @@ class WorkerAgent(Agent):
         self._graph = None
         self._threads: dict[str, str] = {}
         self._context_by_session: dict[str, int] = {}
+        self._store: ChatStore | None = None
+
+    async def configure_persistence(
+        self, store: "ChatStore", checkpointer: "BaseCheckpointSaver"
+    ) -> None:
+        """Attach durable checkpoints and restore logical session mappings."""
+        self._store = store
+        self._checkpointer = checkpointer
+        self._graph = None
+        self._threads.clear()
+        self._context_by_session.clear()
+        for session in await store.load_agent_sessions(self.spec.id):
+            self._threads[session["conversation_id"]] = session["thread_id"]
+            if session["context_tokens"] is not None:
+                self._context_by_session[session["conversation_id"]] = session["context_tokens"]
 
     def build_graph(self):
         if self._graph is not None:
@@ -71,6 +90,8 @@ class WorkerAgent(Agent):
         self._context_by_session.pop(conversation_id, None)
         if thread_id:
             await self._checkpointer.adelete_thread(thread_id)
+        if self._store:
+            await self._store.delete_agent_session(conversation_id, self.spec.id)
 
     async def stream(
         self,
@@ -84,6 +105,10 @@ class WorkerAgent(Agent):
         if resolved == "fresh":
             await self.discard_session(conversation_id)
             self._threads[conversation_id] = uuid4().hex
+            if self._store:
+                await self._store.save_agent_session(
+                    conversation_id, self.spec.id, self._threads[conversation_id], None
+                )
             messages: list[BaseMessage] = [SystemMessage(content=self.system_prompt())]
         else:
             messages = []
@@ -122,4 +147,11 @@ class WorkerAgent(Agent):
             elif kind == "on_chat_model_end" and event.get("metadata", {}).get("langgraph_node") == "agent":
                 if self.record_usage(event.get("data", {}).get("output")):
                     self._context_by_session[conversation_id] = self.context_tokens
+                    if self._store:
+                        await self._store.save_agent_session(
+                            conversation_id,
+                            self.spec.id,
+                            self._threads[conversation_id],
+                            self.context_tokens,
+                        )
                     yield "usage", {}

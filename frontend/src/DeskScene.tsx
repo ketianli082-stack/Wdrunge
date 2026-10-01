@@ -1,4 +1,5 @@
 import * as THREE from "three";
+import { memberName } from "./TeamIdentity";
 import { RoundedBoxGeometry } from "three/addons/geometries/RoundedBoxGeometry.js";
 import { createScreenSurface, type ScreenKind, type ScreenSurface } from "./ScreenSurface";
 
@@ -21,12 +22,12 @@ export type DeskModel = THREE.Group & {
   };
 };
 export const deskDetails: Record<DeskRole, { name: string; label: string; accent: string }> = {
-  leader: { name: "Leader", label: "超宽屏看板 · 团队协作", accent: "#839b90" },
-  product: { name: "产品", label: "笔记本电脑 · 需求手册 · 便签", accent: "#b6a082" },
-  backend: { name: "后端开发", label: "三联屏 · 代码 / 终端 / 服务监控", accent: "#8397ad" },
-  designer: { name: "美工", label: "大尺寸绘图板 · 手写笔 · 实体色卡", accent: "#ac9bbb" },
-  frontend: { name: "前端开发", label: "双显示器 · 代码 / 页面预览", accent: "#86a89e" },
-  testing: { name: "测试", label: "测试屏 · 手机 / 平板 · 检查清单", accent: "#b2a57e" },
+  leader: { name: memberName("leader"), label: "超宽屏看板 · 团队协作", accent: "#839b90" },
+  product: { name: memberName("product"), label: "笔记本电脑 · 需求手册 · 便签", accent: "#b6a082" },
+  backend: { name: memberName("backend"), label: "三联屏 · 代码 / 终端 / 服务监控", accent: "#8397ad" },
+  designer: { name: memberName("designer"), label: "大尺寸绘图板 · 手写笔 · 实体色卡", accent: "#ac9bbb" },
+  frontend: { name: memberName("frontend"), label: "双显示器 · 代码 / 页面预览", accent: "#86a89e" },
+  testing: { name: memberName("testing"), label: "测试屏 · 手机 / 平板 · 检查清单", accent: "#b2a57e" },
 };
 
 export function material(color: THREE.ColorRepresentation, roughness = .65, metalness = 0): Surface {

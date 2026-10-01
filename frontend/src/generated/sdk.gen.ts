@@ -2,7 +2,7 @@
 
 import type { Client, Options as Options2, TDataShape } from './client';
 import { client } from './client.gen';
-import type { ChatStreamApiChatStreamPostData, ChatStreamApiChatStreamPostErrors, ChatStreamApiChatStreamPostResponse, ChatStreamApiChatStreamPostResponses, HealthApiHealthGetData, HealthApiHealthGetResponses, TeamStatusApiTeamGetData, TeamStatusApiTeamGetResponses, ValidateWorkspaceApiWorkspacesValidatePostData, ValidateWorkspaceApiWorkspacesValidatePostErrors, ValidateWorkspaceApiWorkspacesValidatePostResponses } from './types.gen';
+import type { ChatStreamApiChatStreamPostData, ChatStreamApiChatStreamPostErrors, ChatStreamApiChatStreamPostResponse, ChatStreamApiChatStreamPostResponses, ConversationDetailApiConversationsConversationIdGetData, ConversationDetailApiConversationsConversationIdGetErrors, ConversationDetailApiConversationsConversationIdGetResponses, ConversationMessageStreamApiConversationsConversationIdMessagesStreamPostData, ConversationMessageStreamApiConversationsConversationIdMessagesStreamPostErrors, ConversationMessageStreamApiConversationsConversationIdMessagesStreamPostResponse, ConversationMessageStreamApiConversationsConversationIdMessagesStreamPostResponses, CreateConversationApiProjectsProjectIdConversationsPostData, CreateConversationApiProjectsProjectIdConversationsPostErrors, CreateConversationApiProjectsProjectIdConversationsPostResponses, CreateProjectApiProjectsPostData, CreateProjectApiProjectsPostErrors, CreateProjectApiProjectsPostResponses, HealthApiHealthGetData, HealthApiHealthGetResponses, ListProjectsApiProjectsGetData, ListProjectsApiProjectsGetResponses, TeamStatusApiTeamGetData, TeamStatusApiTeamGetResponses, ValidateWorkspaceApiWorkspacesValidatePostData, ValidateWorkspaceApiWorkspacesValidatePostErrors, ValidateWorkspaceApiWorkspacesValidatePostResponses } from './types.gen';
 
 export type Options<TData extends TDataShape = TDataShape, ThrowOnError extends boolean = boolean, TResponse = unknown> = Options2<TData, ThrowOnError, TResponse> & {
     /**
@@ -36,11 +36,57 @@ export const validateWorkspaceApiWorkspacesValidatePost = <ThrowOnError extends 
 });
 
 /**
+ * List Projects
+ */
+export const listProjectsApiProjectsGet = <ThrowOnError extends boolean = false>(options?: Options<ListProjectsApiProjectsGetData, ThrowOnError>) => (options?.client ?? client).get<ListProjectsApiProjectsGetResponses, unknown, ThrowOnError>({ url: '/api/projects', ...options });
+
+/**
+ * Create Project
+ */
+export const createProjectApiProjectsPost = <ThrowOnError extends boolean = false>(options: Options<CreateProjectApiProjectsPostData, ThrowOnError>) => (options.client ?? client).post<CreateProjectApiProjectsPostResponses, CreateProjectApiProjectsPostErrors, ThrowOnError>({
+    url: '/api/projects',
+    ...options,
+    headers: {
+        'Content-Type': 'application/json',
+        ...options.headers
+    }
+});
+
+/**
+ * Create Conversation
+ */
+export const createConversationApiProjectsProjectIdConversationsPost = <ThrowOnError extends boolean = false>(options: Options<CreateConversationApiProjectsProjectIdConversationsPostData, ThrowOnError>) => (options.client ?? client).post<CreateConversationApiProjectsProjectIdConversationsPostResponses, CreateConversationApiProjectsProjectIdConversationsPostErrors, ThrowOnError>({
+    url: '/api/projects/{project_id}/conversations',
+    ...options,
+    headers: {
+        'Content-Type': 'application/json',
+        ...options.headers
+    }
+});
+
+/**
+ * Conversation Detail
+ */
+export const conversationDetailApiConversationsConversationIdGet = <ThrowOnError extends boolean = false>(options: Options<ConversationDetailApiConversationsConversationIdGetData, ThrowOnError>) => (options.client ?? client).get<ConversationDetailApiConversationsConversationIdGetResponses, ConversationDetailApiConversationsConversationIdGetErrors, ThrowOnError>({ url: '/api/conversations/{conversation_id}', ...options });
+
+/**
  * Team Status
  *
  * List every team member and its current state and capabilities.
  */
 export const teamStatusApiTeamGet = <ThrowOnError extends boolean = false>(options?: Options<TeamStatusApiTeamGetData, ThrowOnError>) => (options?.client ?? client).get<TeamStatusApiTeamGetResponses, unknown, ThrowOnError>({ url: '/api/team', ...options });
+
+/**
+ * Persist a message and stream the project team's response
+ */
+export const conversationMessageStreamApiConversationsConversationIdMessagesStreamPost = <ThrowOnError extends boolean = false>(options: Options<ConversationMessageStreamApiConversationsConversationIdMessagesStreamPostData, ThrowOnError, ConversationMessageStreamApiConversationsConversationIdMessagesStreamPostResponse>) => (options.client ?? client).sse.post<ConversationMessageStreamApiConversationsConversationIdMessagesStreamPostResponses, ConversationMessageStreamApiConversationsConversationIdMessagesStreamPostErrors, ThrowOnError>({
+    url: '/api/conversations/{conversation_id}/messages/stream',
+    ...options,
+    headers: {
+        'Content-Type': 'application/json',
+        ...options.headers
+    }
+});
 
 /**
  * Stream a leader-coordinated team response

@@ -1,4 +1,5 @@
 import * as THREE from "three";
+import { characterAppearance } from "./CharacterAppearance";
 import { box, cylinder, material, type DeskModel, type DeskRole } from "./DeskScene";
 import { actionEnvelope, createCharacterBehavior, easeAction, sampleAction, type ActionSample, type CharacterAction } from "./CharacterBehavior";
 import { penTip } from "./WorkAnimation";
@@ -6,14 +7,6 @@ import type { ScreenState } from "./ScreenSurface";
 
 type Vec3 = [number, number, number];
 const UP = new THREE.Vector3(0, 1, 0);
-const look: Record<DeskRole, { shirt: number; hair: number; skin: number; style: string }> = {
-  leader: { shirt: 0x6f8177, hair: 0x514a43, skin: 0xdac0a9, style: "swept" },
-  product: { shirt: 0xb6a389, hair: 0x685448, skin: 0xe2c5ad, style: "bob" },
-  designer: { shirt: 0xa194b4, hair: 0x574843, skin: 0xd6b69a, style: "bun" },
-  frontend: { shirt: 0x7d9c93, hair: 0x594e43, skin: 0xe0c0a4, style: "curly" },
-  backend: { shirt: 0x8194ae, hair: 0x363f48, skin: 0xc9ad97, style: "headphones" },
-  testing: { shirt: 0xc4b895, hair: 0x56534b, skin: 0xe2c7b2, style: "ponytail" },
-};
 
 function ellipsoid(parent: THREE.Group, size: Vec3, position: Vec3, surface: THREE.MeshStandardMaterial) {
   const mesh = new THREE.Mesh(new THREE.SphereGeometry(1, 20, 14), surface);
@@ -214,7 +207,7 @@ export interface OfficeCharacter {
 
 export function createOfficeCharacter(role: DeskRole, desk: DeskModel, random: () => number = Math.random): OfficeCharacter {
   const group = new THREE.Group(); group.name = `character:${role}`; desk.add(group);
-  const colors = look[role];
+  const colors = characterAppearance[role];
   const cloth = material(colors.shirt, .94), hair = material(colors.hair, .94), skin = material(colors.skin, .82);
   const pants = material(0x5c6467, .98), shoes = material(0x42494b, .75), sole = material(0xe1e0d9, .8);
   const body = new THREE.Group(); body.position.set(0, .86, 1.34); group.add(body);
@@ -264,7 +257,7 @@ export function createOfficeCharacter(role: DeskRole, desk: DeskModel, random: (
   box(phone, [.158, .275, .007], [0, .005, .017], material(0xbac6ce, .68), .018);
   for (let i = 0; i < 3; i++) box(phone, [.123, .037, .003], [0, .079 - i * .073, .022], material([0xe3d5c6, 0xc0cdb9, 0xe4e5e2][i]), .007);
 
-  let elapsed = 0, clock = Object.keys(look).indexOf(role) * 1.73, previousState: ScreenState | undefined, previousOverride: CharacterAction | null = null;
+  let elapsed = 0, clock = Object.keys(characterAppearance).indexOf(role) * 1.73, previousState: ScreenState | undefined, previousOverride: CharacterAction | null = null;
   const behavior = createCharacterBehavior(role, random);
   let lastPose: Pose | undefined, transitionPose: Pose | undefined, transitionTime = 0;
   let initialized = false;

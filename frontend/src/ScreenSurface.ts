@@ -8,6 +8,7 @@ export type ScreenState = "idle" | "running" | "failed";
 /** Each display owns a texture, so future live previews/video can replace its
  * material map without changing the desk geometry or rebuilding the office. */
 export interface ScreenSurface {
+  kind: ScreenKind;
   mesh: THREE.Mesh<THREE.PlaneGeometry, THREE.MeshBasicMaterial>;
   texture: THREE.CanvasTexture;
   update: (elapsed: number, state: ScreenState, animate: boolean, activity?: ScreenActivity) => boolean;
@@ -168,5 +169,5 @@ export function createScreenSurface(width: number, height: number, kind: ScreenK
     return true;
   }
   draw(0, "idle", false);
-  return { mesh, texture, update: draw };
+  return { kind, mesh, texture, update: draw };
 }

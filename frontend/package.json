@@ -11,13 +11,18 @@
     "preview": "vite preview",
     "api:generate": "openapi-ts",
     "tauri": "tauri",
-    "tauri:dev": "node scripts/tauri-dev.mjs"
+    "tauri:dev": "node scripts/tauri-dev.mjs",
+    "test:messages": "node scripts/run-message-tests.mjs"
   },
   "dependencies": {
     "@tauri-apps/api": "^2",
+    "@tauri-apps/plugin-dialog": "^2.8.0",
     "@tauri-apps/plugin-opener": "^2",
     "react": "^19.1.0",
     "react-dom": "^19.1.0",
+    "react-markdown": "^10.1.0",
+    "remark-breaks": "^4.0.0",
+    "remark-gfm": "^4.0.1",
     "three": "^0.186.1"
   },
   "devDependencies": {

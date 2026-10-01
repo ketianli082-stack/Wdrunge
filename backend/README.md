@@ -14,7 +14,7 @@ uv run uvicorn app.main:app --host 127.0.0.1 --port 8000
 
 Open `http://127.0.0.1:8000/docs` for the API schema. The frontend runs separately with `cd frontend && npm run dev`.
 
-The agent calls Alibaba Cloud Model Studio through its OpenAI-compatible API. The default model is `qwen3.7-max`. Set `DASHSCOPE_API_KEY` in `.env`; `QWEN_MODEL` and `DASHSCOPE_BASE_URL` can be changed for another model or region. The default URL uses the China (Beijing) endpoint.
+The agent calls Alibaba Cloud Model Studio through its OpenAI-compatible API. The default model is `qwen3.7-max`. Set `DASHSCOPE_API_KEY` in `.env`; `QWEN_MODEL` and `DASHSCOPE_BASE_URL` can be changed for another model or region. The default URL uses the China (Beijing) endpoint. After the first conversation turn completes, a separate `QWEN_TITLE_MODEL` call (default `qwen-flash`) extracts a title of at most 15 characters and emits a `title` event.
 
 Run Uvicorn without `--reload` while an agent may edit backend files; automatic reload would interrupt the active SSE request.
 
@@ -29,7 +29,35 @@ npm run api:generate
 
 The repository's `docs/` directory is reserved for project design documents; it is unrelated to FastAPI's `/docs` route.
 
-## Streaming contract
+## Projects, conversations, and persistence
+
+The backend is the source of truth for chat data. A project owns one validated
+workspace and contains multiple independent conversations. SQLite is stored in
+the operating system's Wdrunge application-data directory by default; set
+`WDRUNGE_DATABASE_PATH` to override it. Run `uv run alembic upgrade head` when
+deploying a new database schema.
+
+Relationships use indexed logical keys rather than SQLite `FOREIGN KEY`
+constraints. `ChatStore` validates parents and performs related writes in one
+transaction. Visible messages, assignment updates, read receipts, reactions,
+tool activities, Leader checkpoints, worker session mappings, and LangGraph
+checkpoints survive backend restarts.
+
+The primary API flow is:
+
+```text
+POST /api/projects
+GET  /api/projects
+POST /api/projects/{project_id}/conversations
+GET  /api/conversations/{conversation_id}
+POST /api/conversations/{conversation_id}/messages/stream
+```
+
+The message stream accepts only the new content and a client-generated
+idempotency key. The server loads prior model messages and the project's
+workspace from SQLite.
+
+## Legacy streaming contract
 
 `POST /api/chat/stream` with `Content-Type: application/json`:
 
@@ -41,7 +69,9 @@ The response uses `text/event-stream`. `status` events contain an agent ID and `
 
 Each delegation uses `context_mode`: `fresh` starts a clean worker thread, `continue` resumes that worker's thread in the same chat, and `auto` resumes while the latest reported input is below 60% of the configured context window. If usage is unavailable, `auto` starts fresh. If there is no saved thread, `continue` starts fresh. Every delegation also carries a private `handoff` with the goal, constraints, and relevant artifact paths. A fresh worker receives its role prompt, the current task, and this handoff; it does not receive the old chat transcript. The Leader may call `checkpoint_context` at a stage boundary to save a structured goal, constraints, artifacts, completed work, and pending work. Subsequent Leader calls in that chat use the checkpoint and later messages instead of older history.
 
-Worker threads and Leader checkpoints live in backend memory. Restarting the backend clears them, so the next worker assignment starts fresh. Keep important decisions in project documents as well as handoffs.
+`POST /api/chat/stream` remains available for compatibility, but it accepts a
+client-provided transcript and does not provide project-scoped persistence. New
+clients should use the conversation message endpoint above.
 
 Set `QWEN_CONTEXT_WINDOW` to the actual context limit of the configured model. The default `131072` is an application assumption for the draft UI, not a verified property of every Qwen model. Context percentage uses the latest reported input-token count divided by that configured limit. Cumulative token counts use provider-reported usage; no number is invented when usage is missing.
 

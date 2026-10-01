@@ -63,6 +63,92 @@ export type ChatRequest = {
 };
 
 /**
+ * ConversationCreate
+ */
+export type ConversationCreate = {
+    /**
+     * Title
+     */
+    title?: string;
+};
+
+/**
+ * ConversationDetailResponse
+ */
+export type ConversationDetailResponse = {
+    /**
+     * Id
+     */
+    id: string;
+    /**
+     * Project Id
+     */
+    project_id: string;
+    /**
+     * Title
+     */
+    title: string;
+    /**
+     * Status
+     */
+    status: string;
+    /**
+     * Created At
+     */
+    created_at: string;
+    /**
+     * Updated At
+     */
+    updated_at: string;
+    /**
+     * Project Name
+     */
+    project_name: string;
+    /**
+     * Workspace Path
+     */
+    workspace_path: string;
+    /**
+     * Messages
+     */
+    messages: Array<PersistedMessageResponse>;
+    /**
+     * Activities
+     */
+    activities: Array<PersistedActivityResponse>;
+};
+
+/**
+ * ConversationSummaryResponse
+ */
+export type ConversationSummaryResponse = {
+    /**
+     * Id
+     */
+    id: string;
+    /**
+     * Project Id
+     */
+    project_id: string;
+    /**
+     * Title
+     */
+    title: string;
+    /**
+     * Status
+     */
+    status: string;
+    /**
+     * Created At
+     */
+    created_at: string;
+    /**
+     * Updated At
+     */
+    updated_at: string;
+};
+
+/**
  * HTTPValidationError
  */
 export type HttpValidationError = {
@@ -80,6 +166,150 @@ export type HealthResponse = {
      * Status
      */
     status: 'ok';
+};
+
+/**
+ * MessageCreate
+ */
+export type MessageCreate = {
+    /**
+     * Content
+     */
+    content: string;
+    /**
+     * Client Message Id
+     */
+    client_message_id: string;
+};
+
+/**
+ * PersistedActivityResponse
+ */
+export type PersistedActivityResponse = {
+    /**
+     * Id
+     */
+    id: string;
+    /**
+     * Agent
+     */
+    agent: string;
+    /**
+     * Tool
+     */
+    tool: string;
+    /**
+     * Description
+     */
+    description: string;
+    /**
+     * Phase
+     */
+    phase: string;
+    /**
+     * Sequence
+     */
+    sequence: number;
+    /**
+     * Created At
+     */
+    created_at: string;
+};
+
+/**
+ * PersistedMessageResponse
+ */
+export type PersistedMessageResponse = {
+    /**
+     * Id
+     */
+    id: string;
+    /**
+     * Sender
+     */
+    sender: string;
+    /**
+     * Content
+     */
+    content: string;
+    /**
+     * Kind
+     */
+    kind: string;
+    /**
+     * Status
+     */
+    status: string;
+    /**
+     * Sequence
+     */
+    sequence: number;
+    /**
+     * Mention
+     */
+    mention?: string | null;
+    /**
+     * Mentions
+     */
+    mentions?: Array<{
+        [key: string]: unknown;
+    }>;
+    /**
+     * Read By
+     */
+    read_by?: Array<string>;
+    /**
+     * Completed By
+     */
+    completed_by?: Array<string>;
+    /**
+     * Created At
+     */
+    created_at: string;
+};
+
+/**
+ * ProjectCreate
+ */
+export type ProjectCreate = {
+    /**
+     * Name
+     */
+    name?: string | null;
+    /**
+     * Workspace Path
+     */
+    workspace_path: string;
+};
+
+/**
+ * ProjectResponse
+ */
+export type ProjectResponse = {
+    /**
+     * Id
+     */
+    id: string;
+    /**
+     * Name
+     */
+    name: string;
+    /**
+     * Workspace Path
+     */
+    workspace_path: string;
+    /**
+     * Created At
+     */
+    created_at: string;
+    /**
+     * Updated At
+     */
+    updated_at: string;
+    /**
+     * Conversations
+     */
+    conversations?: Array<ConversationSummaryResponse>;
 };
 
 /**
@@ -222,6 +452,109 @@ export type ValidateWorkspaceApiWorkspacesValidatePostResponses = {
 
 export type ValidateWorkspaceApiWorkspacesValidatePostResponse = ValidateWorkspaceApiWorkspacesValidatePostResponses[keyof ValidateWorkspaceApiWorkspacesValidatePostResponses];
 
+export type ListProjectsApiProjectsGetData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/api/projects';
+};
+
+export type ListProjectsApiProjectsGetResponses = {
+    /**
+     * Response List Projects Api Projects Get
+     *
+     * Successful Response
+     */
+    200: Array<ProjectResponse>;
+};
+
+export type ListProjectsApiProjectsGetResponse = ListProjectsApiProjectsGetResponses[keyof ListProjectsApiProjectsGetResponses];
+
+export type CreateProjectApiProjectsPostData = {
+    body: ProjectCreate;
+    path?: never;
+    query?: never;
+    url: '/api/projects';
+};
+
+export type CreateProjectApiProjectsPostErrors = {
+    /**
+     * Validation Error
+     */
+    422: HttpValidationError;
+};
+
+export type CreateProjectApiProjectsPostError = CreateProjectApiProjectsPostErrors[keyof CreateProjectApiProjectsPostErrors];
+
+export type CreateProjectApiProjectsPostResponses = {
+    /**
+     * Successful Response
+     */
+    201: ProjectResponse;
+};
+
+export type CreateProjectApiProjectsPostResponse = CreateProjectApiProjectsPostResponses[keyof CreateProjectApiProjectsPostResponses];
+
+export type CreateConversationApiProjectsProjectIdConversationsPostData = {
+    body: ConversationCreate;
+    path: {
+        /**
+         * Project Id
+         */
+        project_id: string;
+    };
+    query?: never;
+    url: '/api/projects/{project_id}/conversations';
+};
+
+export type CreateConversationApiProjectsProjectIdConversationsPostErrors = {
+    /**
+     * Validation Error
+     */
+    422: HttpValidationError;
+};
+
+export type CreateConversationApiProjectsProjectIdConversationsPostError = CreateConversationApiProjectsProjectIdConversationsPostErrors[keyof CreateConversationApiProjectsProjectIdConversationsPostErrors];
+
+export type CreateConversationApiProjectsProjectIdConversationsPostResponses = {
+    /**
+     * Successful Response
+     */
+    201: ConversationSummaryResponse;
+};
+
+export type CreateConversationApiProjectsProjectIdConversationsPostResponse = CreateConversationApiProjectsProjectIdConversationsPostResponses[keyof CreateConversationApiProjectsProjectIdConversationsPostResponses];
+
+export type ConversationDetailApiConversationsConversationIdGetData = {
+    body?: never;
+    path: {
+        /**
+         * Conversation Id
+         */
+        conversation_id: string;
+    };
+    query?: never;
+    url: '/api/conversations/{conversation_id}';
+};
+
+export type ConversationDetailApiConversationsConversationIdGetErrors = {
+    /**
+     * Validation Error
+     */
+    422: HttpValidationError;
+};
+
+export type ConversationDetailApiConversationsConversationIdGetError = ConversationDetailApiConversationsConversationIdGetErrors[keyof ConversationDetailApiConversationsConversationIdGetErrors];
+
+export type ConversationDetailApiConversationsConversationIdGetResponses = {
+    /**
+     * Successful Response
+     */
+    200: ConversationDetailResponse;
+};
+
+export type ConversationDetailApiConversationsConversationIdGetResponse = ConversationDetailApiConversationsConversationIdGetResponses[keyof ConversationDetailApiConversationsConversationIdGetResponses];
+
 export type TeamStatusApiTeamGetData = {
     body?: never;
     path?: never;
@@ -237,6 +570,48 @@ export type TeamStatusApiTeamGetResponses = {
 };
 
 export type TeamStatusApiTeamGetResponse = TeamStatusApiTeamGetResponses[keyof TeamStatusApiTeamGetResponses];
+
+export type ConversationMessageStreamApiConversationsConversationIdMessagesStreamPostData = {
+    body: MessageCreate;
+    path: {
+        /**
+         * Conversation Id
+         */
+        conversation_id: string;
+    };
+    query?: never;
+    url: '/api/conversations/{conversation_id}/messages/stream';
+};
+
+export type ConversationMessageStreamApiConversationsConversationIdMessagesStreamPostErrors = {
+    /**
+     * Conversation not found
+     */
+    404: unknown;
+    /**
+     * Duplicate client message
+     */
+    409: unknown;
+    /**
+     * Validation Error
+     */
+    422: HttpValidationError;
+    /**
+     * DASHSCOPE_API_KEY is not configured
+     */
+    503: unknown;
+};
+
+export type ConversationMessageStreamApiConversationsConversationIdMessagesStreamPostError = ConversationMessageStreamApiConversationsConversationIdMessagesStreamPostErrors[keyof ConversationMessageStreamApiConversationsConversationIdMessagesStreamPostErrors];
+
+export type ConversationMessageStreamApiConversationsConversationIdMessagesStreamPostResponses = {
+    /**
+     * Server-Sent Events
+     */
+    200: string;
+};
+
+export type ConversationMessageStreamApiConversationsConversationIdMessagesStreamPostResponse = ConversationMessageStreamApiConversationsConversationIdMessagesStreamPostResponses[keyof ConversationMessageStreamApiConversationsConversationIdMessagesStreamPostResponses];
 
 export type ChatStreamApiChatStreamPostData = {
     body: ChatRequest;

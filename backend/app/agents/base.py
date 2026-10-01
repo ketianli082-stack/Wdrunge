@@ -8,6 +8,8 @@ from pathlib import Path
 from langchain_core.tools import BaseTool
 from langchain_openai import ChatOpenAI
 
+from app.agents.identity import team_identity_prompt
+
 
 class AgentStatus(StrEnum):
     IDLE = "idle"
@@ -72,7 +74,7 @@ class Agent:
 
     def system_prompt(self) -> str:
         root = Path(__file__).resolve().parent
-        parts = [(root / "prompts" / self.spec.prompt_file).read_text(encoding="utf-8")]
+        parts = [(root / "prompts" / self.spec.prompt_file).read_text(encoding="utf-8"), team_identity_prompt(self.spec.id)]
         for skill in self.spec.skills:
             parts.append((root / "skills" / skill).read_text(encoding="utf-8"))
         return "\n\n".join(parts)
