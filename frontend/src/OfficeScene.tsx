@@ -323,7 +323,7 @@ export default function OfficeScene({ agents, animate = true, actionOverride = n
         for (const desk of desks) {
           const actualState = agentsRef.current.find((agent) => agent.id === desk.role)?.status ?? "idle";
           const review = reviewsRef.current[desk.role];
-          const resolved = resolveReview(desk.role, actualState, review);
+          const resolved = resolveReview(desk.role, actualState === "waiting" ? "idle" : actualState, review);
           const manual = !!resolved.action && !!review;
           const state = resolved.state;
           let frameTime = previewRef.current.poseTime;
@@ -408,9 +408,10 @@ export default function OfficeScene({ agents, animate = true, actionOverride = n
   return <div className={`office-scene${unavailable ? " is-unavailable" : ""}`} ref={stageRef} aria-label="后方俯视的三维办公室，两列三排角色工位，中央与横向通道保持畅通">
     <div className="office-scene-render" ref={renderRef} role="img" aria-label="Leader 宽屏、产品笔记本、美工绘图板、前端双屏、后端三屏、测试多设备工位" />
     {!unavailable && stations.map(({ role }) => {
-      const status = resolveReview(role, agents.find((agent) => agent.id === role)?.status ?? "idle", reviews[role]).state;
+      const actualState = agents.find((agent) => agent.id === role)?.status ?? "idle";
+      const status = resolveReview(role, actualState === "waiting" ? "idle" : actualState, reviews[role]).state;
       return <button type="button" className={`station-label ${status}${reviews[role] ? " is-manual" : ""}`} data-station={role} key={role} title={`${deskDetails[role].label} · 点击选择动作`} aria-label={`${deskDetails[role].name}，选择动作`} aria-expanded={selectedRole === role} onClick={() => openReview(role)}>
-        <span>{deskDetails[role].name}</span><i aria-label={status === "running" ? "工作中" : status === "failed" ? "需要关注" : "待命"} />{reviews[role] && <small>手动</small>}
+        <span>{deskDetails[role].name}</span><i aria-label={status === "running" ? "工作中" : status === "failed" ? "需要关注" : actualState === "waiting" ? "等待消息" : "待命"} />{reviews[role] ? <small>手动</small> : actualState === "waiting" && <small>等待消息</small>}
       </button>;
     })}
     {!unavailable && selectedRole && <div className={`character-review${stations.find(station => station.role === selectedRole)!.x > 0 ? " is-left" : ""}`} ref={reviewCardRef} role="dialog" aria-label={`${deskDetails[selectedRole].name}动作验收`} onKeyDown={event => { if (event.key === "Escape") { event.stopPropagation(); closeReview(); } }}>

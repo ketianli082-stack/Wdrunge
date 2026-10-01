@@ -14,6 +14,7 @@ from app.agents.identity import team_identity_prompt
 class AgentStatus(StrEnum):
     IDLE = "idle"
     RUNNING = "running"
+    WAITING = "waiting"
     FAILED = "failed"
 
 

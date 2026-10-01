@@ -497,7 +497,7 @@ export type TeamMemberResponse = {
     /**
      * Status
      */
-    status: 'idle' | 'running' | 'failed';
+    status: 'idle' | 'running' | 'waiting' | 'failed';
     /**
      * Tools
      */

@@ -279,3 +279,21 @@ and `include_hash=true` to read larger files in parts and obtain that SHA-256.
 Managed Markdown still requires `collaborate publish`. These are exact text
 replacements, not Git patch syntax. External editors do not participate in the
 process-local lock; a hash/content check detects changes observed before replace.
+
+
+### Asynchronous Leader coordination
+
+Persistent project delegations enqueue work and return immediately. Leader ends
+its current turn after handling ready decisions and displays “等待消息” when work
+remains. The scheduler observes the durable Leader inbox without making model
+calls while idle. Mentions, delivery and escalation events start serialized
+background turns independent of the browser's SSE connection. Each turn uses the
+saved human/assistant history plus current task handoff and unconsumed reminders.
+After replying/accepting, Leader returns to waiting if tasks remain, or idle.
+
+Read receipts are emitted after a successful model response, including tool-call
+responses. Inbox consumption remains deferred until the final reply is persisted:
+a crash can replay unfinished coordination without misrepresenting “read” as
+“resolved.” Restart restores eligible conversations and pending events. Failures
+retry with backoff up to three times, then wait for user intervention; a new user
+turn resets this failure state. Project pause and debug reset stop automatic work.

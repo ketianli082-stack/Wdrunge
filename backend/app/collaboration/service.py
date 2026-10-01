@@ -507,9 +507,9 @@ class Collaboration:
             if state == 'cancelled':
                 await self._cancel_dependents(c, project, identifier)
             await self._put(c, 'request', project, identifier, r)
-            await self._event(c, project, r['sender'], {'type': 'request_status', 'request_id': identifier, 'state': state, 'result': r['result'][:1200], 'target_request': r.get('parent')}, r['conversation'])
             recipient = r['recipient'] if actor != r['recipient'] else r['sender']
-            await self._group_message(c, project, r['conversation'], actor, recipient, public_summary, f'transition:{identifier}:{uuid4().hex}')
+            chat_message_id = await self._group_message(c, project, r['conversation'], actor, recipient, public_summary, f'transition:{identifier}:{uuid4().hex}')
+            await self._event(c, project, r['sender'], {'type': 'request_status', 'request_id': identifier, 'state': state, 'result': r['result'][:1200], 'target_request': r.get('parent'), 'chat_message_id': chat_message_id if recipient == r['sender'] else None}, r['conversation'])
             if state == 'completed' and r.get('origin_message') and r['conversation']:
                 await self.store.add_reaction_in_transaction(c, r['conversation'], {'message_id': r['origin_message'], 'worker': r['recipient'], 'reaction': 'done'})
             return r
@@ -854,3 +854,30 @@ class Collaboration:
             revisions = [json.loads(row) for row in rows]
             return {'revisions': [{key: r.get(key) for key in ('version','summary','author','created','conversation','based_on','batch_id','merged_from_version')} for r in revisions[:limit]],
                     'next_offset': offset+limit if len(revisions)>limit else None}
+
+    async def leader_session(self, project, conversation, **updates):
+        async with self.transaction() as c:
+            await self._conversation(c, project, conversation)
+            session = await self._get(c, 'leader_session', project, conversation, False) or {
+                'id': conversation, 'state': 'waiting', 'last_wake': time.time(),
+                'last_progress': 0, 'retry_after': 0, 'failures': 0,
+            }
+            session.update(updates)
+            await self._put(c, 'leader_session', project, conversation, session)
+            return session
+
+    async def mark_leader_read(self, project, event_ids):
+        """UI read receipt after a successful model response, without consuming
+        the durable inbox until the coordination turn has been saved."""
+        async with self.transaction() as c:
+            for identifier in event_ids:
+                event = (await c.execute(text("SELECT conversation,data FROM collaboration_events WHERE project=:p AND recipient='leader' AND seq=:s"), {'p': project, 's': identifier})).mappings().first()
+                if event:
+                    payload = json.loads(event['data'])
+                    if event['conversation'] and payload.get('chat_message_id'):
+                        await self.store.add_receipt_in_transaction(c, event['conversation'], {'message_id': payload['chat_message_id'], 'reader': 'leader'})
+
+    async def leader_rest_state(self, project, conversation):
+        async with self.reading() as c:
+            pending = await c.scalar(text("SELECT 1 FROM collaboration_records WHERE project=:p AND kind='request' AND state IN ('queued','running','blocked','review') AND json_extract(data,'$.conversation')=:v LIMIT 1"), {'p':project, 'v':conversation})
+            return 'waiting' if pending else 'idle'

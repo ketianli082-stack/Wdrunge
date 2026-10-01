@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+import time
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from functools import lru_cache
@@ -193,29 +194,39 @@ class Team:
 
     async def stream(
         self, history: list[BaseMessage], *, conversation_id: str | None = None,
-        workspace_path: Path | None = None,
+        workspace_path: Path | None = None, wake_only: bool = False,
     ) -> AsyncIterator[tuple[str, dict]]:
         """Let the Leader reply or function-call specialists as needed."""
         session_id = conversation_id or uuid4().hex
         async with self._lock:
             token = active_workspace.set(workspace_path.resolve() if workspace_path else None)
             collaboration_token = None
-            if self.collaboration:
-                project = await self.collaboration.project_for_conversation(session_id)
-                if project:
-                    context = Context(self.collaboration, project, 'leader', session_id, f'leader:{session_id}')
-                    context.read_context = uuid4().hex
-                    collaboration_token = active.set(context)
             try:
+                if self.collaboration:
+                    project = await self.collaboration.project_for_conversation(session_id)
+                    if project:
+                        if wake_only and not await self.collaboration.inbox(project, 'leader', f'leader:{session_id}', session_id):
+                            return
+                        await self.collaboration.leader_session(project, session_id, state='running', last_wake=time.time(), retry_after=0, **({'failures': 0} if not wake_only else {}))
+                        context = Context(self.collaboration, project, 'leader', session_id, f'leader:{session_id}')
+                        context.read_context = uuid4().hex
+                        collaboration_token = active.set(context)
                 async for event in self._run(history, session_id):
                     yield event
             finally:
-                if collaboration_token is not None:
-                    active.reset(collaboration_token)
-                active_workspace.reset(token)
-                for agent in (self.leader, *self.workers.values()):
-                    if agent.status == AgentStatus.RUNNING:
-                        agent.status = AgentStatus.IDLE
+                try:
+                    if collaboration_token is not None:
+                        ctx = active.get()
+                        state = 'failed' if self.leader.status == AgentStatus.FAILED else await self.collaboration.leader_rest_state(ctx.project, session_id)
+                        await self.collaboration.leader_session(ctx.project, session_id, state=state)
+                        self.leader.status = AgentStatus(state)
+                finally:
+                    if collaboration_token is not None:
+                        active.reset(collaboration_token)
+                    active_workspace.reset(token)
+                    for agent in (self.leader, *self.workers.values()):
+                        if agent.status == AgentStatus.RUNNING:
+                            agent.status = AgentStatus.IDLE
 
     async def _run(self, history: list[BaseMessage], conversation_id: str) -> AsyncIterator[tuple[str, dict]]:
         self._pending_leader_receipts.pop(conversation_id, None)
@@ -233,6 +244,10 @@ class Team:
             ]
         else:
             messages = [system, *history]
+        if active.get():
+            import json
+            ctx = active.get()
+            messages.append(HumanMessage(content='Current coordination state (project data): ' + json.dumps(await ctx.service.handoff(ctx.project, 'leader'), ensure_ascii=False)))
         count = 0
 
         for _ in range(MAX_DELEGATIONS + 6):
@@ -256,7 +271,9 @@ class Team:
                 await ctx.service.confirm_reads(ctx.project, ctx.pending_reads)
                 ctx.pending_reads.clear()
             if ctx and reminders:
-                ctx.seen_events.update(i for r in reminders for i in r.get('event_ids', [r.get('event_id')]))
+                event_ids = [i for r in reminders for i in r.get('event_ids', [r.get('event_id')])]
+                ctx.seen_events.update(event_ids)
+                await ctx.service.mark_leader_read(ctx.project, event_ids)
             if self.leader.record_usage(response):
                 yield "usage", self.usage_snapshot()
 
@@ -468,15 +485,8 @@ class Team:
             if ctx:
                 request = await ctx.service.create_request(ctx.project, 'leader', assignment.worker,
                     assignment.task + '\nHandoff: ' + assignment.handoff, event_id, conversation=conversation_id, summary=assignment.summary, origin_message=message_id)
-                while True:
-                    current = await ctx.service.get_request(ctx.project, request['id'])
-                    async with ctx.service.reading() as connection:
-                        settings = await ctx.service._get(connection, 'settings', ctx.project, 'project', False)
-                    if current['state'] in {'review', 'completed', 'cancelled', 'failed', 'rejected'} or current.get('blocked_reason') or current.get('escalated_at') or (settings and settings.get('paused')):
-                        break
-                    await asyncio.sleep(.25)
-                output.append(f"Durable request {request['id']} is {current['state']}. Result: {current['result']}. Artifacts: {current['delivered']}. Use collaborate transition to accept a reviewed delivery or request rework; queued/blocked work is not completed.")
-                await queue.put(("activity", {"id": event_id, "agent": "leader", "tool": tool_name, "description": f"协作请求 {request['id']} · {current['state']}", "phase": "failed" if current['state'] == 'failed' else "completed"}))
+                output.append(f"Durable request {request['id']} is queued. Delegation returns immediately; it is NOT completed. The coordinator will wake on messages, blockers or delivery. Handle any other ready decisions now, then give a short update and suspend; do not poll or re-create this task.")
+                await queue.put(("activity", {"id": event_id, "agent": "leader", "tool": tool_name, "description": f"已异步指派给{worker.spec.name}，等待消息或交付", "phase": "completed"}))
                 await queue.put(("_finished", {"call_id": call_id, "worker": assignment.worker, "output": ''.join(output), "error": None}))
                 return
             await queue.put(("read_receipt", {"message_id": message_id, "reader": assignment.worker}))

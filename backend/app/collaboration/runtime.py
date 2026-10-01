@@ -25,16 +25,20 @@ class Scheduler:
         self.active_workers = {}
         self.team.scheduler = self
         self.last_maintenance = 0
+        from app.collaboration.coordinator import LeaderCoordinator
+        self.coordinator = LeaderCoordinator(service, team)
 
     async def start(self):
         await self.service.initialize()
         await self.service.recover_requests()
+        await self.coordinator.start()
         self.loop = asyncio.create_task(self.run())
 
     async def close(self):
         if self.loop:
             self.loop.cancel()
             await asyncio.gather(self.loop, return_exceptions=True)
+        await self.coordinator.close()
         for task in self.jobs:
             task.cancel()
         await asyncio.gather(*self.jobs, return_exceptions=True)
@@ -42,6 +46,7 @@ class Scheduler:
     async def run(self):
         while True:
             try:
+                await self.coordinator.tick()
                 if time.monotonic()-self.last_maintenance > 10:
                     await self.service.renew_leases(self.owner, set(self.executions.values()))
                     await self.service.scheduling_tick()

@@ -1520,6 +1520,7 @@
             "enum": [
               "idle",
               "running",
+              "waiting",
               "failed"
             ],
             "title": "Status"

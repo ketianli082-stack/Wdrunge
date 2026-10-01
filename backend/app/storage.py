@@ -412,6 +412,8 @@ class ChatStore:
         existing = await connection.scalar(select(message_receipts.c.message_id).where(
             message_receipts.c.message_id == payload["message_id"], message_receipts.c.reader_id == payload["reader"]
         ))
+        if existing:
+            return
         if not existing:
             await connection.execute(insert(message_receipts).values(
                 message_id=payload["message_id"], reader_id=payload["reader"], created_at=now,

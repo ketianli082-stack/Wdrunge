@@ -282,7 +282,7 @@ def resolve_workspace(path: str) -> Path:
 class TeamMemberResponse(BaseModel):
     id: str
     name: str
-    status: Literal["idle", "running", "failed"]
+    status: Literal["idle", "running", "waiting", "failed"]
     tools: list[str]
     skills: list[str]
 

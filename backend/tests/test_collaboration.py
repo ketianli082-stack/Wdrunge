@@ -395,7 +395,7 @@ def test_leader_receipts_wait_for_durable_reply(tmp_path, monkeypatch):
     run(scenario())
 
 
-def test_persisted_leader_waits_for_review_then_accepts(tmp_path, monkeypatch):
+def test_persisted_leader_dispatches_then_wakes_to_accept(tmp_path, monkeypatch):
     from app.agents.team import Team
     from app.agents.worker import WorkerAgent
     from app.collaboration.runtime import Scheduler
@@ -413,14 +413,12 @@ def test_persisted_leader_waits_for_review_then_accepts(tmp_path, monkeypatch):
         await team.configure_persistence(store, InMemorySaver())
         team.collaboration = s
         async def leader(messages, *, allow_delegation=True):
-            results = [m for m in messages if isinstance(m, ToolMessage)]
-            if not results:
+            requests = (await s.snapshot(p))['request']
+            if not requests:
                 return AIMessage(content='', tool_calls=[{'id':'delegate','name':'delegate_task','args':{'worker':'frontend','task':'Deliver file','summary':'Create file','handoff':'Write delivery.txt'}}])
-            if len(results) == 1:
-                requests = (await s.snapshot(p))['request']
-                assert requests[0]['state'] == 'review'
+            if requests[0]['state'] == 'review':
                 return AIMessage(content='', tool_calls=[{'id':'accept','name':'collaborate','args':{'action':'transition','payload':{'identifier':requests[0]['id'],'state':'completed','result':'Verified delivery'}}}])
-            return AIMessage(content='Delivery accepted')
+            return AIMessage(content='Delivery accepted' if requests[0]['state']=='completed' else 'Work assigned; waiting')
         monkeypatch.setattr(team.leader, 'next_message', leader)
         scheduler = Scheduler(s, team)
         await scheduler.start()
@@ -433,8 +431,11 @@ def test_persisted_leader_waits_for_review_then_accepts(tmp_path, monkeypatch):
             return result
         try:
             events = await asyncio.wait_for(collect(), 5)
-            assert ('delta', {'role':'leader','content':'Delivery accepted'}) in events
-            assert (await s.snapshot(p))['request'][0]['state'] == 'completed'
+            assert any(name=='delta' for name, _ in events)
+            async def accepted():
+                while (await s.snapshot(p))['request'][0]['state'] != 'completed':
+                    await asyncio.sleep(.02)
+            await asyncio.wait_for(accepted(), 5)
             assert (workspace/'delivery.txt').read_text() == 'ready'
         finally:
             await scheduler.close()
