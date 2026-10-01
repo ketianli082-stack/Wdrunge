@@ -468,3 +468,28 @@ def test_team_stream_scopes_each_conversation_to_its_workspace(tmp_path, monkeyp
     assert [path for path, _ in observed] == [first, second]
     assert all(str(path) in prompt for path, prompt in observed)
     assert _workspace.active_workspace.get() is None
+
+
+def test_worker_can_finish_beyond_default_graph_recursion_limit(monkeypatch):
+    from langchain_core.runnables import RunnableLambda
+    from app.agents.limits import graph_recursion_limit
+    monkeypatch.delenv('WDRUNGE_GRAPH_RECURSION_LIMIT', raising=False)
+    assert graph_recursion_limit() == 1000
+    calls = []
+    async def respond(messages):
+        calls.append(messages)
+        if len(calls) <= 30:
+            return AIMessage(content='', tool_calls=[{'name':'current_utc_time', 'args':{}, 'id':f'clock-{len(calls)}'}])
+        return AIMessage(content='Long task finished')
+    class Model:
+        def bind_tools(self, tools):
+            return RunnableLambda(respond)
+    worker = WorkerAgent(AgentSpec(id='testing', name='Test', prompt_file='testing.md', tools=(current_utc_time,)))
+    monkeypatch.setattr(worker, 'model', lambda: Model())
+    async def scenario():
+        return [e async for e in worker.stream('Long task', conversation_id='long', context_mode='fresh', handoff='')]
+    events = asyncio.run(scenario())
+    assert len(calls) == 31
+    assert sum(name == 'activity' and data['phase'] == 'completed' for name, data in events) == 30
+    monkeypatch.setenv('WDRUNGE_GRAPH_RECURSION_LIMIT', '7')
+    assert graph_recursion_limit() == 7

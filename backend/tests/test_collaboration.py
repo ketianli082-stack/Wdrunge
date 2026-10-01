@@ -440,3 +440,28 @@ def test_persisted_leader_waits_for_review_then_accepts(tmp_path, monkeypatch):
             await scheduler.close()
             await store.close()
     run(scenario())
+
+
+def test_retry_failed_request_preserves_workspace_and_unblocks_dependency(tmp_path):
+    async def scenario():
+        store, s, p, workspace = await setup(tmp_path)
+        child = await s.create_request(p, 'leader', 'product', 'Product', 'child')
+        parent = await s.create_request(p, 'leader', 'frontend', 'Build', 'parent', dependencies=[child['id']])
+        job = await s.claim()
+        isolated = await s.prepare_workspace(p, child['id'])
+        (isolated.work/'draft.txt').write_text('retained work')
+        await s.transition(p, child['id'], 'product', 'failed', 'Recursion limit of 25 reached')
+        assert await s.claim() is None
+        assert (await s.get_request(p, parent['id']))['blocked_reason'] == 'dependency_failed'
+        await s.transition(p, child['id'], 'leader', 'queued', 'Continue original task')
+        retried = await s.claim()
+        assert retried[2]['id'] == child['id']
+        assert retried[2]['workspace_id'] == job[2]['workspace_id']
+        assert (await s.prepare_workspace(p, child['id'])).work.joinpath('draft.txt').read_text() == 'retained work'
+        await s.transition(p, child['id'], 'product', 'review', 'Ready')
+        await s.transition(p, child['id'], 'leader', 'completed', 'Accepted')
+        resumed = await s.claim()
+        assert resumed[2]['id'] == parent['id']
+        assert 'blocked_reason' not in resumed[2]
+        await store.close()
+    run(scenario())

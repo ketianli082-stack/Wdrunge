@@ -425,11 +425,15 @@ class Collaboration:
         async with self.transaction() as c:
             p = await self._project(c, project)
             r = await self._get(c, 'request', project, identifier)
-            allowed = {'running': {'review', 'blocked', 'failed', 'cancelled'}, 'queued': {'cancelled', 'rejected'}, 'blocked': {'queued', 'cancelled'}, 'review': {'completed', 'queued', 'cancelled'}}
+            allowed = {'running': {'review', 'blocked', 'failed', 'cancelled'}, 'queued': {'cancelled', 'rejected'}, 'blocked': {'queued', 'cancelled'}, 'review': {'completed', 'queued', 'cancelled'}, 'failed': {'queued', 'cancelled'}}
             if state not in allowed.get(r['state'], set()):
                 raise StorageConflictError(f"Cannot move {r['state']} to {state}")
             if actor not in {r['sender'], r['recipient'], 'leader'} or (state == 'completed' and actor not in {r['sender'], 'leader'}):
                 raise ValueError('Actor cannot make this transition')
+            if r['state'] == 'failed' and actor not in {r['sender'], 'leader'}:
+                raise ValueError('Only sender or Leader may retry a failed request')
+            if r['state'] == 'failed' and state == 'queued':
+                r['attempts'] = 0
             if based_on is not None:
                 await self._dependencies(c, project, based_on)
                 r['based_on'] = based_on
@@ -493,6 +497,7 @@ class Collaboration:
                     r.update(state='failed', result='Request execution budget exhausted')
                     await self._put(c, 'request', project, r['id'], r)
                     continue
+                r.pop('blocked_reason', None)
                 r.update(state='running', attempts=r['attempts']+1, lease_owner=owner, lease_until=time.time()+60)
                 if not r.get('workspace_id') or r.get('workspace_published'):
                     r.update(workspace_id=uuid4().hex, workspace_published=False)

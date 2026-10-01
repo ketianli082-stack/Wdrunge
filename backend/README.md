@@ -200,3 +200,10 @@ limits listings to 10,000 entries. Paths stay within the selected project. HTML 
 unsupported resources are downloads, not executable pages. Raw responses disable
 caching and use a sandbox CSP. File previews reflect current disk contents;
 registered document revision history remains in “协作记录与管理”.
+
+Specialist graphs default to 1,000 LangGraph steps per execution; override with
+`WDRUNGE_GRAPH_RECURSION_LIMIT`. Steps include model, tool and acknowledgment nodes,
+so this is not a count of tool calls. A failed request can be explicitly requeued
+by its sender or Leader (also via “重试原任务” in the panel). Retried requests retain
+their ID, dependencies and unpublished workspace; they are not duplicated or
+silently restarted. Dependencies resume once their prerequisites are reviewable.

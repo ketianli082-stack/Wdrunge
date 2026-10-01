@@ -9,6 +9,7 @@ from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.graph import END, START, MessagesState, StateGraph
 from langgraph.prebuilt import ToolNode, tools_condition
 
+from app.agents.limits import graph_recursion_limit
 from app.agents.base import Agent
 from app.collaboration.tools import active, collaborate
 
@@ -189,7 +190,8 @@ class WorkerAgent(Agent):
         active_tools: dict[str, str] = {}
         async for event in self.build_graph().astream_events(
             {"messages": messages},
-            config={"configurable": {"thread_id": self._threads[conversation_id]}},
+            config={"configurable": {"thread_id": self._threads[conversation_id]},
+                    "recursion_limit": graph_recursion_limit()},
             version="v2",
             **({"durability": "sync"} if ctx else {}),
         ):
