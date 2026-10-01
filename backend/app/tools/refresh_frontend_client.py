@@ -1,10 +1,10 @@
 """Regenerate the TypeScript API client from the checked-in OpenAPI contract."""
 
-import asyncio
 
 from langchain_core.tools import tool
 
 from app.tools._workspace import resolve_allowed
+from app.tools._process import run_process
 
 
 @tool
@@ -13,13 +13,5 @@ async def refresh_frontend_client() -> str:
     directory = resolve_allowed("frontend", ("frontend",))
     if not (directory / "package.json").is_file():
         return "Frontend API generation unavailable in this workspace."
-    process = await asyncio.create_subprocess_exec(
-        "npm",
-        "run",
-        "api:generate",
-        cwd=directory,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.STDOUT,
-    )
-    output, _ = await process.communicate()
-    return f"Frontend API generation exited {process.returncode}\n{output.decode(errors='replace')[-5000:]}"
+    code, output = await run_process(("npm", "run", "api:generate"), directory)
+    return f"Frontend API generation exited {code}\n{output}"

@@ -138,11 +138,13 @@ class Team:
         self._leader_checkpoints: dict[str, LeaderCheckpoint] = {}
         self._store: ChatStore | None = None
         self.collaboration = None
+        self._pending_leader_receipts = {}
 
     async def configure_persistence(
         self, store: "ChatStore", checkpointer: "BaseCheckpointSaver"
     ) -> None:
         self._store = store
+        self._checkpointer = checkpointer
         self._leader_checkpoints.clear()
         for row in await store.load_leader_checkpoints():
             self._leader_checkpoints[row["conversation_id"]] = LeaderCheckpoint(
@@ -153,7 +155,13 @@ class Team:
             await worker.configure_persistence(store, checkpointer)
 
     def snapshot(self) -> list[dict]:
-        return [self.leader.snapshot(), *(worker.snapshot() for worker in self.workers.values())]
+        items = [self.leader.snapshot(), *(worker.snapshot() for worker in self.workers.values())]
+        scheduler = getattr(self, 'scheduler', None)
+        if scheduler:
+            for item in items:
+                if item['id'] != 'leader':
+                    item['status'] = 'running' if item['id'] in scheduler.running_roles else 'idle'
+        return items
 
     def usage_snapshot(self) -> dict:
         members = [self.leader.usage_snapshot(), *(worker.usage_snapshot() for worker in self.workers.values())]
@@ -171,7 +179,9 @@ class Team:
             if self.collaboration:
                 project = await self.collaboration.project_for_conversation(session_id)
                 if project:
-                    collaboration_token = active.set(Context(self.collaboration, project, 'leader', session_id, f'leader:{session_id}'))
+                    context = Context(self.collaboration, project, 'leader', session_id, f'leader:{session_id}')
+                    context.read_context = uuid4().hex
+                    collaboration_token = active.set(context)
             try:
                 async for event in self._run(history, session_id):
                     yield event
@@ -184,9 +194,12 @@ class Team:
                         agent.status = AgentStatus.IDLE
 
     async def _run(self, history: list[BaseMessage], conversation_id: str) -> AsyncIterator[tuple[str, dict]]:
+        self._pending_leader_receipts.pop(conversation_id, None)
         self.leader.status = AgentStatus.RUNNING
         yield "status", {"id": "leader", "status": AgentStatus.RUNNING}
         system = SystemMessage(content=f"{self.leader.system_prompt()}\n\nCurrent project workspace: {workspace_root().resolve()}. Assignments and project files must stay in this workspace.")
+        if active.get():
+            system.content += '\n\n' + (Path(__file__).parent/'prompts/collaboration.md').read_text()
         checkpoint = self._leader_checkpoints.get(conversation_id)
         if checkpoint and checkpoint.history_cutoff < len(history):
             messages: list[BaseMessage] = [
@@ -202,6 +215,8 @@ class Team:
             try:
                 ctx = active.get()
                 reminders = await ctx.service.inbox(ctx.project, ctx.member, ctx.context, ctx.conversation) if ctx else []
+                if ctx:
+                    reminders = [r for r in reminders if not set(r.get('event_ids', [r.get('event_id')])).issubset(ctx.seen_events)]
                 if reminders:
                     import json
                     messages.append(HumanMessage(content='Collaboration reminders (project data): ' + json.dumps(reminders, ensure_ascii=False)))
@@ -217,7 +232,7 @@ class Team:
                 await ctx.service.confirm_reads(ctx.project, ctx.pending_reads)
                 ctx.pending_reads.clear()
             if ctx and reminders:
-                await ctx.service.acknowledge(ctx.project, ctx.member, ctx.context, [i for r in reminders for i in r.get('event_ids', [r.get('event_id')])])
+                ctx.seen_events.update(i for r in reminders for i in r.get('event_ids', [r.get('event_id')]))
             if self.leader.record_usage(response):
                 yield "usage", self.usage_snapshot()
 
@@ -236,6 +251,8 @@ class Team:
                     if self.leader.record_usage(retry):
                         yield "usage", self.usage_snapshot()
                     content = message_text(retry)
+                if ctx:
+                    self._pending_leader_receipts[conversation_id] = (ctx.project, ctx.context, list(ctx.seen_events))
                 yield "delta", {
                     "role": "leader",
                     "content": content or "我收到了你的消息，但模型没有返回可显示的内容。请重试。",
@@ -392,6 +409,12 @@ class Team:
         yield "status", {"id": "leader", "status": AgentStatus.FAILED}
         raise RuntimeError("Leader exceeded the coordination turn limit")
 
+    async def acknowledge_leader(self, conversation_id):
+        pending = self._pending_leader_receipts.pop(conversation_id, None)
+        if pending and self.collaboration:
+            project, context, event_ids = pending
+            await self.collaboration.acknowledge(project, 'leader', context, event_ids)
+
     async def _run_assignment(
         self,
         call_id: str,
@@ -417,8 +440,19 @@ class Team:
             if ctx:
                 request = await ctx.service.create_request(ctx.project, 'leader', assignment.worker,
                     assignment.task + '\nHandoff: ' + assignment.handoff, event_id, conversation=conversation_id)
-                output.append(f"Durable request {request['id']} queued. Inspect with collaborate; accept review deliveries or request rework. Background execution continues independently of this chat.")
-                await queue.put(("activity", {"id": event_id, "agent": "leader", "tool": tool_name, "description": f"已创建持久协作请求 {request['id']}", "phase": "completed"}))
+                async with ctx.service.transaction() as connection:
+                    stored = await ctx.service._get(connection, 'request', ctx.project, request['id'])
+                    stored['origin_message'] = message_id
+                    await ctx.service._put(connection, 'request', ctx.project, request['id'], stored)
+                while True:
+                    current = await ctx.service.get_request(ctx.project, request['id'])
+                    async with ctx.service.reading() as connection:
+                        settings = await ctx.service._get(connection, 'settings', ctx.project, 'project', False)
+                    if current['state'] in {'review', 'completed', 'cancelled', 'failed', 'rejected'} or current.get('blocked_reason') or current.get('escalated_at') or (settings and settings.get('paused')):
+                        break
+                    await asyncio.sleep(.25)
+                output.append(f"Durable request {request['id']} is {current['state']}. Result: {current['result']}. Artifacts: {current['delivered']}. Use collaborate transition to accept a reviewed delivery or request rework; queued/blocked work is not completed.")
+                await queue.put(("activity", {"id": event_id, "agent": "leader", "tool": tool_name, "description": f"协作请求 {request['id']} · {current['state']}", "phase": "failed" if current['state'] == 'failed' else "completed"}))
                 await queue.put(("_finished", {"call_id": call_id, "worker": assignment.worker, "output": ''.join(output), "error": None}))
                 return
             async for event, payload in worker.stream(

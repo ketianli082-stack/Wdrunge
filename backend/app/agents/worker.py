@@ -62,10 +62,10 @@ class WorkerAgent(Agent):
             reminders = []
             if ctx and ctx.request:
                 current = await ctx.service.get_request(ctx.project, ctx.request)
-                if current['state'] != 'running':
+                if current['state'] != 'running' or (ctx.instance_id and current.get('instance_id') != ctx.instance_id):
                     return {'messages': [AIMessage(content='Request execution suspended.')]}
             if ctx:
-                reminders = await ctx.service.inbox(ctx.project, ctx.member, ctx.context, ctx.conversation)
+                reminders = await ctx.service.inbox(ctx.project, ctx.member, ctx.context, ctx.conversation, request=ctx.request)
             import json
             messages = state["messages"]
             if reminders:
@@ -105,12 +105,23 @@ class WorkerAgent(Agent):
 
             async def guarded_tools(state, config):
                 ctx = active.get()
-                if ctx and ctx.request:
-                    current = await ctx.service.get_request(ctx.project, ctx.request)
-                    if current['state'] != 'running':
-                        from langchain_core.messages import ToolMessage
-                        return {'messages': [ToolMessage(content='Request is no longer running; tool skipped.', tool_call_id=call['id']) for call in state['messages'][-1].tool_calls]}
-                return await tool_node.ainvoke(state, config)
+                if not ctx:
+                    return await tool_node.ainvoke(state, config)
+                from langchain_core.messages import ToolMessage
+                results = []
+                last = state['messages'][-1]
+                # Ordered mutations: a wait/cancel/delivery takes effect before
+                # any subsequent tool in the same model response may execute.
+                for call in last.tool_calls:
+                    if ctx.request:
+                        current = await ctx.service.get_request(ctx.project, ctx.request)
+                        if current['state'] != 'running' or (ctx.instance_id and current.get('instance_id') != ctx.instance_id):
+                            results.append(ToolMessage(content='Request is no longer running; tool skipped.', tool_call_id=call['id']))
+                            continue
+                    single = last.model_copy(update={'tool_calls': [call]})
+                    result = await tool_node.ainvoke({**state, 'messages': [*state['messages'][:-1], single]}, config)
+                    results.extend(result['messages'])
+                return {'messages': results}
 
             graph.add_node("tools", guarded_tools)
             graph.add_node("acknowledge", after_model)
@@ -159,7 +170,11 @@ class WorkerAgent(Agent):
                 await self._store.save_agent_session(
                     conversation_id, self.spec.id, self._threads[conversation_id], None
                 )
-            messages: list[BaseMessage] = [SystemMessage(content=self.system_prompt())]
+            prompt = self.system_prompt()
+            if active.get():
+                from pathlib import Path
+                prompt += '\n\n' + (Path(__file__).parent/'prompts/collaboration.md').read_text()
+            messages: list[BaseMessage] = [SystemMessage(content=prompt)]
         else:
             messages = []
         ctx = active.get()
@@ -176,6 +191,7 @@ class WorkerAgent(Agent):
             {"messages": messages},
             config={"configurable": {"thread_id": self._threads[conversation_id]}},
             version="v2",
+            **({"durability": "sync"} if ctx else {}),
         ):
             kind = event["event"]
             name = event.get("name", "")

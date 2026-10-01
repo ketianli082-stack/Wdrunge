@@ -630,7 +630,10 @@
               "dependencies",
               "decision",
               "maintenance",
-              "handoff"
+              "handoff",
+              "recover",
+              "inspect_message",
+              "history"
             ],
             "title": "Action"
           },

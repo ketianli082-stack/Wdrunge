@@ -1,12 +1,12 @@
 """Run one of the project's fixed verification commands."""
 
-import asyncio
 import sys
 from typing import Literal
 
 from langchain_core.tools import tool
 
 from app.tools._workspace import resolve_allowed
+from app.tools._process import run_process
 
 
 @tool
@@ -22,17 +22,5 @@ async def run_project_check(check: Literal["backend_tests", "frontend_build"]) -
     if not directory.is_dir():
         return f"{check} unavailable: {directory} does not exist."
 
-    process = await asyncio.create_subprocess_exec(
-        *command,
-        cwd=directory,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.STDOUT,
-    )
-    try:
-        output, _ = await asyncio.wait_for(process.communicate(), timeout=120)
-    except TimeoutError:
-        process.kill()
-        await process.communicate()
-        return f"{check} timed out after 120 seconds."
-    text = output.decode(errors="replace")[-10000:]
-    return f"{check} exited {process.returncode}\n{text}"
+    code, output = await run_process(command, directory)
+    return f"{check} exited {code}\n{output}"

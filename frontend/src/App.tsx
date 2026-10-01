@@ -144,6 +144,19 @@ function App() {
     return () => abort.abort();
   }, []);
 
+  useEffect(() => {
+    const abort = new AbortController();
+    const timer = setInterval(() => {
+      void getTeamStatus(abort.signal).then(team => { if (!abort.signal.aborted) { setAgents(team.agents); setUsage(team.usage); } }).catch(() => {});
+      if (active?.id && !streaming) {
+        void getConversation(active.id, abort.signal).then(detail => {
+          if (!abort.signal.aborted) setActive(current => current?.id === detail.id ? toConversationView(detail) : current);
+        }).catch(() => {});
+      }
+    }, 3000);
+    return () => { abort.abort(); clearInterval(timer); };
+  }, [active?.id, streaming]);
+
   useEffect(() => () => controller.current?.abort(), []);
   useEffect(() => {
     if (panel === "chat" && chatFeed.current) chatFeed.current.scrollTop = chatFeed.current.scrollHeight;

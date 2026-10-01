@@ -19,6 +19,7 @@ from sqlalchemy import text
 
 from app.collaboration.documents import digest, outline, section, edit_document, page
 from app.collaboration.schema import DDL
+from app.collaboration.workspaces import merge_text, IsolatedWorkspace
 from app.storage import ChatStore, StorageConflictError, StorageNotFoundError
 
 ROLES = {'leader', 'product', 'backend', 'frontend', 'designer', 'testing'}
@@ -30,6 +31,8 @@ class Collaboration:
         self.store = store
         self._lock = asyncio.Lock()
         self._ready = False
+        self.max_running = max(1, min(32, int(os.getenv('WDRUNGE_MAX_CONCURRENCY', '4'))))
+        self.role_concurrency = max(1, min(8, int(os.getenv('WDRUNGE_ROLE_CONCURRENCY', '2'))))
 
     async def initialize(self):
         if self._ready:
@@ -41,6 +44,7 @@ class Collaboration:
                     await c.execute(text(sql))
             self._ready = True
         await self.recover()
+        await self.rebuild_search()
 
     @asynccontextmanager
     async def transaction(self):
@@ -54,6 +58,16 @@ class Collaboration:
                 except BaseException:
                     await c.rollback()
                     raise
+
+    @asynccontextmanager
+    async def reading(self):
+        await self.initialize()
+        async with self.store.engine.connect() as c:
+            await c.exec_driver_sql('BEGIN')
+            try:
+                yield c
+            finally:
+                await c.rollback()
 
     async def _project(self, c, project):
         row = (await c.execute(text('SELECT * FROM projects WHERE id=:id'), {'id': project})).mappings().first()
@@ -94,7 +108,7 @@ class Collaboration:
         root = Path(workspace).resolve()
         rel = Path(path)
         result = (root / rel).resolve()
-        if rel.is_absolute() or '..' in rel.parts or not result.is_relative_to(root) or '.git' in rel.parts or '.wdrunge-runs' in rel.parts:
+        if rel.is_absolute() or '..' in rel.parts or not result.is_relative_to(root) or any(part in {'.git', '.wdrunge-runs', '.aws', '.codex', '.agents'} for part in rel.parts):
             raise ValueError('Path must stay inside the project workspace')
         return result
 
@@ -106,7 +120,7 @@ class Collaboration:
 
     async def publish(self, project, author, changes, conversation=''):
         """Validate all documents/dependencies, journal a batch, then publish together."""
-        if author not in ROLES or not changes or len(changes) > 20:
+        if author not in ROLES or not isinstance(changes, list) or not changes or len(changes) > 20:
             raise ValueError('Invalid author or batch size')
         batch_id = uuid4().hex
         async with self.transaction() as c:
@@ -124,7 +138,9 @@ class Collaboration:
                 seen.add(identifier)
                 current = await self._get(c, 'document', project, identifier, False)
                 version = current['version'] if current else 0
-                if change.get('base_version', 0) != version:
+                base_version = change.get('base_version', 0)
+                merging = base_version != version
+                if merging and (not change.get('allow_merge') or not current or change.get('external')):
                     raise StorageConflictError(f'{identifier}: expected version {version}')
                 summary = change.get('summary', '').strip()
                 if not summary or len(summary) > 2000:
@@ -133,6 +149,7 @@ class Collaboration:
                 old = (await self._get(c, 'revision', project, f'{identifier}:{version}'))['content'] if current else ''
                 path = current['path'] if current else change['path']
                 target = self._path(p['workspace_path'], path)
+                path = str(target.relative_to(Path(p['workspace_path']).resolve()))
                 if target.suffix.lower() != '.md':
                     raise ValueError('Managed documents must be Markdown files')
                 if path in paths and paths[path] != identifier:
@@ -147,7 +164,21 @@ class Collaboration:
                         raise StorageConflictError('External file is missing')
                     content = actual
                 elif current:
-                    content = edit_document(old, change.get('edits', []))
+                    if merging:
+                        base_revision = await self._get(c, 'revision', project, f'{identifier}:{base_version}')
+                        base_content = base_revision['content']
+                        # Automatic reconciliation is allowed only for unchanged
+                        # direct bodies of explicitly selected existing sections.
+                        for edit in change.get('edits', []):
+                            if edit['operation'] not in {'replace_text', 'replace_section_body'}:
+                                raise StorageConflictError('Structural edits require current document version')
+                            before = section(base_content, edit['section_id'])
+                            after = section(old, edit['section_id'])
+                            if base_content[before['start']:before['body_end']] != old[after['start']:after['body_end']]:
+                                raise StorageConflictError('The edited section changed concurrently')
+                        content = merge_text(base_content, old, edit_document(base_content, change.get('edits', [])))
+                    else:
+                        content = edit_document(old, change.get('edits', []))
                 else:
                     content = change.get('content', actual or '')
                     if actual is not None and actual != content:
@@ -157,7 +188,7 @@ class Collaboration:
                 revision = dict(id=identifier, path=path, title=change.get('title', current['title'] if current else target.stem), version=version+1,
                     content=content, hash=digest(content), outline=outline(content), summary=summary,
                     author=author, conversation=conversation, based_on=change.get('based_on', []), batch_id=batch_id,
-                    created=time.time(), external=external,
+                    created=time.time(), external=external, merged_from_version=base_version if merging else None,
                     diff=''.join(difflib.unified_diff(old.splitlines(True), content.splitlines(True), fromfile=f'{path}@{version}', tofile=f'{path}@{version+1}')),
                     previous_hash=digest(actual) if actual is not None else None)
                 revisions.append(revision)
@@ -195,6 +226,7 @@ class Collaboration:
                                 if os.path.exists(temp):
                                     os.unlink(temp)
                             await self._put(c, 'revision', pid, f"{r['id']}:{r['version']}", r)
+                            await self._index_sections(c, pid, r)
                             await self._put(c, 'document', pid, r['id'], {k: r[k] for k in ('id', 'path', 'title', 'version', 'hash', 'author', 'created')})
                         for r in pending['revisions']:
                             previous = await self._get(c, 'revision', pid, f"{r['id']}:{r['version']-1}", False)
@@ -203,7 +235,14 @@ class Collaboration:
                             changed = [key for key in old_sections.keys() | new_sections.keys() if old_sections.get(key) != new_sections.get(key)]
                             notified = set()
                             for sub in await self._list(c, 'subscription', pid):
-                                if sub['document_id'] == r['id'] and (not sub.get('section_id') or sub['section_id'] in changed) and sub['member'] not in notified:
+                                if sub['document_id'] == r['id'] and sub.get('section_id'):
+                                    selected = next((h for h in r['outline'] if h['id'] == sub['section_id']), None)
+                                    ambiguous = selected is None or sum(h['title'] == selected['title'] and h['parent'] == selected['parent'] for h in r['outline']) != 1
+                                    if ambiguous:
+                                        sub['needs_review'] = True
+                                        await self._put(c, 'subscription', pid, f"{sub['member']}:{r['id']}:{sub['section_id']}", sub)
+                                        await self._event(c, pid, sub['member'], {'type': 'subscription_structure_changed', 'document_id': r['id'], 'section_id': sub['section_id'], 'hint': 'Read the new outline and resubscribe; whole-document reminders remain enabled.'})
+                                if sub['document_id'] == r['id'] and (not sub.get('section_id') or sub.get('needs_review') or sub['section_id'] in changed) and sub['member'] not in notified:
                                     notified.add(sub['member'])
                                     await self._event(c, pid, sub['member'], {'type': 'document_changed', 'document_id': r['id'], 'version': r['version'], 'summary': r['summary'], 'batch_id': r['batch_id'], 'changed_sections': changed})
                         changed_versions = {r['id']: r['version'] for r in pending['revisions']}
@@ -217,7 +256,7 @@ class Collaboration:
                         await c.execute(text("DELETE FROM collaboration_records WHERE kind='pending' AND project=:p AND id=:i"), {'p': pid, 'i': pending['id']})
 
     async def catalog(self, project):
-        async with self.transaction() as c:
+        async with self.reading() as c:
             p = await self._project(c, project)
             docs = await self._list(c, 'document', project)
             for d in docs:
@@ -228,7 +267,7 @@ class Collaboration:
     async def read(self, project, document_id, version=None, section_id=None, offset=0, limit=6000):
         if offset < 0 or not 1 <= limit <= 12000:
             raise ValueError('Invalid read window')
-        async with self.transaction() as c:
+        async with self.reading() as c:
             doc = await self._get(c, 'document', project, document_id)
             r = await self._get(c, 'revision', project, f"{document_id}:{version or doc['version']}")
             if section_id is None:
@@ -248,23 +287,29 @@ class Collaboration:
             if section_id:
                 doc = await self._get(c, 'document', project, document_id)
                 revision = await self._get(c, 'revision', project, f"{document_id}:{doc['version']}")
-                section(revision['content'], section_id)
+                selected = section(revision['content'], section_id)
+                if sum(h['title'] == selected['title'] and h['parent'] == selected['parent'] for h in revision['outline']) != 1:
+                    raise ValueError('Section subscription requires a unique sibling heading')
             if enabled:
                 await self._put(c, 'subscription', project, key, dict(member=member, document_id=document_id, section_id=section_id))
             else:
                 await c.execute(text("DELETE FROM collaboration_records WHERE kind='subscription' AND project=:p AND id=:i"), dict(p=project, i=key))
         return {'subscribed': enabled}
 
-    async def send(self, project, sender, recipient, content, key, conversation='', reply_to=None):
-        if sender not in ROLES or recipient not in ROLES or not content.strip() or len(content) > 4000:
+    async def send(self, project, sender, recipient, content, key, conversation='', reply_to=None, request_id=None):
+        if not key or len(key) > 160 or sender not in ROLES or recipient not in ROLES or not content.strip() or len(content) > 4000:
             raise ValueError('Invalid message')
         async with self.transaction() as c:
             await self._project(c, project)
             await self._conversation(c, project, conversation)
             if reply_to:
                 await self._get(c, 'message', project, reply_to)
+            if request_id:
+                request = await self._get(c, 'request', project, request_id)
+                if request['recipient'] != recipient or request['conversation'] != conversation:
+                    raise ValueError('Message request target must match recipient and conversation')
             identifier = f'{sender}:{key}'
-            message = dict(id=identifier, sender=sender, recipient=recipient, content=content, conversation=conversation, reply_to=reply_to)
+            message = dict(id=identifier, sender=sender, recipient=recipient, content=content, conversation=conversation, reply_to=reply_to, target_request=request_id)
             old = await self._get(c, 'message', project, identifier, False)
             if old and old != message:
                 raise StorageConflictError('Idempotency key was used for different message')
@@ -273,17 +318,28 @@ class Collaboration:
                 await self._event(c, project, recipient, {'type': 'message', **message}, conversation)
             return message
 
-    async def inbox(self, project, member, context, conversation='', limit=6000):
-        async with self.transaction() as c:
+    async def inbox(self, project, member, context, conversation='', limit=6000, request=None):
+        async with self.reading() as c:
             rows = (await c.execute(text('''SELECT e.seq,e.data FROM collaboration_events e
               LEFT JOIN collaboration_receipts r ON r.project=e.project AND r.context=:ctx AND r.seq=e.seq
               WHERE e.project=:p AND e.recipient=:m AND (e.conversation='' OR e.conversation=:v)
-              AND r.seq IS NULL ORDER BY e.seq LIMIT 200'''), dict(ctx=f'{member}:{context}', p=project, m=member, v=conversation))).mappings().all()
+              AND (json_extract(e.data,'$.target_request') IS NULL OR json_extract(e.data,'$.target_request')=:request)
+              AND r.seq IS NULL ORDER BY e.seq LIMIT 200'''), dict(ctx=f'{member}:{context}', p=project, m=member, v=conversation, request=request))).mappings().all()
             items = []
             size = 0
             for row in rows:
                 item = {'event_id': row['seq'], **json.loads(row['data'])}
-                length = len(json.dumps(item, ensure_ascii=False))
+                original_length = len(json.dumps(item, ensure_ascii=False))
+                if original_length > limit//2:
+                    for field in ('content','summary','goal','result','detail'):
+                        if isinstance(item.get(field), str) and len(item[field]) > 600:
+                            item[field] = item[field][:600]
+                            item['preview_only'] = True
+                    if len(item.get('changed_sections', [])) > 20:
+                        item['changed_section_count'] = len(item['changed_sections'])
+                        item['changed_sections'] = item['changed_sections'][:20]
+                        item['preview_only'] = True
+                length = len(json.dumps(item, ensure_ascii=False)) + 180
                 if size + length > limit:
                     break
                 items.append(item)
@@ -312,6 +368,8 @@ class Collaboration:
                   SELECT project,:ctx,seq FROM collaboration_events WHERE project=:p AND recipient=:m AND seq=:s'''), dict(ctx=f'{member}:{context}', p=project, m=member, s=identifier))
 
     async def create_request(self, project, sender, recipient, goal, key, conversation='', based_on=None, dependencies=None, artifacts=None, parent=None, priority=1, deadline=None):
+        if not key or len(key) > 160:
+            raise ValueError('A bounded idempotency key is required')
         if priority not in range(4) or (deadline is not None and deadline <= 0):
             raise ValueError('Priority must be 0..3 and deadline a positive Unix timestamp')
         if sender not in ROLES or recipient not in ROLES - {'leader'} or not goal.strip() or len(goal) > 8000:
@@ -334,9 +392,12 @@ class Collaboration:
             requests = await self._list(c, 'request', project)
             if sum(r['state'] not in TERMINAL for r in requests) >= 50 or (parent and sum(r['spec']['parent'] == parent for r in requests) >= 12):
                 raise ValueError('Outstanding request budget reached')
+            project_info = await self._project(c, project)
+            for path in spec['artifacts']:
+                self._path(project_info['workspace_path'], path)
             request = dict(id=identifier, **spec, spec=spec, state='queued', created=time.time(), attempts=0, result='', delivered=[], needs_review=False)
             await self._put(c, 'request', project, identifier, request)
-            await self._event(c, project, recipient, {'type': 'request', 'request_id': identifier, 'goal': goal[:1000]}, conversation)
+            await self._event(c, project, recipient, {'type': 'request', 'request_id': identifier, 'goal': goal[:1000], 'target_request': identifier}, conversation)
             return request
 
     async def wait_for(self, project, identifier, dependencies, actor):
@@ -384,32 +445,40 @@ class Collaboration:
                     raise StorageConflictError('Dependencies are not completed')
                 r['delivered'] = delivered
             r.update(state=state, result=result or r['result'], needs_review=False)
+            if state == 'queued':
+                r.pop('blocked_reason', None)
             if state == 'cancelled':
                 await self._cancel_dependents(c, project, identifier)
             await self._put(c, 'request', project, identifier, r)
-            await self._event(c, project, r['sender'], {'type': 'request_status', 'request_id': identifier, 'state': state, 'result': r['result'][:1200]}, r['conversation'])
+            await self._event(c, project, r['sender'], {'type': 'request_status', 'request_id': identifier, 'state': state, 'result': r['result'][:1200], 'target_request': r.get('parent')}, r['conversation'])
             return r
 
     async def get_request(self, project, identifier):
-        async with self.transaction() as c:
+        async with self.reading() as c:
             return await self._get(c, 'request', project, identifier)
 
     async def snapshot(self, project):
-        async with self.transaction() as c:
+        async with self.reading() as c:
             await self._project(c, project)
-            return {kind: await self._list(c, kind, project) for kind in ('document', 'subscription', 'message', 'request', 'pending', 'decision', 'handoff')}
+            return {kind: await self._list(c, kind, project) for kind in ('document', 'subscription', 'message', 'request', 'pending', 'decision', 'handoff', 'settings')}
 
-    async def claim(self):
+    async def claim(self, owner="local"):
+        await self.recover_requests()
         async with self.transaction() as c:
             rows = (await c.execute(text("SELECT project,data FROM collaboration_records WHERE kind='request' AND state IN ('queued','blocked','running') ORDER BY updated"))).mappings().all()
-            busy = {(row['project'], json.loads(row['data'])['recipient']) for row in rows if json.loads(row['data'])['state'] == 'running'}
+            from collections import Counter
+            busy = Counter((row['project'], json.loads(row['data'])['recipient']) for row in rows if json.loads(row['data'])['state'] == 'running')
+            if sum(busy.values()) >= self.max_running:
+                return None
             rows = sorted(rows, key=lambda row: (-json.loads(row['data']).get('priority', 1), json.loads(row['data'])['created']))
             for row in rows:
                 project, r = row['project'], json.loads(row['data'])
                 paused = await self._get(c, 'settings', project, 'project', False)
                 if paused and paused.get('paused'):
                     continue
-                if r['state'] == 'running' or (project, r['recipient']) in busy:
+                if r.get('blocked_reason') in {'merge_conflict', 'basis_changed'}:
+                    continue
+                if r['state'] == 'running' or busy[(project, r['recipient'])] >= self.role_concurrency:
                     continue
                 deps = [await self._get(c, 'request', project, d) for d in r['dependencies']]
                 if any(d['state'] in {'cancelled', 'rejected', 'failed'} for d in deps):
@@ -424,7 +493,10 @@ class Collaboration:
                     r.update(state='failed', result='Request execution budget exhausted')
                     await self._put(c, 'request', project, r['id'], r)
                     continue
-                r.update(state='running', attempts=r['attempts']+1)
+                r.update(state='running', attempts=r['attempts']+1, lease_owner=owner, lease_until=time.time()+60)
+                if not r.get('workspace_id') or r.get('workspace_published'):
+                    r.update(workspace_id=uuid4().hex, workspace_published=False)
+                r['instance_id'] = uuid4().hex
                 await self._put(c, 'request', project, r['id'], r)
                 p = await self._project(c, project)
                 return project, p['workspace_path'], r
@@ -435,6 +507,8 @@ class Collaboration:
             rows = (await c.execute(text("SELECT project,id,data FROM collaboration_records WHERE kind='request' AND state='running'"))).mappings().all()
             for row in rows:
                 r = json.loads(row['data'])
+                if r.get('lease_until', 0) > time.time():
+                    continue
                 r.update(state='queued')
                 await self._put(c, 'request', row['project'], row['id'], r)
 
@@ -448,7 +522,7 @@ class Collaboration:
     async def section_diff(self, project, document_id, from_version, to_version, section_id, offset=0, limit=6000):
         if offset < 0 or not 1 <= limit <= 12000:
             raise ValueError('Invalid diff window')
-        async with self.transaction() as c:
+        async with self.reading() as c:
             contents = []
             for version in (from_version, to_version):
                 r = await self._get(c, 'revision', project, f'{document_id}:{version}')
@@ -460,22 +534,22 @@ class Collaboration:
     async def search(self, project, query, offset=0, limit=20):
         if not query.strip() or len(query) > 200 or offset < 0 or not 1 <= limit <= 50:
             raise ValueError('Invalid search query or window')
-        async with self.transaction() as c:
+        async with self.reading() as c:
             await self._project(c, project)
-            matches = []
-            for doc in await self._list(c, 'document', project):
-                r = await self._get(c, 'revision', project, f"{doc['id']}:{doc['version']}")
-                for s in r['outline']:
-                    body = r['content'][s['start']:s['body_end']]
-                    position = body.casefold().find(query.casefold())
-                    if position >= 0:
-                        matches.append({'document_id': doc['id'], 'version': doc['version'], 'section_id': s['id'], 'title': s['title'], 'excerpt': body[max(0,position-80):position+240]})
-            return {'matches': matches[offset:offset+limit], 'next_offset': offset+limit if len(matches)>offset+limit else None}
+            rows = (await c.execute(text("""SELECT document,version,section,title,body,
+              instr(lower(body),lower(:q)) AS position FROM collaboration_sections
+              WHERE project=:p AND instr(lower(body),lower(:q))>0
+              ORDER BY document,section LIMIT :n OFFSET :offset"""),
+              {'p': project, 'q': query, 'n': limit+1, 'offset': offset})).mappings().all()
+            matches = [{'document_id': row['document'], 'version': row['version'], 'section_id': row['section'], 'title': row['title'],
+                        'excerpt': row['body'][max(0,row['position']-81):row['position']+239]} for row in rows[:limit]]
+            return {'matches': matches, 'next_offset': offset+limit if len(rows)>limit else None}
+
 
     async def read_cached(self, project, member, context, force=False, **payload):
         result = await self.read(project, **payload)
         key = digest(json.dumps([member, context, payload, result.get('version')], sort_keys=True))
-        async with self.transaction() as c:
+        async with self.reading() as c:
             cached = await self._get(c, 'read', project, key, False)
         if cached and not force:
             return {'already_in_context': True, 'document_id': payload['document_id'], 'version': result['version'], 'section_id': payload.get('section_id'), 'hint': 'Use force=true to read again.'}, None
@@ -531,7 +605,7 @@ class Collaboration:
             return r
 
     async def dependency_graph(self, project):
-        async with self.transaction() as c:
+        async with self.reading() as c:
             await self._project(c, project)
             requests = await self._list(c, 'request', project)
             return {'nodes': [{key: r.get(key) for key in ('id','goal','state','recipient','priority','deadline','blocked_reason')} for r in requests],
@@ -576,7 +650,7 @@ class Collaboration:
     async def maintenance(self, project, stale_days=90):
         if stale_days < 1:
             raise ValueError('stale_days must be positive')
-        async with self.transaction() as c:
+        async with self.reading() as c:
             await self._project(c, project)
             docs = await self._list(c, 'document', project)
             versions = {d['id']: d['version'] for d in docs}
@@ -628,3 +702,93 @@ class Collaboration:
                 handoff['id'] = uuid4().hex
                 await self._put(c, 'handoff', project, handoff['id'], handoff)
             return handoff
+
+
+    async def _index_sections(self, c, project, revision):
+        await c.execute(text('DELETE FROM collaboration_sections WHERE project=:p AND document=:d'), {'p': project, 'd': revision['id']})
+        for heading in revision['outline']:
+            await c.execute(text('INSERT INTO collaboration_sections(project,document,section,version,title,body) VALUES(:p,:d,:s,:v,:t,:b)'),
+                            {'p': project, 'd': revision['id'], 's': heading['id'], 'v': revision['version'], 't': heading['title'], 'b': revision['content'][heading['start']:heading['body_end']]})
+
+    async def rebuild_search(self):
+        async with self.transaction() as c:
+            rows = (await c.execute(text("SELECT project,data FROM collaboration_records WHERE kind='document'"))).mappings().all()
+            for row in rows:
+                d = json.loads(row['data'])
+                if not await c.scalar(text('SELECT 1 FROM collaboration_sections WHERE project=:p AND document=:d AND version=:v LIMIT 1'), {'p': row['project'], 'd': d['id'], 'v': d['version']}):
+                    r = await self._get(c, 'revision', row['project'], f"{d['id']}:{d['version']}")
+                    await self._index_sections(c, row['project'], r)
+
+    async def renew_leases(self, owner, active_requests):
+        async with self.transaction() as c:
+            rows = (await c.execute(text("SELECT project,id,data FROM collaboration_records WHERE kind='request' AND state='running'"))).mappings().all()
+            for row in rows:
+                r = json.loads(row['data'])
+                if r.get('lease_owner') == owner and (row['project'], row['id']) in active_requests:
+                    r['lease_until'] = time.time()+60
+                    await self._put(c, 'request', row['project'], row['id'], r)
+
+    async def prepare_workspace(self, project, identifier):
+        async with self.transaction() as c:
+            r = await self._get(c, 'request', project, identifier)
+            p = await self._project(c, project)
+            workspace = IsolatedWorkspace(p['workspace_path'], r['workspace_id'])
+            await asyncio.to_thread(workspace.prepare)
+            await asyncio.to_thread(workspace.refresh)
+            return workspace
+
+    async def publish_artifacts(self, project, identifier, instance_id):
+        async with self.transaction() as c:
+            r = await self._get(c, 'request', project, identifier)
+            if r.get('instance_id') != instance_id or r['state'] not in {'running', 'review'} or r.get('lease_until',0) <= time.time():
+                raise StorageConflictError('Request execution lease is no longer valid')
+            if r.get('workspace_published'):
+                return
+            await self._dependencies(c, project, r['based_on'])
+            if any(dep['state'] != 'completed' for dep in [await self._get(c, 'request', project, identifier) for identifier in r['dependencies']]):
+                raise StorageConflictError('Accept dependency deliveries before publishing artifacts')
+            p = await self._project(c, project)
+            workspace = IsolatedWorkspace(p['workspace_path'], r['workspace_id'])
+            for path in r['artifacts']:
+                target = self._path(str(workspace.work), path)
+                if not target.is_file():
+                    raise ValueError(f'Expected artifact is missing: {path}')
+            await asyncio.to_thread(workspace.recover_merge)
+            # Finish an interrupted merge before considering a new plan.
+            managed = {d['path'] for d in await self._list(c, 'document', project)}
+            changes = await asyncio.to_thread(workspace.plan, managed)
+            await asyncio.to_thread(workspace.publish, changes)
+            r['workspace_published'] = True
+            r['merged_paths'] = [item['path'] for item in changes]
+            await self._put(c, 'request', project, identifier, r)
+
+    async def mark_conflict(self, project, identifier, detail, instance_id=None):
+        async with self.transaction() as c:
+            r = await self._get(c, 'request', project, identifier)
+            if r['state'] not in {'running', 'review'} or (instance_id and r.get('instance_id') != instance_id):
+                return
+            r.update(state='blocked', blocked_reason='basis_changed' if 'Dependency changed:' in detail else 'merge_conflict', result=detail[:2000])
+            await self._put(c, 'request', project, identifier, r)
+            await self._event(c, project, 'leader', {'type': 'merge_conflict', 'request_id': identifier, 'detail': detail[:1000]}, r['conversation'])
+
+
+    async def inspect_message(self, project, identifier, offset=0, limit=4000):
+        if offset < 0 or not 1 <= limit <= 8000:
+            raise ValueError('Invalid message window')
+        async with self.reading() as c:
+            message = await self._get(c, 'message', project, identifier)
+            content = message['content']
+            return {**message, 'content': content[offset:offset+limit], 'next_offset': offset+limit if len(content)>offset+limit else None}
+
+
+    async def history(self, project, document_id, offset=0, limit=20):
+        if offset < 0 or not 1 <= limit <= 50:
+            raise ValueError('Invalid revision window')
+        async with self.reading() as c:
+            await self._get(c, 'document', project, document_id)
+            rows = await c.scalars(text("""SELECT data FROM collaboration_records WHERE project=:p AND kind='revision'
+              AND json_extract(data,'$.id')=:d ORDER BY CAST(json_extract(data,'$.version') AS INTEGER) DESC
+              LIMIT :n OFFSET :offset"""), {'p': project, 'd': document_id, 'n': limit+1, 'offset': offset})
+            revisions = [json.loads(row) for row in rows]
+            return {'revisions': [{key: r.get(key) for key in ('version','summary','author','created','conversation','based_on','batch_id','merged_from_version')} for r in revisions[:limit]],
+                    'next_offset': offset+limit if len(revisions)>limit else None}

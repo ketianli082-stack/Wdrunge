@@ -385,6 +385,8 @@ async def conversation_message_stream(
                     yield sse(event_name, payload)
             if reply_started:
                 await store.update_assistant_message(reply_id, reply, "completed")
+                if hasattr(team, 'acknowledge_leader'):
+                    await team.acknowledge_leader(conversation_id)
                 await store.add_event(
                     conversation_id,
                     "assistant_completed",

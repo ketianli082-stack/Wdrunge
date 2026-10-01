@@ -17,7 +17,7 @@ def configure(service):
 class Command(BaseModel):
     member: Literal['leader', 'product', 'backend', 'frontend', 'designer', 'testing'] = 'leader'
     conversation: str = ''
-    action: Literal['catalog', 'read', 'publish', 'subscribe', 'send', 'request', 'inspect_request', 'transition', 'snapshot', 'search', 'diff', 'schedule', 'dependencies', 'decision', 'maintenance', 'handoff']
+    action: Literal['catalog', 'read', 'publish', 'subscribe', 'send', 'request', 'inspect_request', 'transition', 'snapshot', 'search', 'diff', 'schedule', 'dependencies', 'decision', 'maintenance', 'handoff', 'recover', 'inspect_message', 'history']
     payload: dict = Field(default_factory=dict)
 
 
@@ -57,4 +57,9 @@ class Pause(BaseModel):
 
 @router.post('/pause')
 async def pause(project_id: str, body: Pause):
-    return await _service.set_paused(project_id, body.paused)
+    if _service is None:
+        raise HTTPException(503, 'Collaboration is not initialized')
+    try:
+        return await _service.set_paused(project_id, body.paused)
+    except StorageNotFoundError as exc:
+        raise HTTPException(404, str(exc)) from exc

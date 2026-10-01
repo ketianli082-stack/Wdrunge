@@ -1,5 +1,7 @@
 """Create or replace a text file within a role's assigned directories."""
 
+from pathlib import Path
+
 from langchain_core.tools import tool
 
 from app.tools._workspace import resolve_allowed
@@ -12,14 +14,14 @@ def make_write_project_file(allowed_roots: tuple[str, ...]):
         target = resolve_allowed(path, allowed_roots)
         from app.collaboration.tools import active
         ctx = active.get()
+        if ctx and bool(Path(path).parts) and Path(path).parts[0].lower() == 'docs' and target.suffix.lower() == '.md':
+            return 'Shared Markdown must use collaborate publish with a base version and summary; use base_version=0 for a new document.'
         if ctx and ctx.service.store.sqlite_path:
             import sqlite3
             import json
             with sqlite3.connect(ctx.service.store.sqlite_path) as db:
-                workspace = db.execute('SELECT workspace_path FROM projects WHERE id=?', (ctx.project,)).fetchone()
                 records = db.execute("SELECT data FROM collaboration_records WHERE kind='document' AND project=?", (ctx.project,)).fetchall()
-                from pathlib import Path
-                if any((Path(workspace[0]) / json.loads(row[0])['path']).resolve() == target for row in records):
+                if any(str(Path(path)) == json.loads(row[0])['path'] for row in records):
                     return 'Managed document: use collaborate publish with base_version and a change summary.'
         if len(content) > 100000:
             return "File is too large; keep content under 100000 characters."

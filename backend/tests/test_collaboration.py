@@ -217,3 +217,226 @@ def test_decision_history_staleness_duplicates_and_handoff(tmp_path):
             await s.record_decision(p, 'leader', 'Overwrite', 'reason', links, identifier=a['id'], base_version=0)
         await store.close()
     run(scenario())
+
+
+def test_safe_document_auto_merge_rejects_changed_section(tmp_path):
+    async def scenario():
+        store, s, p, workspace = await setup(tmp_path)
+        doc = await create(s, p, '# Guide\nintro\n## A\na\n## B\nb\n')
+        sections = (await s.read(p, doc))['outline']
+        a, b = sections[-2]['id'], sections[-1]['id']
+        def change(sid, old, new):
+            return dict(document_id=doc, base_version=1, allow_merge=True, summary=new, edits=[dict(operation='replace_text', section_id=sid, old_text=old, new_text=new)])
+        await s.publish(p, 'backend', [change(a, 'a', 'first')])
+        await s.publish(p, 'backend', [change(b, 'b', 'second')])
+        assert (await s.read(p, doc, 3, a))['content'] == 'first\n'
+        assert (await s.read(p, doc, 3, b))['content'] == 'second\n'
+        with pytest.raises(StorageConflictError):
+            await s.publish(p, 'backend', [change(a, 'a', 'overwrite')])
+        await store.close()
+    run(scenario())
+
+
+def test_multi_instance_leases_and_isolated_merge(tmp_path):
+    async def scenario():
+        store, s, p, workspace = await setup(tmp_path)
+        (workspace/'code.txt').write_text('one\ntwo\nthree\n')
+        for key in ['a','b','c']:
+            await s.create_request(p, 'leader', 'frontend', key, key)
+        other = Collaboration(ChatStore(f'sqlite+aiosqlite:///{tmp_path / "test.db"}'))
+        await other.initialize()
+        claims = await asyncio.gather(s.claim('one'), other.claim('two'))
+        assert len({job[2]['id'] for job in claims}) == 2
+        assert await s.claim('three') is None
+        first, second = claims[0][2], claims[1][2]
+        wa = await s.prepare_workspace(p, first['id'])
+        wb = await other.prepare_workspace(p, second['id'])
+        (wa.work/'code.txt').write_text('ONE\ntwo\nthree\n')
+        (wb.work/'code.txt').write_text('one\ntwo\nTHREE\n')
+        assert (workspace/'code.txt').read_text() == 'one\ntwo\nthree\n'
+        await s.publish_artifacts(p, first['id'], first['instance_id'])
+        await other.publish_artifacts(p, second['id'], second['instance_id'])
+        assert (workspace/'code.txt').read_text() == 'ONE\ntwo\nTHREE\n'
+        await s.recover_requests()
+        assert (await s.get_request(p, first['id']))['state'] == 'running'
+        async with s.transaction() as c:
+            request = await s._get(c, 'request', p, first['id'])
+            request['lease_until'] = 1
+            await s._put(c, 'request', p, first['id'], request)
+        await s.recover_requests()
+        assert (await s.get_request(p, first['id']))['state'] == 'queued'
+        with pytest.raises(StorageConflictError):
+            await s.publish_artifacts(p, first['id'], first['instance_id'])
+        await other.store.close()
+        await store.close()
+    run(scenario())
+
+
+def test_workspace_conflict_preserves_original_and_refreshes_dependency(tmp_path):
+    from app.collaboration.workspaces import IsolatedWorkspace, merge_text
+    root = tmp_path/'source'
+    root.mkdir()
+    (root/'a.txt').write_text('original\n')
+    (root/'b.txt').write_text('original\n')
+    w = IsolatedWorkspace(root, 'abc123')
+    w.prepare()
+    (w.work/'a.txt').write_text('local\n')
+    (w.work/'b.txt').write_text('local\n')
+    (root/'b.txt').write_text('external\n')
+    with pytest.raises(StorageConflictError):
+        w.plan()
+    assert (root/'a.txt').read_text() == 'original\n'
+    (root/'dependency.svg').write_text('<svg/>')
+    w.refresh()
+    assert (w.work/'dependency.svg').exists()
+    assert (w.work/'a.txt').read_text() == 'local\n'
+    with pytest.raises(StorageConflictError):
+        merge_text('line\n', 'change1\n', 'change2\n')
+
+
+def test_real_worker_graph_uses_isolated_request_workspace(tmp_path, monkeypatch):
+    from app.agents.team import Team
+    from app.agents.worker import WorkerAgent
+    from app.collaboration.runtime import Scheduler
+    from langchain_core.messages import AIMessage, ToolMessage
+    from langgraph.checkpoint.memory import InMemorySaver
+    class FakeModel:
+        def bind_tools(self, tools):
+            return self
+        async def ainvoke(self, messages):
+            if any(isinstance(m, ToolMessage) for m in messages):
+                return AIMessage(content='File delivered')
+            return AIMessage(content='', tool_calls=[{'name':'write_project_file','args':{'path':'result.txt','content':'isolated artifact'},'id':'write'}])
+    monkeypatch.setattr(WorkerAgent, 'model', lambda self: FakeModel())
+    async def scenario():
+        store, s, p, workspace = await setup(tmp_path)
+        team = Team()
+        await team.configure_persistence(store, InMemorySaver())
+        team._checkpointer = InMemorySaver()
+        scheduler = Scheduler(s, team)
+        request = await s.create_request(p, 'leader', 'frontend', 'Write result', 'result', artifacts=['result.txt'])
+        job = await s.claim(scheduler.owner)
+        await scheduler.execute(*job)
+        r = await s.get_request(p, request['id'])
+        assert r['state'] == 'review', r['result']
+        assert r['workspace_published']
+        assert (workspace/'result.txt').read_text() == 'isolated artifact'
+        await store.close()
+    run(scenario())
+
+
+def test_messages_can_target_one_concurrent_request(tmp_path):
+    async def scenario():
+        store, s, p, workspace = await setup(tmp_path)
+        one = await s.create_request(p, 'leader', 'frontend', 'One', 'one')
+        two = await s.create_request(p, 'leader', 'frontend', 'Two', 'two')
+        await s.send(p, 'leader', 'frontend', 'Only task one', 'msg', request_id=one['id'])
+        assert any(r.get('content') == 'Only task one' for r in await s.inbox(p, 'frontend', 'one', request=one['id']))
+        assert not any(r.get('content') == 'Only task one' for r in await s.inbox(p, 'frontend', 'two', request=two['id']))
+        await store.close()
+    run(scenario())
+
+
+def test_missing_delivery_does_not_publish_partial_edits(tmp_path):
+    async def scenario():
+        store, s, p, workspace = await setup(tmp_path)
+        r = await s.create_request(p, 'leader', 'frontend', 'Deliver image', 'missing', artifacts=['missing.svg'])
+        job = (await s.claim())[2]
+        w = await s.prepare_workspace(p, r['id'])
+        (w.work/'partial.txt').write_text('unfinished')
+        with pytest.raises(ValueError):
+            await s.publish_artifacts(p, r['id'], job['instance_id'])
+        assert not (workspace/'partial.txt').exists()
+        await store.close()
+    run(scenario())
+
+
+def test_command_api_and_revision_trace(tmp_path):
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+    from app.collaboration.api import router, configure
+    async def scenario():
+        store, service, project, workspace = await setup(tmp_path)
+        return store, service, project
+    store, service, project = run(scenario())
+    configure(service)
+    app = FastAPI()
+    app.include_router(router)
+    with TestClient(app) as client:
+        url = f'/api/projects/{project}/collaboration'
+        response = client.post(url+'/commands', json={'member':'backend','action':'publish','payload':{'changes':[{'path':'docs/trace.md','content':'# Trace\ncontent\n','summary':'Create trace','base_version':0}]}})
+        assert response.status_code == 200, response.text
+        doc = response.json()['revisions'][0]['document_id']
+        history = client.post(url+'/commands', json={'action':'history','payload':{'document_id':doc}})
+        assert history.json()['revisions'][0]['summary'] == 'Create trace'
+        assert client.post(url+'/commands', json={'action':'read','payload':{}}).status_code == 409
+        assert client.get('/api/projects/missing/collaboration').status_code == 404
+    run(store.close())
+
+
+def test_leader_receipts_wait_for_durable_reply(tmp_path, monkeypatch):
+    from app.agents.team import Team
+    from langchain_core.messages import AIMessage, HumanMessage
+    async def scenario():
+        store, s, p, workspace = await setup(tmp_path)
+        conversation = await store.create_conversation(p, 'Chat')
+        await s.send(p, 'frontend', 'leader', 'Important delivery', 'delivery', conversation['id'])
+        team = Team()
+        team.collaboration = s
+        async def answer(messages, *, allow_delegation=True):
+            return AIMessage(content='Acknowledged')
+        monkeypatch.setattr(team.leader, 'next_message', answer)
+        events = [event async for event in team.stream([HumanMessage(content='Status')], conversation_id=conversation['id'], workspace_path=workspace)]
+        context = f"leader:{conversation['id']}"
+        assert await s.inbox(p, 'leader', context, conversation['id'])
+        await team.acknowledge_leader(conversation['id'])
+        assert not await s.inbox(p, 'leader', context, conversation['id'])
+        await store.close()
+    run(scenario())
+
+
+def test_persisted_leader_waits_for_review_then_accepts(tmp_path, monkeypatch):
+    from app.agents.team import Team
+    from app.agents.worker import WorkerAgent
+    from app.collaboration.runtime import Scheduler
+    from app.tools._workspace import workspace_root
+    from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+    from langgraph.checkpoint.memory import InMemorySaver
+    async def fake_worker(self, task, **kwargs):
+        (workspace_root()/'delivery.txt').write_text('ready')
+        yield 'content', {'content':'Delivery ready at delivery.txt'}
+    monkeypatch.setattr(WorkerAgent, 'stream', fake_worker)
+    async def scenario():
+        store, s, p, workspace = await setup(tmp_path)
+        conversation = await store.create_conversation(p, 'Delivery')
+        team = Team()
+        await team.configure_persistence(store, InMemorySaver())
+        team.collaboration = s
+        async def leader(messages, *, allow_delegation=True):
+            results = [m for m in messages if isinstance(m, ToolMessage)]
+            if not results:
+                return AIMessage(content='', tool_calls=[{'id':'delegate','name':'delegate_task','args':{'worker':'frontend','task':'Deliver file','summary':'Create file','handoff':'Write delivery.txt'}}])
+            if len(results) == 1:
+                requests = (await s.snapshot(p))['request']
+                assert requests[0]['state'] == 'review'
+                return AIMessage(content='', tool_calls=[{'id':'accept','name':'collaborate','args':{'action':'transition','payload':{'identifier':requests[0]['id'],'state':'completed','result':'Verified delivery'}}}])
+            return AIMessage(content='Delivery accepted')
+        monkeypatch.setattr(team.leader, 'next_message', leader)
+        scheduler = Scheduler(s, team)
+        await scheduler.start()
+        async def collect():
+            result = []
+            async for name, payload in team.stream([HumanMessage(content='Build')], conversation_id=conversation['id'], workspace_path=workspace):
+                if name == 'chat_message':
+                    await store.add_chat_message(conversation['id'], payload)
+                result.append((name,payload))
+            return result
+        try:
+            events = await asyncio.wait_for(collect(), 5)
+            assert ('delta', {'role':'leader','content':'Delivery accepted'}) in events
+            assert (await s.snapshot(p))['request'][0]['state'] == 'completed'
+            assert (workspace/'delivery.txt').read_text() == 'ready'
+        finally:
+            await scheduler.close()
+            await store.close()
+    run(scenario())

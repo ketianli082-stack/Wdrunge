@@ -119,8 +119,10 @@ Document subscriptions are project-wide. Request execution uses bounded backgrou
 slots, releases blocked slots, and survives browser disconnects. Agent results go
 to `review`; the sender or user must accept them before they count as completed.
 Dependent workers may wake for review to inspect and accept a child delivery.
-Starting a persisted delegation now queues durable work; Leader reports its request
-ID and can inspect/accept it with the collaboration tool. Legacy stateless chat
+Starting a persisted delegation queues durable work and awaits a reviewable result
+without occupying a worker slot. Leader can accept it and continue dependent work;
+paused/conflicted requests return their pending status. Disconnects leave requests
+running; the project panel and next conversation can recover them. Legacy stateless chat
 retains the original synchronous delegation behavior.
 
 Context efficiency: `subscribe` optionally takes `section_id`; `search` returns
@@ -150,3 +152,35 @@ a bounded project bootstrap with current references, accepted decisions and open
 requests; `save: true` retains a stage snapshot. Leader context checkpoints also
 save these snapshots. Document changes notify affected requests even without a
 subscription, and mark their basis as needing review.
+
+Concurrent execution: `WDRUNGE_ROLE_CONCURRENCY` defaults to 2 instances per role
+per project; `WDRUNGE_MAX_CONCURRENCY` defaults to 4 active jobs across this database.
+Claims use SQLite write transactions and 60-second execution leases, renewed every
+10 seconds. Restart only reclaims expired leases, so another live scheduler is not
+interrupted. Every execution gets an instance ID and uses a persistent snapshot
+under `.wdrunge-runs/<workspace_id>/work`; suspended work retains local edits and
+pulls new dependency artifacts into unchanged files before resuming.
+
+Snapshots exclude Git internals, secrets directories, environments, dependency
+packages and build outputs. Existing `node_modules` directories are shared through
+links for verification; agent file tools cannot write through those external links.
+Snapshot limits are 128 MiB and 10,000 source files; oversized workspaces fail with
+an explicit message. This is source-file isolation, not a security sandbox for
+arbitrary executable project code. Snapshots are retained for recovery and manual
+inspection; no background cleanup deletes user work.
+
+Artifact delivery checks dependencies and required paths before publishing. Text
+changes use conservative three-way merging; overlapping edits, binary conflicts,
+concurrent creation/deletion and managed-document bypasses block delivery while
+retaining the run workspace. Multi-file publication has a recovery journal. A
+retry must reconcile conflicts; cancellation never rolls back already published
+files. For managed documents, `allow_merge: true` permits stale-version patches
+only when the edited sections are unchanged and explicit dependencies still match.
+This proves textual independence, not semantic compatibility across sections;
+keep coupled changes in one batch and declare `based_on` requirements.
+
+Current section bodies have a project-indexed search projection rebuilt on startup
+when needed. WAL reads use separate read transactions without taking the writer
+mutex. Message `request_id` targets a specific role instance's request, avoiding
+cross-talk between concurrent tasks. External requests remain project/conversation
+scoped. Cancelled verification commands terminate their process groups.

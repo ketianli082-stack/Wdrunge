@@ -1,6 +1,10 @@
 """Bounded background execution; blocked jobs release their execution slots."""
 import asyncio
 import logging
+import time
+from uuid import uuid4
+from app.storage import StorageConflictError
+from app.tools._workspace import source_workspace
 from pathlib import Path
 
 from app.collaboration.tools import Context, active
@@ -16,6 +20,10 @@ class Scheduler:
         self.jobs = set()
         self.executions = {}
         self.loop = None
+        self.owner = uuid4().hex
+        self.running_roles = {}
+        self.team.scheduler = self
+        self.last_maintenance = 0
 
     async def start(self):
         await self.service.initialize()
@@ -33,13 +41,16 @@ class Scheduler:
     async def run(self):
         while True:
             try:
-                await self.service.scheduling_tick()
+                if time.monotonic()-self.last_maintenance > 10:
+                    await self.service.renew_leases(self.owner, set(self.executions.values()))
+                    await self.service.scheduling_tick()
+                    self.last_maintenance = time.monotonic()
                 for task, (project, identifier) in list(self.executions.items()):
                     request = await self.service.get_request(project, identifier)
-                    if request['state'] == 'cancelled':
+                    if request['state'] == 'cancelled' or request.get('lease_owner') != self.owner:
                         task.cancel()
                 while len(self.jobs) < self.concurrency:
-                    job = await self.service.claim()
+                    job = await self.service.claim(self.owner)
                     if not job:
                         break
                     task = asyncio.create_task(self.execute(*job))
@@ -53,27 +64,44 @@ class Scheduler:
 
     async def execute(self, project, workspace, request):
         from app.agents.worker import WorkerAgent
-        worker = WorkerAgent(self.team.workers[request['recipient']].spec)
-        await worker.configure_persistence(self.team._store, self.team._checkpointer)
+        role = request['recipient']
+        self.running_roles[role] = self.running_roles.get(role, 0)+1
+        worker = WorkerAgent(self.team.workers[role].spec)
         token = active.set(Context(self.service, project, request['recipient'], request['conversation'], f"request:{request['id']}:{request['attempts']}", request['id']))
         workspace_token = active_workspace.set(Path(workspace))
+        source_token = source_workspace.set(Path(workspace))
         output = []
         try:
+            await worker.configure_persistence(self.team._store, self.team._checkpointer)
+            isolated = await self.service.prepare_workspace(project, request['id'])
+            active_workspace.set(isolated.work)
+            active.get().instance_id = request['instance_id']
             # A fresh execution gets durable task state and current project facts;
             # it does not depend on a cancelled model's tool-call transcript.
             async for event, data in worker.stream(request['goal'], conversation_id=f"collaboration:{project}:{request['id']}", context_mode='fresh', handoff=f"Durable request {request['id']}. Requirements: {request['based_on']}. Expected artifacts: {request['artifacts']}. Prior result: {request['result']}. Dependencies: {request['dependencies']}. Use collaborate to inspect dependencies, deliver, or wait."):
                 if event == 'content':
                     output.append(data['content'])
+                elif event == 'activity' and request['conversation']:
+                    await self.team._store.upsert_activity(request['conversation'], {**data, 'agent': role})
             current = await self.service.get_request(project, request['id'])
             if current['state'] == 'running':
+                await self.service.publish_artifacts(project, request['id'], request['instance_id'])
                 await self.service.transition(project, request['id'], request['recipient'], 'review', result=''.join(output)[-4000:] or 'Execution finished; inspect artifacts before accepting.', artifacts=request['artifacts'])
         except asyncio.CancelledError:
             raise
+        except StorageConflictError as exc:
+            await self.service.mark_conflict(project, request['id'], str(exc), request['instance_id'])
         except Exception as exc:
             logger.exception('Collaboration request failed')
             current = await self.service.get_request(project, request['id'])
             if current['state'] == 'running':
                 await self.service.transition(project, request['id'], request['recipient'], 'failed', result=str(exc)[:1000])
         finally:
+            self.team.workers[role].total_tokens += worker.total_tokens
+            self.team.workers[role].context_tokens = worker.context_tokens
+            self.running_roles[role] -= 1
+            if not self.running_roles[role]:
+                del self.running_roles[role]
             active.reset(token)
             active_workspace.reset(workspace_token)
+            source_workspace.reset(source_token)
