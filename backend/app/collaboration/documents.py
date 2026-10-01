@@ -1,6 +1,5 @@
 """Deterministic Markdown indexing and exact, atomic in-memory edits."""
 import hashlib
-import re
 
 
 def digest(content: str) -> str:
@@ -8,55 +7,49 @@ def digest(content: str) -> str:
 
 
 def outline(content: str) -> list[dict]:
-    # CommonMark-style ATX/setext headings; fenced/indented code is excluded.
+    from markdown_it import MarkdownIt
     lines = content.splitlines(keepends=True)
-    entries = [{"id": "root", "title": "Document", "level": 0, "start": 0, "body_start": 0, "parent": None}]
-    stack = [entries[0]]
-    fence = None
-    previous = None
-    offset = 0
-    counts = {}
+    offsets = [0]
     for line in lines:
-        marker = re.match(r"^ {0,3}(`{3,}|~{3,})(.*)$", line)
-        if fence:
-            if marker and marker[1][0] == fence[0] and len(marker[1]) >= len(fence) and not marker[2].strip():
-                fence = None
-            previous = None
-            offset += len(line)
+        offsets.append(offsets[-1] + len(line))
+    entries = [{"id": "root", "title": "Document", "level": 0, "start": 0, "body_start": 0, "parent": None}]
+    stack, counts = [entries[0]], {}
+    tokens = MarkdownIt('commonmark').parse(content)
+    for i, token in enumerate(tokens):
+        if token.type != 'heading_open' or token.level != 0 or token.map is None:
             continue
-        if marker:
-            fence = marker[1]
-            previous = None
-            offset += len(line)
-            continue
-        heading = re.match(r"^ {0,3}(#{1,6})(?:[ \t]+(.*?)|[ \t]*)\n?$", line)
-        underline = re.match(r"^ {0,3}(=+|-+)\s*$", line)
-        title = None
-        start = offset
-        if heading:
-            level = len(heading[1])
-            title = re.sub(r"\s+#+\s*$", "", heading[2] or "").strip()
-        elif underline and previous:
-            level = 1 if underline[1][0] == '=' else 2
-            start, title = previous
-        if title is not None:
-            while stack[-1]["level"] >= level:
-                stack.pop()
-            parent = stack[-1]["id"]
-            key = f"{parent}/{title}"
-            counts[key] = counts.get(key, 0) + 1
-            identifier = digest(f"{key}:{counts[key]}")[:16]
-            entry = dict(id=identifier, title=title, level=level, start=start,
-                         body_start=offset + len(line), parent=parent)
-            entries.append(entry)
-            stack.append(entry)
-        previous = (offset, line.strip()) if line.strip() and not line.startswith(('    ', '\t')) and title is None else None
-        offset += len(line)
+        level, title = int(token.tag[1:]), tokens[i+1].content
+        while stack[-1]['level'] >= level:
+            stack.pop()
+        parent = stack[-1]['id']
+        key = f'{parent}/{title}'
+        counts[key] = counts.get(key, 0) + 1
+        entry = dict(id=digest(f'{key}:{counts[key]}')[:16], title=title, level=level,
+                     start=offsets[token.map[0]], body_start=offsets[token.map[1]], parent=parent)
+        entries.append(entry)
+        stack.append(entry)
     for i, entry in enumerate(entries):
-        entry["body_end"] = entries[i + 1]["start"] if i + 1 < len(entries) else len(content)
-        entry["end"] = next((e["start"] for e in entries[i + 1:] if e["level"] <= entry["level"]), len(content))
-        entry["characters"] = entry["body_end"] - entry["body_start"]
+        entry['body_end'] = entries[i+1]['start'] if i+1 < len(entries) else len(content)
+        entry['end'] = next((e['start'] for e in entries[i+1:] if e['level'] <= entry['level']), len(content))
+        entry['characters'] = entry['body_end']-entry['body_start']
     return entries
+
+
+def page(content: str, offset: int, limit: int) -> tuple[str, int | None, bool]:
+    """Prefer complete top-level Markdown blocks; explicitly label oversized fragments."""
+    from markdown_it import MarkdownIt
+    offsets = [0]
+    for line in content.splitlines(keepends=True):
+        offsets.append(offsets[-1]+len(line))
+    boundaries = {0, len(content)}
+    for token in MarkdownIt('commonmark').parse(content):
+        if token.level == 0 and token.map:
+            boundaries.update(offsets[i] for i in token.map)
+    end = min(len(content), offset+limit)
+    natural = [b for b in boundaries if offset < b <= end]
+    if natural:
+        end = max(natural)
+    return content[offset:end], end if end < len(content) else None, offset not in boundaries or end not in boundaries
 
 
 def section(content: str, section_id: str) -> dict:

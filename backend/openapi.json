@@ -623,7 +623,9 @@
               "request",
               "inspect_request",
               "transition",
-              "snapshot"
+              "snapshot",
+              "search",
+              "diff"
             ],
             "title": "Action"
           },

@@ -1,6 +1,6 @@
 """Agent tools obtain identity/project from trusted runtime context."""
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Literal
 
 from langchain_core.tools import tool
@@ -16,20 +16,23 @@ class Context:
     conversation: str
     context: str
     request: str | None = None
+    pending_reads: list[str] = field(default_factory=list)
 
 
 active: ContextVar[Context | None] = ContextVar('collaboration_context', default=None)
 
 
 @tool
-async def collaborate(action: Literal['catalog', 'read', 'publish', 'subscribe', 'send', 'request', 'inspect_request', 'wait', 'transition', 'snapshot'], payload: dict) -> dict:
+async def collaborate(action: Literal['catalog', 'read', 'publish', 'subscribe', 'send', 'request', 'inspect_request', 'wait', 'transition', 'snapshot', 'search', 'diff'], payload: dict) -> dict:
     """Project collaboration. Identity is supplied by the runtime.
 
     catalog: {}. read: {document_id, version?, section_id?, offset?, limit?}; omit
     section_id to read outline first. publish: {changes:[{document_id?,path?,
     base_version,summary,content? (new docs only),edits?:[{operation,section_id,
     old_text?,new_text?,include_children?}],based_on?:[{document_id,version}]}]}.
-    subscribe: {document_id,enabled?}. send: {recipient,content,key,reply_to?}.
+    subscribe: {document_id,enabled?,section_id?}. search: {query,offset?,limit?}.
+    diff: {document_id,from_version,to_version,section_id,offset?,limit?}.
+    read supports force=true to bypass confirmed context-read deduplication. send: {recipient,content,key,reply_to?}.
     request: {recipient,goal,key,based_on?,dependencies?,artifacts?}; include
     acceptance criteria in goal. inspect_request: {identifier}.
     wait: {dependencies:[request_id]} suspends your current task until accepted
@@ -46,7 +49,14 @@ async def collaborate(action: Literal['catalog', 'read', 'publish', 'subscribe',
         if action == 'catalog':
             return {'documents': await s.catalog(p)}
         if action == 'read':
-            return await s.read(p, **payload)
+            result, key = await s.read_cached(p, ctx.member, ctx.context, **payload)
+            if key:
+                ctx.pending_reads.append(key)
+            return result
+        if action == 'search':
+            return await s.search(p, **payload)
+        if action == 'diff':
+            return await s.section_diff(p, **payload)
         if action == 'publish':
             # Enforce the same role write boundary as file tools.
             from app.agents.team import ROLE_CONFIG

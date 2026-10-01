@@ -39,7 +39,7 @@ def test_revision_conflict_sections_external_and_recovery(tmp_path):
         inbox = await s.inbox(p, 'frontend', 'ctx')
         assert len(inbox) == 1
         assert await s.inbox(p, 'frontend', 'ctx') == inbox
-        await s.acknowledge(p, 'frontend', 'ctx', [inbox[0]['event_id']])
+        await s.acknowledge(p, 'frontend', 'ctx', inbox[0]['event_ids'])
         assert not await s.inbox(p, 'frontend', 'ctx')
         assert await s.inbox(p, 'frontend', 'new-context')
         (workspace/'docs/api.md').write_text('# External\nManual edit\n')
@@ -135,3 +135,39 @@ def test_dependency_rechecked_at_delivery_and_inbox_isolation(tmp_path):
             await s.transition(p, r['id'], 'designer', 'review', 'Done')
         await store.close()
     run(scenario())
+
+
+def test_section_subscriptions_diff_search_and_read_confirmation(tmp_path):
+    async def scenario():
+        store, s, p, workspace = await setup(tmp_path)
+        doc = await create(s, p, '# Guide\nIntro\n## API\nold\n## Other\nstable\n')
+        sections = (await s.read(p, doc))['outline']
+        api, other = sections[-2]['id'], sections[-1]['id']
+        await s.subscribe(p, 'frontend', doc, section_id=api)
+        await s.subscribe(p, 'designer', doc, section_id=other)
+        for version, before, after in [(1, 'old', 'new'), (2, 'new', 'newer')]:
+            await s.publish(p, 'backend', [dict(document_id=doc, base_version=version, summary=after, edits=[dict(operation='replace_text', section_id=api, old_text=before, new_text=after)])])
+        reminders = await s.inbox(p, 'frontend', 'ctx')
+        assert len(reminders) == 1 and len(reminders[0]['event_ids']) == 2
+        assert not await s.inbox(p, 'designer', 'ctx')
+        assert '+newer' in (await s.section_diff(p, doc, 1, 3, api))['diff']
+        assert (await s.search(p, 'newer'))['matches'][0]['section_id'] == api
+        result, key = await s.read_cached(p, 'frontend', 'ctx', document_id=doc, section_id=api)
+        assert result['content'] == 'newer\n'
+        assert not (await s.read_cached(p, 'frontend', 'ctx', document_id=doc, section_id=api))[0].get('already_in_context')
+        await s.confirm_reads(p, [key])
+        assert (await s.read_cached(p, 'frontend', 'ctx', document_id=doc, section_id=api))[0]['already_in_context']
+        assert 'content' in (await s.read_cached(p, 'frontend', 'fresh', document_id=doc, section_id=api))[0]
+        await store.close()
+    run(scenario())
+
+
+def test_commonmark_index_and_bounded_pages():
+    from app.collaboration.documents import page
+    content = '# Real\n\n> # Quoted\n\n<!--\n# Hidden\n-->\n\n~~~md\n# Code\n~~~\n\nSection\n-------\ntext\n'
+    assert [s['title'] for s in outline(content)] == ['Document', 'Real', 'Section']
+    body = 'first paragraph\n\n```json\n' + 'x' * 100 + '\n```\n'
+    first, cursor, fragmented = page(body, 0, 30)
+    assert len(first) <= 30 and cursor and not fragmented
+    rest, following, fragmented = page(body, cursor, 30)
+    assert len(rest) <= 30 and following and fragmented

@@ -171,7 +171,7 @@ class Team:
             if self.collaboration:
                 project = await self.collaboration.project_for_conversation(session_id)
                 if project:
-                    collaboration_token = active.set(Context(self.collaboration, project, 'leader', session_id, f'leader:{session_id}:{uuid4().hex}'))
+                    collaboration_token = active.set(Context(self.collaboration, project, 'leader', session_id, f'leader:{session_id}'))
             try:
                 async for event in self._run(history, session_id):
                     yield event
@@ -213,8 +213,11 @@ class Team:
                 yield "status", {"id": "leader", "status": AgentStatus.FAILED}
                 raise
             messages.append(response)
+            if ctx:
+                await ctx.service.confirm_reads(ctx.project, ctx.pending_reads)
+                ctx.pending_reads.clear()
             if ctx and reminders:
-                await ctx.service.acknowledge(ctx.project, ctx.member, ctx.context, [r['event_id'] for r in reminders])
+                await ctx.service.acknowledge(ctx.project, ctx.member, ctx.context, [i for r in reminders for i in r.get('event_ids', [r.get('event_id')])])
             if self.leader.record_usage(response):
                 yield "usage", self.usage_snapshot()
 

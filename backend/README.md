@@ -122,3 +122,11 @@ Dependent workers may wake for review to inspect and accept a child delivery.
 Starting a persisted delegation now queues durable work; Leader reports its request
 ID and can inspect/accept it with the collaboration tool. Legacy stateless chat
 retains the original synchronous delegation behavior.
+
+Context efficiency: `subscribe` optionally takes `section_id`; `search` returns
+bounded literal keyword matches, and `diff` pages a section's version difference.
+The CommonMark parser excludes quoted/code/HTML headings. Section reads prefer
+whole Markdown blocks; oversized blocks carry `fragment: true` and a continuation
+cursor. Repeated reads are suppressed only after successful model processing and
+checkpointing, scoped to a context and version; `force: true` rereads explicitly.
+Reminder aggregation preserves every included revision summary and event ID.

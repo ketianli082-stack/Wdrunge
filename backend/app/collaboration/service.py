@@ -17,7 +17,7 @@ from uuid import uuid4
 
 from sqlalchemy import text
 
-from app.collaboration.documents import digest, outline, section, edit_document
+from app.collaboration.documents import digest, outline, section, edit_document, page
 from app.collaboration.schema import DDL
 from app.storage import ChatStore, StorageConflictError, StorageNotFoundError
 
@@ -197,9 +197,15 @@ class Collaboration:
                             await self._put(c, 'revision', pid, f"{r['id']}:{r['version']}", r)
                             await self._put(c, 'document', pid, r['id'], {k: r[k] for k in ('id', 'path', 'title', 'version', 'hash', 'author', 'created')})
                         for r in pending['revisions']:
+                            previous = await self._get(c, 'revision', pid, f"{r['id']}:{r['version']-1}", False)
+                            old_sections = {s['id']: previous['content'][s['start']:s['body_end']] for s in previous['outline']} if previous else {}
+                            new_sections = {s['id']: r['content'][s['start']:s['body_end']] for s in r['outline']}
+                            changed = [key for key in old_sections.keys() | new_sections.keys() if old_sections.get(key) != new_sections.get(key)]
+                            notified = set()
                             for sub in await self._list(c, 'subscription', pid):
-                                if sub['document_id'] == r['id']:
-                                    await self._event(c, pid, sub['member'], {'type': 'document_changed', 'document_id': r['id'], 'version': r['version'], 'summary': r['summary'], 'batch_id': r['batch_id']})
+                                if sub['document_id'] == r['id'] and (not sub.get('section_id') or sub['section_id'] in changed) and sub['member'] not in notified:
+                                    notified.add(sub['member'])
+                                    await self._event(c, pid, sub['member'], {'type': 'document_changed', 'document_id': r['id'], 'version': r['version'], 'summary': r['summary'], 'batch_id': r['batch_id'], 'changed_sections': changed})
                         await c.execute(text("DELETE FROM collaboration_records WHERE kind='pending' AND project=:p AND id=:i"), {'p': pid, 'i': pending['id']})
 
     async def catalog(self, project):
@@ -218,20 +224,25 @@ class Collaboration:
             doc = await self._get(c, 'document', project, document_id)
             r = await self._get(c, 'revision', project, f"{document_id}:{version or doc['version']}")
             if section_id is None:
-                return {'document_id': document_id, 'version': r['version'], 'outline': r['outline'][offset:offset+min(limit,100)], 'next_offset': offset+100 if len(r['outline']) > offset+100 else None}
+                return {'document_id': document_id, 'version': r['version'], 'outline': r['outline'][offset:offset+min(limit,100)], 'next_offset': offset+min(limit,100) if len(r['outline']) > offset+min(limit,100) else None}
             s = section(r['content'], section_id)
             body = r['content'][s['body_start']:s['body_end']]
-            end = min(len(body), offset+limit)
-            return {'document_id': document_id, 'version': r['version'], 'section': s, 'content': body[offset:end], 'next_offset': end if end < len(body) else None}
+            content, next_offset, fragment = page(body, offset, limit)
+            return {'document_id': document_id, 'version': r['version'], 'section': s, 'content': content, 'next_offset': next_offset, 'fragment': fragment}
 
-    async def subscribe(self, project, member, document_id, enabled=True):
+
+    async def subscribe(self, project, member, document_id, enabled=True, section_id=None):
         if member not in ROLES:
             raise ValueError('Unknown member')
         async with self.transaction() as c:
             await self._get(c, 'document', project, document_id)
-            key = f'{member}:{document_id}'
+            key = f'{member}:{document_id}:{section_id or "*"}'
+            if section_id:
+                doc = await self._get(c, 'document', project, document_id)
+                revision = await self._get(c, 'revision', project, f"{document_id}:{doc['version']}")
+                section(revision['content'], section_id)
             if enabled:
-                await self._put(c, 'subscription', project, key, dict(member=member, document_id=document_id))
+                await self._put(c, 'subscription', project, key, dict(member=member, document_id=document_id, section_id=section_id))
             else:
                 await c.execute(text("DELETE FROM collaboration_records WHERE kind='subscription' AND project=:p AND id=:i"), dict(p=project, i=key))
         return {'subscribed': enabled}
@@ -259,7 +270,7 @@ class Collaboration:
             rows = (await c.execute(text('''SELECT e.seq,e.data FROM collaboration_events e
               LEFT JOIN collaboration_receipts r ON r.project=e.project AND r.context=:ctx AND r.seq=e.seq
               WHERE e.project=:p AND e.recipient=:m AND (e.conversation='' OR e.conversation=:v)
-              AND r.seq IS NULL ORDER BY e.seq LIMIT 100'''), dict(ctx=f'{member}:{context}', p=project, m=member, v=conversation))).mappings().all()
+              AND r.seq IS NULL ORDER BY e.seq LIMIT 200'''), dict(ctx=f'{member}:{context}', p=project, m=member, v=conversation))).mappings().all()
             items = []
             size = 0
             for row in rows:
@@ -269,7 +280,22 @@ class Collaboration:
                     break
                 items.append(item)
                 size += length
-            return items
+            groups = {}
+            result = []
+            for item in items:
+                key = item.get('document_id') if item.get('type') == 'document_changed' else None
+                if key and key in groups:
+                    group = groups[key]
+                    group['event_ids'].append(item['event_id'])
+                    group['versions'].append(item['version'])
+                    group['changes'].append({'version': item['version'], 'summary': item['summary'], 'changed_sections': item.get('changed_sections', [])})
+                elif key:
+                    group = dict(type='document_changes', document_id=key, event_ids=[item['event_id']], versions=[item['version']], changes=[{'version': item['version'], 'summary': item['summary'], 'changed_sections': item.get('changed_sections', [])}])
+                    groups[key] = group
+                    result.append(group)
+                else:
+                    result.append(item)
+            return result
 
     async def acknowledge(self, project, member, context, event_ids):
         async with self.transaction() as c:
@@ -398,3 +424,45 @@ class Collaboration:
             await self._project(c, project)
             await self._put(c, 'settings', project, 'project', {'paused': paused})
         return {'paused': paused}
+
+
+    async def section_diff(self, project, document_id, from_version, to_version, section_id, offset=0, limit=6000):
+        if offset < 0 or not 1 <= limit <= 12000:
+            raise ValueError('Invalid diff window')
+        async with self.transaction() as c:
+            contents = []
+            for version in (from_version, to_version):
+                r = await self._get(c, 'revision', project, f'{document_id}:{version}')
+                found = next((s for s in r['outline'] if s['id'] == section_id), None)
+                contents.append(r['content'][found['start']:found['body_end']] if found else '')
+            diff = ''.join(difflib.unified_diff(contents[0].splitlines(True), contents[1].splitlines(True), fromfile=f'v{from_version}', tofile=f'v{to_version}'))
+            return {'diff': diff[offset:offset+limit], 'next_offset': offset+limit if len(diff) > offset+limit else None}
+
+    async def search(self, project, query, offset=0, limit=20):
+        if not query.strip() or len(query) > 200 or offset < 0 or not 1 <= limit <= 50:
+            raise ValueError('Invalid search query or window')
+        async with self.transaction() as c:
+            await self._project(c, project)
+            matches = []
+            for doc in await self._list(c, 'document', project):
+                r = await self._get(c, 'revision', project, f"{doc['id']}:{doc['version']}")
+                for s in r['outline']:
+                    body = r['content'][s['start']:s['body_end']]
+                    position = body.casefold().find(query.casefold())
+                    if position >= 0:
+                        matches.append({'document_id': doc['id'], 'version': doc['version'], 'section_id': s['id'], 'title': s['title'], 'excerpt': body[max(0,position-80):position+240]})
+            return {'matches': matches[offset:offset+limit], 'next_offset': offset+limit if len(matches)>offset+limit else None}
+
+    async def read_cached(self, project, member, context, force=False, **payload):
+        result = await self.read(project, **payload)
+        key = digest(json.dumps([member, context, payload, result.get('version')], sort_keys=True))
+        async with self.transaction() as c:
+            cached = await self._get(c, 'read', project, key, False)
+        if cached and not force:
+            return {'already_in_context': True, 'document_id': payload['document_id'], 'version': result['version'], 'section_id': payload.get('section_id'), 'hint': 'Use force=true to read again.'}, None
+        return result, key
+
+    async def confirm_reads(self, project, keys):
+        async with self.transaction() as c:
+            for key in keys:
+                await self._put(c, 'read', project, key, {'confirmed': True})
