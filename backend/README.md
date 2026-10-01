@@ -199,7 +199,10 @@ This browser excludes hidden paths, symlinks, dependency/build directories and
 limits listings to 10,000 entries. Paths stay within the selected project. HTML and
 unsupported resources are downloads, not executable pages. Raw responses disable
 caching and use a sandbox CSP. File previews reflect current disk contents;
-registered document revision history remains in “协作记录与管理”.
+registered document revision history remains under team chat → “任务与协作” →
+“项目记录与文档维护”. The delivery tab only shows the live file tree and previews;
+assignments, replies, acceptance/retry controls and collaboration details belong
+to team chat.
 
 Specialist graphs default to 1,000 LangGraph steps per execution; override with
 `WDRUNGE_GRAPH_RECURSION_LIMIT`. Steps include model, tool and acknowledgment nodes,

@@ -18,6 +18,7 @@ import {
 } from "./api";
 import { applyConversationEvent } from "./conversationEvents";
 import CollaborationPanel from "./CollaborationPanel";
+import DeliveryPanel from "./DeliveryPanel";
 import { DeliveryPreview, useDeliveryFiles } from "./DeliveryFiles";
 import OfficeScene from "./OfficeScene";
 import AgentAvatar from "./AgentAvatar";
@@ -89,6 +90,8 @@ function App() {
     agents: initialAgents.map((agent) => ({ id: agent.id, total_tokens: 0, context_tokens: 0, context_window: 131072, context_percent: 0 })),
   });
   const [panel, setPanel] = useState<Panel>("chat");
+  const [showCollaboration, setShowCollaboration] = useState(false);
+  useEffect(() => { setShowCollaboration(false); }, [active?.id, panel]);
   const [search, setSearch] = useState("");
   const [input, setInput] = useState("");
   const [streaming, setStreaming] = useState(false);
@@ -197,7 +200,7 @@ function App() {
   useEffect(() => () => controller.current?.abort(), []);
   useEffect(() => {
     if (panel === "chat" && chatFeed.current) chatFeed.current.scrollTop = chatFeed.current.scrollHeight;
-  }, [active?.id, active?.messages, panel]);
+  }, [active?.id, active?.messages, panel, showCollaboration]);
 
   function updateActive(update: (item: ConversationView) => ConversationView) {
     setActive((current) => current ? update(current) : current);
@@ -367,8 +370,9 @@ function App() {
         <button role="tab" aria-selected={panel === "activity"} className={panel === "activity" ? "active" : ""} onClick={() => setPanel("activity")}>工作日志 <span>{active?.activities.length || 0}</span></button>
         <button role="tab" aria-selected={panel === "collaboration"} className={panel === "collaboration" ? "active" : ""} onClick={() => setPanel("collaboration")}>交付文档</button>
       </div>
-      {panel === "collaboration" && activeProject ? <CollaborationPanel key={activeProject.id} project={activeProject.id} files={deliveryFiles} selected={openFile?.path || null} onOpen={showFile} /> : !active ? <section className="chat-panel empty-conversation"><div className="chat-welcome"><span className="welcome-icon">W</span><strong>{activeProject ? activeProject.name : "开始使用 Wdrunge"}</strong><p>{activeProject ? "在此项目中创建一段对话。" : "先创建一个项目，团队会围绕项目工作区持续协作。"}</p><button onClick={() => activeProject ? void startConversation(activeProject.id) : setProjectDialog(true)}>{activeProject ? "新建对话" : "新建项目"}</button></div></section> : panel === "chat" ? <section className="chat-panel" role="tabpanel" aria-label="团队群聊">
-        <header className="panel-heading"><div><strong>{active.project_name} · {active.title}</strong><span>{Object.values(teamIdentities).map((member) => member.name).join(" · ")}</span></div><span className="member-count">6 人</span></header>
+      {panel === "collaboration" && activeProject ? <DeliveryPanel key={activeProject.id} files={deliveryFiles} selected={openFile?.path || null} onOpen={showFile} /> : !active ? <section className="chat-panel empty-conversation"><div className="chat-welcome"><span className="welcome-icon">W</span><strong>{activeProject ? activeProject.name : "开始使用 Wdrunge"}</strong><p>{activeProject ? "在此项目中创建一段对话。" : "先创建一个项目，团队会围绕项目工作区持续协作。"}</p><button onClick={() => activeProject ? void startConversation(activeProject.id) : setProjectDialog(true)}>{activeProject ? "新建对话" : "新建项目"}</button></div></section> : panel === "chat" ? <section className="chat-panel" role="tabpanel" aria-label="团队群聊">
+        <header className="panel-heading"><div><strong>{active.project_name} · {active.title}</strong><span>{Object.values(teamIdentities).map((member) => member.name).join(" · ")}</span></div><div className="chat-heading-actions"><button aria-expanded={showCollaboration} onClick={() => setShowCollaboration(value => !value)}>{showCollaboration ? "返回群聊" : "任务与协作"}</button><span className="member-count">6 人</span></div></header>
+        {showCollaboration ? <CollaborationPanel key={active.id} project={active.project_id} conversation={active.id} onOpen={showFile} /> : <>
         <div className="workspace-banner"><span title={active.workspace_path}>项目工作区 · {active.workspace_path}</span></div>
         <div className="chat-feed" ref={chatFeed}>
           {active.messages.length === 0 && <div className="chat-welcome"><span className="welcome-icon">W</span><strong>开始一段对话</strong><p>向{memberName("leader")}发送消息。团队记录会保存在项目下。</p></div>}
@@ -376,6 +380,7 @@ function App() {
           {streaming && <div className="processing"><i /><i /><i /><span>团队正在处理</span></div>}
         </div>
         <div className="composer-area">{error && <p className="error" role="alert">{error}</p>}<form className="composer" onSubmit={send}><textarea aria-label="发送消息" placeholder="给团队发消息…" value={input} onChange={(event) => setInput(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); event.currentTarget.form?.requestSubmit(); } }} rows={2} /><div className="composer-bottom"><span>Enter 发送 · Shift + Enter 换行</span>{streaming ? <button type="button" onClick={() => controller.current?.abort()} aria-label="停止生成">■</button> : <button type="submit" disabled={!input.trim()} aria-label="发送">↑</button>}</div></form></div>
+        </>}
       </section> : <section className="log-panel" role="tabpanel" aria-label="工作日志">
         <div className="usage-dashboard"><div className="usage-total"><span>累计使用</span><strong>{usage.total_tokens.toLocaleString()}</strong><small>TOKENS</small></div><div className="context-usage"><div className="context-heading">上下文窗口占用</div>{agents.map((agent) => { const item = usage.agents.find((member) => member.id === agent.id); const percent = item?.context_percent ?? 0; return <div className="context-row" key={agent.id} title={`${item?.context_tokens ?? 0} / ${item?.context_window ?? 131072} tokens`}><span title={nameOf(agent.id)}>{nameOf(agent.id)}</span><div className="context-track"><i style={{ width: `${Math.min(percent, 100)}%` }} /></div><strong>{percent.toFixed(1)}%</strong></div>; })}</div></div>
         <header className="panel-heading"><div><strong>工具调用时间线</strong><span>按时间记录 Agent 的工具调用</span></div><span className="member-count">{active.activities.length} 条</span></header>

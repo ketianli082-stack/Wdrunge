@@ -17,8 +17,6 @@
 .delivery-empty{padding:25px 8px;text-align:center;color:#8c9388;font-size:12px;line-height:1.8}
 .delivery-empty small{display:block;font-size:11px}
 .delivery-note{padding:12px;background:#f8f5e9;color:#85774c;font-size:12px;line-height:1.7}
-.delivery-management{border-top:1px solid #e9e9e5;margin-top:24px;padding-top:16px}
-.delivery-management>summary{cursor:pointer;font-size:12px;color:#7b8176}
 .office{position:relative}
 .delivery-overlay{position:absolute;z-index:10;inset:18px;display:flex;flex-direction:column;overflow:hidden;border:1px solid #dedfd8;border-radius:13px;background:#fffefa;box-shadow:0 20px 60px #26352526,0 2px 8px #2635250d;color:#343a32}
 .delivery-preview-heading{display:flex;justify-content:space-between;align-items:center;gap:16px;padding:22px 24px 17px;border-bottom:1px solid #e9e9e3;background:#fafaf5}
