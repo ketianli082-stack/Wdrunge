@@ -376,7 +376,7 @@ class ChatStore:
         sequence = await self._next_sequence(connection, conversation_id)
         await connection.execute(insert(messages).values(
             id=payload["id"], conversation_id=conversation_id, sequence=sequence,
-            sender_id=payload["sender"], role=None, kind="team", content=payload["content"],
+            sender_id=payload["sender"], role=None, kind="progress" if payload.get("kind") == "progress" else "team", content=payload["content"],
             status="completed", metadata_json={"mention": payload.get("mention"), "mentions": payload.get("mentions") or []},
             created_at=now, completed_at=now,
         ))

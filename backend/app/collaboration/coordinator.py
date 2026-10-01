@@ -1,4 +1,4 @@
-"""Event-driven Leader turns, independent of foreground HTTP streams."""
+"""Event-driven Leader turns and context-free, three-minute progress checks."""
 import asyncio
 import json
 import logging
@@ -54,6 +54,8 @@ class LeaderCoordinator:
                     self.job = asyncio.create_task(self.run(project, conversation, row['workspace_path']))
                     # Let a normal event wake take precedence over a timed check.
                     return
+            if now - max(session.get('last_wake', now), session.get('last_progress', 0)) >= 180:
+                await self.progress(project, conversation, now)
 
     async def run(self, project, conversation, workspace):
         store = self.service.store
@@ -89,3 +91,37 @@ class LeaderCoordinator:
                 await self.service._put(c, 'leader_session', project, conversation, session)
             await store.upsert_activity(conversation, dict(id=uuid4().hex, agent='leader', tool='coordination', description='自动协调失败，稍后重试。' if failures < 3 else '自动协调连续失败，请检查后继续对话。', phase='failed'))
 
+    async def progress(self, project, conversation, now):
+        """UI-only exchanges derived from actual runtime evidence. No LLM call,
+        agent checkpoint, model history, handoff or collaboration inbox entry."""
+        from app.agents.identity import member_name
+        async with self.service.transaction() as c:
+            session = await self.service._get(c, 'leader_session', project, conversation)
+            if session['state'] in {'running', 'failed'} or now-max(session.get('last_wake', now), session.get('last_progress', 0)) < 180:
+                return
+            requests = [r for r in await self.service._list(c, 'request', project) if r['conversation']==conversation and r['state'] in {'queued','running','blocked','review'}]
+            if not requests:
+                return
+            session['last_progress'] = now
+            await self.service._put(c, 'leader_session', project, conversation, session)
+            roles = sorted({r['recipient'] for r in requests})
+            batch = uuid4().hex
+            question = dict(id=batch, sender='leader', kind='progress', content='请简要同步当前进度；有阻塞或待验收交付请正式 @我。', mentions=[{'worker': role, 'name': member_name(role), 'summary': '请同步当前工作进度。'} for role in roles])
+            await self.service.store.add_chat_message_in_transaction(c, conversation, question)
+            states = {'queued':'排队中', 'running':'执行中', 'blocked':'等待依赖', 'review':'待验收'}
+            for role in roles:
+                own = [r for r in requests if r['recipient']==role]
+                counts = {state: sum(r['state']==state for r in own) for state in states}
+                summary = '进度快照：' + '，'.join(f'{count} 项{states[state]}' for state,count in counts.items() if count)
+                activity = (await c.execute(text('SELECT description,phase FROM activities WHERE conversation_id=:c AND agent_id=:r ORDER BY updated_at DESC LIMIT 1'), {'c':conversation,'r':role})).mappings().first()
+                if activity:
+                    summary += f"；最近活动：{activity['description'][:70]}（{activity['phase']}）"
+                await self.service.store.add_receipt_in_transaction(c, conversation, {'message_id': batch, 'reader': role})
+                response = dict(id=f'{batch}:{role}', sender=role, kind='progress', content=summary, mentions=[{'worker':'leader', 'name':member_name('leader'), 'summary':summary}])
+                await self.service.store.add_chat_message_in_transaction(c, conversation, response)
+                await self.service.store.add_receipt_in_transaction(c, conversation, {'message_id': response['id'], 'reader':'leader'})
+                # Progress chatter remains ephemeral to models; an actionable
+                # condition gets a separate durable notification with task IDs.
+                attention = [r['id'] for r in own if r['state']=='review' or r.get('blocked_reason')]
+                if attention:
+                    await self.service._event(c, project, 'leader', {'type':'progress_attention', 'requests':attention, 'summary':'任务需要验收或解除阻塞，请检查状态。'}, conversation)

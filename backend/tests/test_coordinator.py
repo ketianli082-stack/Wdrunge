@@ -96,6 +96,35 @@ def test_suspend_message_wake_reply_resuspend_and_delivery(tmp_path, monkeypatch
     asyncio.run(scenario())
 
 
+def test_progress_deadline_dedup_and_context_isolation(tmp_path):
+    async def scenario():
+        store, s, team, p, c = await setup(tmp_path)
+        await s.create_request(p, 'leader', 'frontend', 'Work', 'task', c)
+        await s.leader_session(p, c, state='waiting', last_wake=100, last_progress=0)
+        coordinator = LeaderCoordinator(s, team)
+        before = await s.inbox(p, 'frontend', 'worker', c)
+        await coordinator.progress(p, c, 279)
+        assert len((await store.get_conversation_detail(c))['messages'])==2
+        await coordinator.progress(p, c, 280)
+        detail = await store.get_conversation_detail(c)
+        progress = [m for m in detail['messages'] if m['kind']=='progress']
+        assert len(progress)==2
+        assert all(m['read_by'] for m in progress)
+        assert await store.model_history(c)==[{'role':'user', 'content':'Build feature'}]
+        assert await s.inbox(p, 'frontend', 'worker', c)==before
+        assert not await s.inbox(p, 'leader', f'leader:{c}', c)
+        assert not (await s.snapshot(p))['message']
+        await coordinator.progress(p, c, 280)
+        assert len((await store.get_conversation_detail(c))['messages'])==len(detail['messages'])
+        await s.leader_session(p, c, last_wake=350)
+        await coordinator.progress(p, c, 529)
+        assert len((await store.get_conversation_detail(c))['messages'])==len(detail['messages'])
+        await coordinator.progress(p, c, 530)
+        assert len((await store.get_conversation_detail(c))['messages'])==len(detail['messages'])+2
+        await store.close()
+    asyncio.run(scenario())
+
+
 def test_restart_replays_unconsumed_event_and_no_duplicate_wake(tmp_path, monkeypatch):
     async def scenario():
         store, s, team, p, c = await setup(tmp_path)
@@ -138,6 +167,37 @@ def test_failed_model_does_not_mark_message_read_and_retries_are_bounded(tmp_pat
         detail = await store.get_conversation_detail(c)
         assert not next(m for m in detail['messages'] if m['id']==message['chat_message_id'])['read_by']
         assert await s.inbox(p, 'leader', f'leader:{c}', c)
+        await coordinator.close()
+        await store.close()
+    asyncio.run(scenario())
+
+
+def test_progress_skips_paused_finished_and_active_conversations(tmp_path):
+    async def scenario():
+        store, s, team, p, c = await setup(tmp_path)
+        request = await s.create_request(p, 'leader', 'frontend', 'Work', 'task', c)
+        await s.leader_session(p, c, state='waiting', last_wake=100, last_progress=0)
+        coordinator = LeaderCoordinator(s, team)
+        await s.set_paused(p, True)
+        await coordinator.tick(now=280)
+        assert not [m for m in (await store.get_conversation_detail(c))['messages'] if m['kind']=='progress']
+        await s.set_paused(p, False)
+        await s.leader_session(p, c, state='running')
+        await coordinator.tick(now=280)
+        assert not [m for m in (await store.get_conversation_detail(c))['messages'] if m['kind']=='progress']
+        await s.leader_session(p, c, state='waiting')
+        await coordinator.tick(now=280)
+        assert len([m for m in (await store.get_conversation_detail(c))['messages'] if m['kind']=='progress'])==2
+        # A restarted coordinator must honor the saved last_progress timestamp.
+        restarted = LeaderCoordinator(s, team)
+        await restarted.start()
+        await restarted.tick(now=300)
+        assert len([m for m in (await store.get_conversation_detail(c))['messages'] if m['kind']=='progress'])==2
+        await s.transition(p, request['id'], 'leader', 'cancelled')
+        await s.leader_session(p, c, state='idle')
+        await coordinator.progress(p, c, 500)
+        assert len([m for m in (await store.get_conversation_detail(c))['messages'] if m['kind']=='progress'])==2
+        await restarted.close()
         await coordinator.close()
         await store.close()
     asyncio.run(scenario())

@@ -297,3 +297,17 @@ a crash can replay unfinished coordination without misrepresenting “read” as
 “resolved.” Restart restores eligible conversations and pending events. Failures
 retry with backoff up to three times, then wait for user intervention; a new user
 turn resets this failure state. Project pause and debug reset stop automatic work.
+
+
+While unfinished tasks remain and Leader is resting, 180 seconds without a wake
+triggers a short group progress inquiry and one runtime progress snapshot per
+assigned role. Further checks are spaced by 180 seconds, and an actual wake resets
+the clock. Timestamps persist across restarts; paused projects and active Leader
+turns skip checks. Completed work does not generate progress inquiries.
+
+These exchanges have message kind `progress` and no model role. They appear in the
+UI and work record but never enter model history, collaboration inboxes, handoffs
+or agent checkpoints. Replies explicitly report a runtime snapshot (task states
+and latest tool activity), not an invented completion percentage or an extra
+model conversation. A reviewable delivery or explicit blocker found by a check
+creates a separate durable attention event so Leader can make a real decision.
