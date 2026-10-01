@@ -627,7 +627,10 @@
               "search",
               "diff",
               "schedule",
-              "dependencies"
+              "dependencies",
+              "decision",
+              "maintenance",
+              "handoff"
             ],
             "title": "Action"
           },

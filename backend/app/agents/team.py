@@ -266,6 +266,9 @@ class Team:
                         handoff=reset_handoff,
                         history_cutoff=len(history),
                     )
+                    if active.get():
+                        ctx = active.get()
+                        await ctx.service.handoff(ctx.project, 'leader', save=True, summary=reset_handoff.goal)
                     if self._store:
                         await self._store.save_leader_checkpoint(
                             conversation_id,

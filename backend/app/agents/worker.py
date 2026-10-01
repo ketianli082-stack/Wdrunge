@@ -165,9 +165,9 @@ class WorkerAgent(Agent):
         ctx = active.get()
         if ctx:
             ctx.context = self._threads[conversation_id]
-            catalog = await ctx.service.catalog(ctx.project)
+            catalog = await ctx.service.handoff(ctx.project, ctx.member)
             import json
-            messages.append(HumanMessage(content="Project document index (read outlines before sections): " + json.dumps(catalog, ensure_ascii=False)[:10000]))
+            messages.append(HumanMessage(content="Project handoff (read document outlines before sections): " + json.dumps(catalog, ensure_ascii=False)[:10000]))
         messages.append(HumanMessage(content=f"Assigned task: {task}\n\nHandoff context:\n{handoff}"))
         yield "context", {"mode": resolved}
         tool_names = {tool.name for tool in self.spec.tools} | {"collaborate"}

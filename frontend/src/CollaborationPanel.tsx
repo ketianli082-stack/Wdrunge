@@ -5,7 +5,8 @@ import './CollaborationPanel.css';
 const base = import.meta.env.VITE_API_BASE_URL || 'http://127.0.0.1:8000';
 type Doc = { id: string; title: string; path: string; version: number };
 type Job = { id: string; sender: string; recipient: string; goal: string; state: string; result: string; dependencies: string[]; delivered: string[]; priority?: number; deadline?: number; escalated_at?: number; blocked_reason?: string };
-type Snapshot = { document: Doc[]; request: Job[]; message: { id: string; sender: string; recipient: string; content: string }[] };
+type Decision = { id: string; title: string; rationale: string; state: string; version: number };
+type Snapshot = { decision?: Decision[]; handoff?: {id: string; created: number; summary: string}[]; document: Doc[]; request: Job[]; message: { id: string; sender: string; recipient: string; content: string }[] };
 type Heading = { id: string; title: string; level: number; characters: number };
 
 export default function CollaborationPanel({ project }: { project: string }) {
@@ -20,6 +21,8 @@ export default function CollaborationPanel({ project }: { project: string }) {
   const [section, setSection] = useState<string | null>(null);
   const [nextOffset, setNextOffset] = useState<number | null>(null);
   const [outlineOffset, setOutlineOffset] = useState<number | null>(null);
+  const [findings, setFindings] = useState<{kind: string; document_id?: string; decision_id?: string; fact?: string}[]>([]);
+  const [checked, setChecked] = useState(false);
   const url = `${base}/api/projects/${encodeURIComponent(project)}/collaboration`;
   async function command(action: string, payload: object) {
     const response = await fetch(`${url}/commands`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action, payload }) });
@@ -34,7 +37,7 @@ export default function CollaborationPanel({ project }: { project: string }) {
   }
   useEffect(() => {
     const controller = new AbortController();
-    setDoc(null); setHeadings([]); setContent(''); setMatches([]); setSection(null); setNextOffset(null); setOutlineOffset(null); setError('');
+    setDoc(null); setHeadings([]); setContent(''); setMatches([]); setFindings([]); setChecked(false); setSection(null); setNextOffset(null); setOutlineOffset(null); setError('');
     const load = () => void refresh(controller.signal).catch(e => { if (!controller.signal.aborted) setError(String(e)); });
     load(); const timer = setInterval(load, 3000);
     return () => { controller.abort(); clearInterval(timer); };
@@ -60,6 +63,12 @@ export default function CollaborationPanel({ project }: { project: string }) {
     <h3>协作请求</h3>
     {!data.request.length && <p className="collaboration-empty">暂无请求</p>}
     {[...data.request].reverse().map(r => <article className="collaboration-request" key={r.id} id={`request-${r.id}`}><div><strong>{r.sender} → {r.recipient}</strong><span>{labels[r.state] || r.state}</span></div><p>{r.goal}</p><div className="collaboration-controls"><label>优先级 <select aria-label={`请求 ${r.id} 优先级`} value={r.priority ?? 1} disabled={busy || ['completed','cancelled','rejected','failed'].includes(r.state)} onChange={e => void act(async () => { await command('schedule', { identifier: r.id, priority: Number(e.target.value) }); })}><option value={0}>低</option><option value={1}>普通</option><option value={2}>高</option><option value={3}>紧急</option></select></label>{r.deadline && <small>截止 {new Date(r.deadline * 1000).toLocaleString()}{r.escalated_at ? ' · 已超时升级' : ''}</small>}</div>{r.blocked_reason && <p role="status">阻塞原因：{r.blocked_reason}</p>}{r.dependencies.length > 0 && <div className="collaboration-dependencies">依赖：{r.dependencies.map(id => <a href={`#request-${id}`} key={id}>{id} · {labels[data.request.find(job => job.id === id)?.state || ''] || '未知'}</a>)}</div>}{r.result && <MessageContent message={{ id: "preview", sender: r.recipient, content: r.result }} />}{r.delivered.map(path => <code key={path}>{path}</code>)}<footer>{r.state === 'review' && <><button disabled={busy} onClick={() => void act(async () => { await command('transition', { identifier: r.id, state: 'completed', result: '用户确认验收通过' }); })}>验收通过</button><button disabled={busy} onClick={() => void act(async () => { await command('transition', { identifier: r.id, state: 'queued', result: '请检查交付要求并重新处理' }); })}>重新处理</button></>}{!['completed', 'cancelled', 'rejected', 'failed'].includes(r.state) && <button disabled={busy} onClick={() => void act(async () => { await command('transition', { identifier: r.id, state: 'cancelled', result: '用户取消' }); })}>取消</button>}</footer></article>)}
+    <h3>文档维护与决策</h3>
+    <div className="collaboration-controls"><button disabled={busy} onClick={() => void act(async () => { const r = await command('maintenance', {}); setFindings(r.findings); setChecked(true); })}>检查文档</button><button disabled={busy} onClick={() => void act(async () => { await command('handoff', { save: true, summary: '用户保存项目阶段交接' }); })}>保存阶段交接</button></div>
+    {checked && <p className="collaboration-empty">{findings.length ? `${findings.length} 项需要核对` : '已检查版本、更新时间、重复正文和结构化决策，未发现问题。'}</p>}
+    {findings.map((f, i) => <p key={i}>{{stale_dependency: '文档依据已变化', review_due: '文档较久未更新', duplicate_section: '发现重复章节', decision_evidence_changed: '决策依据已变化', contradictory_decisions: '决策约定冲突'}[f.kind] || f.kind} · {data.document.find(d => d.id === f.document_id)?.title || f.fact || f.decision_id || '请核对相关章节'}</p>)}
+    {data.decision?.map(d => <article className="collaboration-request" key={d.id}><strong>{d.title}</strong><small> · v{d.version} · {{proposed:'提议',accepted:'已采纳',rejected:'已拒绝',superseded:'已替代'}[d.state] || d.state}</small><MessageContent message={{id:d.id,sender:'leader',content:d.rationale}} /></article>)}
+    {data.handoff?.slice(-3).map(h => <p className="collaboration-empty" key={h.id}>交接记录 · {new Date(h.created*1000).toLocaleString()} · {h.summary || '项目状态快照'}</p>)}
     <h3>定向消息</h3>
     {data.message.map(m => <article className="collaboration-request" key={m.id}><strong>{m.sender} → {m.recipient}</strong><MessageContent message={{ id: "preview", sender: m.sender, content: m.content }} /></article>)}
   </section>;

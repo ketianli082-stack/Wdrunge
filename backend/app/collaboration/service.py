@@ -206,6 +206,14 @@ class Collaboration:
                                 if sub['document_id'] == r['id'] and (not sub.get('section_id') or sub['section_id'] in changed) and sub['member'] not in notified:
                                     notified.add(sub['member'])
                                     await self._event(c, pid, sub['member'], {'type': 'document_changed', 'document_id': r['id'], 'version': r['version'], 'summary': r['summary'], 'batch_id': r['batch_id'], 'changed_sections': changed})
+                        changed_versions = {r['id']: r['version'] for r in pending['revisions']}
+                        for request in await self._list(c, 'request', pid):
+                            affected = [ref for ref in request['based_on'] if ref['document_id'] in changed_versions and ref['version'] != changed_versions[ref['document_id']]]
+                            if affected and request['state'] not in TERMINAL:
+                                request['needs_review'] = True
+                                await self._put(c, 'request', pid, request['id'], request)
+                                for member in {request['sender'], request['recipient']}:
+                                    await self._event(c, pid, member, {'type': 'request_basis_changed', 'request_id': request['id'], 'dependencies': affected}, request['conversation'])
                         await c.execute(text("DELETE FROM collaboration_records WHERE kind='pending' AND project=:p AND id=:i"), {'p': pid, 'i': pending['id']})
 
     async def catalog(self, project):
@@ -389,7 +397,7 @@ class Collaboration:
     async def snapshot(self, project):
         async with self.transaction() as c:
             await self._project(c, project)
-            return {kind: await self._list(c, kind, project) for kind in ('document', 'subscription', 'message', 'request', 'pending')}
+            return {kind: await self._list(c, kind, project) for kind in ('document', 'subscription', 'message', 'request', 'pending', 'decision', 'handoff')}
 
     async def claim(self):
         async with self.transaction() as c:
@@ -528,3 +536,95 @@ class Collaboration:
             requests = await self._list(c, 'request', project)
             return {'nodes': [{key: r.get(key) for key in ('id','goal','state','recipient','priority','deadline','blocked_reason')} for r in requests],
                     'edges': [{'from': r['id'], 'to': dependency, 'type': 'depends_on'} for r in requests for dependency in r['dependencies']]}
+
+    async def record_decision(self, project, actor, title, rationale, links, facts=None, identifier=None, base_version=0, state='proposed', supersedes=None):
+        if state not in {'proposed', 'accepted', 'superseded', 'rejected'} or not title.strip() or not rationale.strip():
+            raise ValueError('A decision needs a title, rationale and valid state')
+        if len(title) > 240 or len(rationale) > 4000 or len(links) > 30 or len(facts or {}) > 30:
+            raise ValueError('Decision exceeds size limits')
+        if actor != 'leader' and state != 'proposed':
+            raise ValueError('Only Leader can accept, reject or supersede a decision')
+        async with self.transaction() as c:
+            await self._project(c, project)
+            identifier = identifier or uuid4().hex
+            previous = await self._get(c, 'decision', project, identifier, False)
+            if base_version != (previous['version'] if previous else 0):
+                raise StorageConflictError('Decision version changed')
+            if previous and actor not in {previous['author'], 'leader'}:
+                raise ValueError('Only the author or Leader may edit a decision')
+            for link in links:
+                await self._get(c, 'revision', project, f"{link['document_id']}:{link['version']}")
+            if state == 'accepted':
+                if not links:
+                    raise ValueError('Accepted decisions must cite a published document revision')
+                await self._dependencies(c, project, links)
+            if supersedes:
+                old = await self._get(c, 'decision', project, supersedes)
+                if old['state'] != 'accepted' or state != 'accepted':
+                    raise ValueError('Only an accepted decision may supersede another accepted decision')
+                old.update(state='superseded', version=old['version']+1, superseded_by=identifier)
+                await self._put(c, 'decision', project, old['id'], old)
+                await self._put(c, 'decision_revision', project, f"{old['id']}:{old['version']}", old)
+            decision = dict(id=identifier, version=base_version+1, author=previous['author'] if previous else actor,
+                            title=title, rationale=rationale, links=links, facts=facts or {}, state=state,
+                            supersedes=supersedes, created=time.time())
+            await self._put(c, 'decision', project, identifier, decision)
+            await self._put(c, 'decision_revision', project, f'{identifier}:{base_version+1}', decision)
+            await self._event(c, project, 'leader', {'type': 'decision_changed', 'decision_id': identifier, 'state': state, 'title': title})
+            return decision
+
+    async def maintenance(self, project, stale_days=90):
+        if stale_days < 1:
+            raise ValueError('stale_days must be positive')
+        async with self.transaction() as c:
+            await self._project(c, project)
+            docs = await self._list(c, 'document', project)
+            versions = {d['id']: d['version'] for d in docs}
+            decisions = await self._list(c, 'decision', project)
+            findings, bodies = [], []
+            for d in docs:
+                r = await self._get(c, 'revision', project, f"{d['id']}:{d['version']}")
+                stale_dependencies = [ref for ref in r.get('based_on', []) if versions.get(ref['document_id']) != ref['version']]
+                if stale_dependencies:
+                    findings.append({'kind': 'stale_dependency', 'document_id': d['id'], 'dependencies': stale_dependencies})
+                if time.time() - r['created'] > stale_days * 86400:
+                    findings.append({'kind': 'review_due', 'document_id': d['id'], 'last_updated': r['created']})
+                for heading in r['outline']:
+                    body = ' '.join(r['content'][heading['body_start']:heading['body_end']].split()).casefold()
+                    if len(body) >= 80:
+                        bodies.append((d['id'], heading['id'], body))
+            hashes = {}
+            for doc, sid, body in bodies:
+                h = digest(body)
+                if h in hashes:
+                    findings.append({'kind': 'duplicate_section', 'left': hashes[h], 'right': {'document_id': doc, 'section_id': sid}, 'requires_review': True})
+                else:
+                    hashes[h] = {'document_id': doc, 'section_id': sid}
+            facts = {}
+            for d in decisions:
+                if d['state'] != 'accepted':
+                    continue
+                if any(versions.get(ref['document_id']) != ref['version'] for ref in d['links']):
+                    findings.append({'kind': 'decision_evidence_changed', 'decision_id': d['id'], 'requires_review': True})
+                for key, value in d['facts'].items():
+                    if key in facts and facts[key]['value'] != value:
+                        findings.append({'kind': 'contradictory_decisions', 'fact': key, 'left': facts[key], 'right': {'decision_id': d['id'], 'value': value}, 'requires_review': True})
+                    else:
+                        facts[key] = {'decision_id': d['id'], 'value': value}
+            return {'findings': findings, 'coverage': 'Exact normalized section duplicates, explicit decision facts and version/age checks. Free-text semantic contradictions require review.'}
+
+    async def handoff(self, project, member='leader', save=False, summary=''):
+        async with self.transaction() as c:
+            await self._project(c, project)
+            docs = await self._list(c, 'document', project)
+            requests = [r for r in await self._list(c, 'request', project) if r['state'] not in TERMINAL and (member == 'leader' or member in {r['sender'], r['recipient']})]
+            decisions = [d for d in await self._list(c, 'decision', project) if d['state'] == 'accepted']
+            handoff = {'created': time.time(), 'member': member, 'summary': summary[:2000],
+                       'documents': [{'id': d['id'], 'version': d['version'], 'title': d['title']} for d in docs[:30]],
+                       'pending': [{key: r.get(key) for key in ('id','state','recipient','dependencies','needs_review')} for r in requests[:30]],
+                       'decisions': [{'id': d['id'], 'version': d['version'], 'title': d['title'], 'links': d['links']} for d in decisions[:20]],
+                       'remaining': {'documents': max(0,len(docs)-30), 'pending': max(0,len(requests)-30), 'decisions': max(0,len(decisions)-20)}}
+            if save:
+                handoff['id'] = uuid4().hex
+                await self._put(c, 'handoff', project, handoff['id'], handoff)
+            return handoff

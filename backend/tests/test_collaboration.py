@@ -191,3 +191,29 @@ def test_priority_deadline_escalation_and_cancellation_graph(tmp_path):
         assert (await s.claim())[2]['id'] == low['id']
         await store.close()
     run(scenario())
+
+
+def test_decision_history_staleness_duplicates_and_handoff(tmp_path):
+    async def scenario():
+        store, s, p, workspace = await setup(tmp_path)
+        text = '# Contract\n' + 'The response uses a documented token field. ' * 4
+        doc = await create(s, p, text)
+        await s.publish(p, 'backend', [dict(path='docs/copy.md', content=text, summary='Copy for review')])
+        links = [dict(document_id=doc, version=1)]
+        a = await s.record_decision(p, 'leader', 'Token naming', 'API compatibility', links, {'auth.token_field': 'token'}, state='accepted')
+        await s.record_decision(p, 'leader', 'Alternative naming', 'New clients', links, {'auth.token_field': 'access_token'}, state='accepted')
+        kinds = {f['kind'] for f in (await s.maintenance(p))['findings']}
+        assert {'duplicate_section', 'contradictory_decisions'} <= kinds
+        request = await s.create_request(p, 'leader', 'frontend', 'Use contract', 'contract', based_on=links)
+        await s.publish(p, 'backend', [dict(document_id=doc, base_version=1, summary='Revise contract', edits=[])])
+        assert (await s.get_request(p, request['id']))['needs_review']
+        assert 'decision_evidence_changed' in {f['kind'] for f in (await s.maintenance(p))['findings']}
+        with pytest.raises(ValueError):
+            await s.record_decision(p, 'frontend', 'Approve', 'reason', links, state='accepted')
+        handoff = await s.handoff(p, 'frontend', save=True)
+        assert handoff['pending'][0]['id'] == request['id'] and handoff['documents']
+        assert (await s.snapshot(p))['handoff']
+        with pytest.raises(StorageConflictError):
+            await s.record_decision(p, 'leader', 'Overwrite', 'reason', links, identifier=a['id'], base_version=0)
+        await store.close()
+    run(scenario())

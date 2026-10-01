@@ -17,7 +17,7 @@ def configure(service):
 class Command(BaseModel):
     member: Literal['leader', 'product', 'backend', 'frontend', 'designer', 'testing'] = 'leader'
     conversation: str = ''
-    action: Literal['catalog', 'read', 'publish', 'subscribe', 'send', 'request', 'inspect_request', 'transition', 'snapshot', 'search', 'diff', 'schedule', 'dependencies']
+    action: Literal['catalog', 'read', 'publish', 'subscribe', 'send', 'request', 'inspect_request', 'transition', 'snapshot', 'search', 'diff', 'schedule', 'dependencies', 'decision', 'maintenance', 'handoff']
     payload: dict = Field(default_factory=dict)
 
 

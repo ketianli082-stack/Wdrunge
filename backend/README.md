@@ -138,3 +138,15 @@ updates these fields. `dependencies` exposes nodes and directed prerequisite edg
 Cancellation propagates to dependent requests and children; unrelated work remains
 active. The scheduler cancels affected running jobs, and tool/model boundaries check
 request state before continuing. Already completed filesystem writes are retained.
+
+Knowledge maintenance: `decision` records versioned proposals and published
+revision references. Only Leader can accept/reject/supersede a decision; accepted
+decisions require current published evidence. `facts` uses scoped keys such as
+`auth.token_field` so competing accepted values can be flagged without guessing.
+`maintenance` reports changed dependencies, aged documents, normalized duplicate
+section bodies and contradictory explicit decision facts. It is not a general
+semantic proofreader and never rewrites documents automatically. `handoff` creates
+a bounded project bootstrap with current references, accepted decisions and open
+requests; `save: true` retains a stage snapshot. Leader context checkpoints also
+save these snapshots. Document changes notify affected requests even without a
+subscription, and mark their basis as needing review.
