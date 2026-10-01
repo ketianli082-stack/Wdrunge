@@ -10,7 +10,7 @@ from langgraph.graph import END, START, MessagesState, StateGraph
 from langgraph.prebuilt import ToolNode, tools_condition
 
 from app.agents.limits import graph_recursion_limit
-from app.tools.validation import tool_error
+from app.tools.validation import tool_error, tool_result_failed
 from app.agents.base import Agent
 from app.collaboration.tools import active, collaborate
 
@@ -226,7 +226,7 @@ class WorkerAgent(Agent):
                     "id": run_id,
                     "tool": tool_name,
                     "description": description,
-                    "phase": "failed" if kind == "on_tool_error" or getattr(event.get("data", {}).get("output"), "status", None) == "error" else "completed",
+                    "phase": "failed" if kind == "on_tool_error" or tool_result_failed(event.get("data", {}).get("output")) else "completed",
                 }
             elif kind == "on_chat_model_stream" and event.get("metadata", {}).get("langgraph_node") == "agent":
                 chunk = event.get("data", {}).get("chunk")

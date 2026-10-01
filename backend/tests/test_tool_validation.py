@@ -126,3 +126,15 @@ def test_leader_recovers_invalid_outer_tool_arguments(tmp_path, monkeypatch):
             active.reset(token)
             await store.close()
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('output,failed', [
+    ({'error': 'Invalid result'}, True),
+    (ToolMessage(content='{"error":"Invalid result"}', tool_call_id='t'), True),
+    (ToolMessage(content='{"passed":false,"status":500}', tool_call_id='t'), True),
+    (ToolMessage(content='{"passed":true}', tool_call_id='t'), False),
+    (ToolMessage(content='regular content', tool_call_id='t'), False),
+])
+def test_rejected_tool_results_are_not_logged_as_completed(output, failed):
+    from app.tools.validation import tool_result_failed
+    assert tool_result_failed(output) is failed
