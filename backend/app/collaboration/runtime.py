@@ -76,6 +76,8 @@ class Scheduler:
             isolated = await self.service.prepare_workspace(project, request['id'])
             active_workspace.set(isolated.work)
             active.get().instance_id = request['instance_id']
+            if request.get('origin_message') and request['conversation']:
+                await self.team._store.add_receipt(request['conversation'], {'message_id': request['origin_message'], 'reader': role})
             # A fresh execution gets durable task state and current project facts;
             # it does not depend on a cancelled model's tool-call transcript.
             async for event, data in worker.stream(request['goal'], conversation_id=f"collaboration:{project}:{request['id']}", context_mode='fresh', handoff=f"Durable request {request['id']}. Requirements: {request['based_on']}. Expected artifacts: {request['artifacts']}. Prior result: {request['result']}. Dependencies: {request['dependencies']}. Use collaborate to inspect dependencies, deliver, or wait."):

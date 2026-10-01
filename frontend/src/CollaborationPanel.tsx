@@ -75,7 +75,7 @@ export default function CollaborationPanel({ project, files, selected, onOpen }:
     {findings.map((f, i) => <p key={i}>{{stale_dependency: '文档依据已变化', review_due: '文档较久未更新', duplicate_section: '发现重复章节', decision_evidence_changed: '决策依据已变化', contradictory_decisions: '决策约定冲突'}[f.kind] || f.kind} · {data.document.find(d => d.id === f.document_id)?.title || f.fact || f.decision_id || '请核对相关章节'}</p>)}
     {data.decision?.map(d => <article className="collaboration-request" key={d.id}><strong>{d.title}</strong><small> · v{d.version} · {{proposed:'提议',accepted:'已采纳',rejected:'已拒绝',superseded:'已替代'}[d.state] || d.state}</small><MessageContent message={{id:d.id,sender:'leader',content:d.rationale}} /></article>)}
     {data.handoff?.slice(-3).map(h => <p className="collaboration-empty" key={h.id}>交接记录 · {new Date(h.created*1000).toLocaleString()} · {h.summary || '项目状态快照'}</p>)}
-    <h3>定向消息</h3>
+    <h3>群内协作详细记录</h3>
     {data.message.map(m => <article className="collaboration-request" key={m.id}><strong>{m.sender} → {m.recipient}</strong><MessageContent message={{ id: "preview", sender: m.sender, content: m.content }} /></article>)}
     </details>
   </section>;

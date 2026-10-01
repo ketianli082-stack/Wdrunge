@@ -465,3 +465,88 @@ def test_retry_failed_request_preserves_workspace_and_unblocks_dependency(tmp_pa
         assert 'blocked_reason' not in resumed[2]
         await store.close()
     run(scenario())
+
+
+def test_group_mentions_show_only_summaries_with_durable_details_and_replies(tmp_path):
+    async def scenario():
+        store, s, p, workspace = await setup(tmp_path)
+        c = (await store.create_conversation(p, 'Group'))['id']
+        msg = await s.send(p, 'frontend', 'backend', 'Full contract details and internal parameters', 'contract', c, summary='请补充点赞接口的响应格式。')
+        assert await s.send(p, 'frontend', 'backend', 'Full contract details and internal parameters', 'contract', c, summary='请补充点赞接口的响应格式。') == msg
+        await s.send(p, 'backend', 'frontend', 'Full response shape and examples', 'reply', c, reply_to=msg['id'], summary='响应格式已补齐，请按接口文档接入。')
+        detail = await store.get_conversation_detail(c)
+        assert len(detail['messages']) == 2
+        assert detail['messages'][0]['mentions'][0]['summary'] == '请补充点赞接口的响应格式。'
+        assert 'Full' not in str(detail['messages'])
+        assert 'Full contract details' in (await s.inspect_message(p, msg['id']))['content']
+        inbox = await s.inbox(p, 'backend', 'ctx', c)
+        await s.acknowledge(p, 'backend', 'ctx', [item['event_id'] for item in inbox])
+        assert (await store.get_conversation_detail(c))['messages'][0]['read_by'] == ['backend']
+        with pytest.raises(ValueError):
+            await s.send(p, 'frontend', 'backend', 'Details', 'too-long', c, summary='x'*161)
+        assert len((await store.get_conversation_detail(c))['messages']) == 2
+        await store.close()
+    run(scenario())
+
+
+def test_request_handoff_and_acceptance_appear_as_short_group_replies(tmp_path):
+    async def scenario():
+        store, s, p, workspace = await setup(tmp_path)
+        c = (await store.create_conversation(p, 'Handoff'))['id']
+        r = await s.create_request(p, 'frontend', 'designer', 'Detailed design requirements', 'design', conversation=c, summary='请提供页面风格与布局方案。')
+        await s.claim()
+        await s.transition(p, r['id'], 'designer', 'review', 'Full delivery details', summary='布局方案已交付，请前端核对。')
+        assert not (await store.get_conversation_detail(c))['messages'][0]['completed_by']
+        await s.transition(p, r['id'], 'frontend', 'completed', 'Accepted full evidence', summary='方案已确认，我继续实现页面。')
+        detail = await store.get_conversation_detail(c)
+        assert len(detail['messages']) == 3
+        assert [m['sender'] for m in detail['messages']] == ['frontend', 'designer', 'frontend']
+        assert detail['messages'][0]['completed_by'] == ['designer']
+        assert 'Detailed' not in str(detail['messages']) and 'Full' not in str(detail['messages'])
+        events = await store.conversation_event_page(c)
+        assert sum(e['type']=='chat_message' for e in events['events']) == 3
+        await store.close()
+    run(scenario())
+
+
+def test_single_slot_scheduler_resumes_parent_after_child_review(tmp_path, monkeypatch):
+    from app.agents.team import Team
+    from app.agents.worker import WorkerAgent
+    from app.collaboration.runtime import Scheduler
+    from app.collaboration.tools import active
+    from langgraph.checkpoint.memory import InMemorySaver
+    seen = []
+    async def worker(self, task, **kwargs):
+        ctx = active.get()
+        current = await ctx.service.get_request(ctx.project, ctx.request)
+        seen.append((ctx.member, current['attempts']))
+        if ctx.member == 'frontend' and current['attempts'] == 1:
+            child = await ctx.service.create_request(ctx.project, 'frontend', 'designer', 'Provide style', 'style', conversation=ctx.conversation, parent=ctx.request, summary='请提供视觉方案。')
+            await ctx.service.wait_for(ctx.project, ctx.request, [child['id']], 'frontend')
+            return
+        if ctx.member == 'frontend':
+            child = await ctx.service.get_request(ctx.project, current['dependencies'][0])
+            assert child['state'] == 'review'
+            await ctx.service.transition(ctx.project, child['id'], 'frontend', 'completed', 'Design verified')
+        yield 'content', {'content':'Verified delivery'}
+    monkeypatch.setattr(WorkerAgent, 'stream', worker)
+    async def scenario():
+        store, s, p, workspace = await setup(tmp_path)
+        c = (await store.create_conversation(p, 'Flow'))['id']
+        root = await s.create_request(p, 'leader', 'frontend', 'Build', 'root', conversation=c)
+        team = Team()
+        await team.configure_persistence(store, InMemorySaver())
+        scheduler = Scheduler(s, team, concurrency=1)
+        await scheduler.start()
+        try:
+            async def finished():
+                while (await s.get_request(p, root['id']))['state'] != 'review':
+                    await asyncio.sleep(.05)
+            await asyncio.wait_for(finished(), 5)
+            assert seen == [('frontend', 1), ('designer', 1), ('frontend', 2)]
+            await s.transition(p, root['id'], 'leader', 'completed', 'Whole delivery accepted')
+            assert all(r['state'] == 'completed' for r in (await s.snapshot(p))['request'])
+        finally:
+            await scheduler.close()
+            await store.close()
+    run(scenario())

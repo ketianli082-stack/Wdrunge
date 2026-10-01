@@ -70,3 +70,10 @@ test('background log replay preserves streamed text and deduplicates tool phases
   assert.equal(view.activities.length, 1);
   assert.equal((view.activities[0] as {phase:string}).phase, 'completed');
 });
+
+test('public mention replies render a short summary and never their detailed payload', () => {
+  const html = render('完整内部交接参数不应出现在群里', {sender:'backend', mentions:[{worker:'frontend', name:'前端', summary:'接口契约已更新，请重新生成客户端。'}]});
+  assert.ok(html.includes('接口契约已更新，请重新生成客户端。'));
+  assert.ok(html.includes('@林青禾（前端开发）'));
+  assert.ok(!html.includes('完整内部交接参数'));
+});

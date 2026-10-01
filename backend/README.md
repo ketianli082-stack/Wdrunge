@@ -213,3 +213,21 @@ Conversation activity and team messages also have a cursor-based durable feed:
 while Leader SSE is open, so background workers remain visible during delegation.
 Pages replay safely, preserve streaming assistant text and retain tool start times.
 Leader collaboration/acceptance tools appear on the same timeline.
+
+Collaboration notifications are public group mentions with bounded summaries:
+`send` and `request` accept `summary` (1–160 characters); delivery/acceptance
+`transition` accepts a reply summary. Full `content`, `goal` and `result` stay in
+collaboration records. Notification persistence and chat insertion share one SQLite
+transaction; idempotent sends do not duplicate chat. Legacy calls without summaries
+use a short generic notice and never copy private arguments into the public bubble.
+Read receipts reflect consumed reminders/started tasks; Done appears only after
+acceptance, including acceptance through the UI. Old records remain available in
+the collaboration details panel.
+
+Role prompts route intent and define direct contract/design handoffs. Designer
+owns style/layout guidance and assets; frontend owns page implementation. Testing
+also has `run_service_check`: it starts standard FastAPI/Vite on a free localhost
+port, probes a requested HTTP path, captures bounded logs and stops its own process
+group on success, failure or cancellation. Wdrunge smoke tests use a temporary DB.
+This does not install dependencies, automate a browser or deploy a production app;
+unsupported startup layouts must be reported and coordinated explicitly.

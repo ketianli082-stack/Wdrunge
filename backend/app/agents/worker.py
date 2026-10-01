@@ -25,6 +25,7 @@ TOOL_LABELS = {
     "refresh_api_contract": "更新接口文档",
     "refresh_frontend_client": "更新前端接口客户端",
     "run_project_check": "运行项目检查",
+    "run_service_check": "启动服务并执行冒烟检查",
 }
 
 

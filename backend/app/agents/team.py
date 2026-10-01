@@ -26,6 +26,7 @@ from app.tools.read_project_file import make_read_project_file
 from app.tools.refresh_api_contract import refresh_api_contract
 from app.tools.refresh_frontend_client import refresh_frontend_client
 from app.tools.run_project_check import run_project_check
+from app.tools.run_service_check import run_service_check
 from app.tools.write_project_file import make_write_project_file
 from app.tools._workspace import active_workspace, workspace_root
 
@@ -54,7 +55,7 @@ ROLE_CONFIG = {
         "prompt": "designer.md",
         "skills": ("visual_design.md",),
         "read": ("docs", "frontend/src", "frontend/public"),
-        "write": ("frontend/src", "frontend/public", "docs/design"),
+        "write": ("frontend/public", "docs/design"),
     },
     "frontend": {
         "name": member_name("frontend"),
@@ -115,7 +116,7 @@ class Team:
                 make_write_project_file(write_roots),
             )
             if role == "testing":
-                tools += (run_project_check,)
+                tools += (run_project_check, run_service_check,)
             if role == "backend":
                 tools += (refresh_api_contract,)
             if role == "frontend":
@@ -435,21 +436,11 @@ class Team:
         output: list[str] = []
         error: Exception | None = None
         context_label = "上下文准备中"
-        await queue.put(("read_receipt", {"message_id": message_id, "reader": assignment.worker}))
-        await queue.put(("chat_message", {
-            "id": f"{event_id}-ack",
-            "sender": assignment.worker,
-            "content": WORKER_ACK[assignment.worker],
-        }))
         try:
             ctx = active.get()
             if ctx:
                 request = await ctx.service.create_request(ctx.project, 'leader', assignment.worker,
-                    assignment.task + '\nHandoff: ' + assignment.handoff, event_id, conversation=conversation_id)
-                async with ctx.service.transaction() as connection:
-                    stored = await ctx.service._get(connection, 'request', ctx.project, request['id'])
-                    stored['origin_message'] = message_id
-                    await ctx.service._put(connection, 'request', ctx.project, request['id'], stored)
+                    assignment.task + '\nHandoff: ' + assignment.handoff, event_id, conversation=conversation_id, summary=assignment.summary, origin_message=message_id)
                 while True:
                     current = await ctx.service.get_request(ctx.project, request['id'])
                     async with ctx.service.reading() as connection:
@@ -461,6 +452,12 @@ class Team:
                 await queue.put(("activity", {"id": event_id, "agent": "leader", "tool": tool_name, "description": f"协作请求 {request['id']} · {current['state']}", "phase": "failed" if current['state'] == 'failed' else "completed"}))
                 await queue.put(("_finished", {"call_id": call_id, "worker": assignment.worker, "output": ''.join(output), "error": None}))
                 return
+            await queue.put(("read_receipt", {"message_id": message_id, "reader": assignment.worker}))
+            await queue.put(("chat_message", {
+                "id": f"{event_id}-ack",
+                "sender": assignment.worker,
+                "content": WORKER_ACK[assignment.worker],
+            }))
             async for event, payload in worker.stream(
                 assignment.task,
                 conversation_id=conversation_id,

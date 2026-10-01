@@ -350,16 +350,22 @@ class ChatStore:
 
     async def add_chat_message(self, conversation_id: str, payload: dict[str, Any]) -> None:
         await self.initialize()
-        now = utcnow()
         async with self.engine.begin() as connection:
-            sequence = await self._next_sequence(connection, conversation_id)
-            await connection.execute(insert(messages).values(
-                id=payload["id"], conversation_id=conversation_id, sequence=sequence,
-                sender_id=payload["sender"], role=None, kind="team", content=payload["content"],
-                status="completed", metadata_json={"mention": payload.get("mention"), "mentions": payload.get("mentions") or []},
-                created_at=now, completed_at=now,
-            ))
-            await self._insert_event(connection, conversation_id, sequence, "chat_message", payload["id"], payload, now)
+            await self.add_chat_message_in_transaction(connection, conversation_id, payload)
+
+    async def add_chat_message_in_transaction(self, connection, conversation_id, payload):
+        """Shared transaction makes a collaboration notification and its chat atomic."""
+        if await connection.scalar(select(messages.c.id).where(messages.c.id == payload['id'])):
+            return
+        now = utcnow()
+        sequence = await self._next_sequence(connection, conversation_id)
+        await connection.execute(insert(messages).values(
+            id=payload["id"], conversation_id=conversation_id, sequence=sequence,
+            sender_id=payload["sender"], role=None, kind="team", content=payload["content"],
+            status="completed", metadata_json={"mention": payload.get("mention"), "mentions": payload.get("mentions") or []},
+            created_at=now, completed_at=now,
+        ))
+        await self._insert_event(connection, conversation_id, sequence, "chat_message", payload["id"], payload, now)
 
     async def start_assistant_message(self, conversation_id: str, message_id: str, content: str) -> None:
         await self.initialize()
@@ -381,38 +387,44 @@ class ChatStore:
 
     async def add_receipt(self, conversation_id: str, payload: dict[str, Any]) -> None:
         await self.initialize()
-        now = utcnow()
         async with self.engine.begin() as connection:
-            if not await connection.scalar(select(messages.c.id).where(messages.c.id == payload["message_id"], messages.c.conversation_id == conversation_id)):
-                raise StorageNotFoundError("Message not found")
-            existing = await connection.scalar(select(message_receipts.c.message_id).where(
-                message_receipts.c.message_id == payload["message_id"], message_receipts.c.reader_id == payload["reader"]
+            await self.add_receipt_in_transaction(connection, conversation_id, payload)
+
+    async def add_receipt_in_transaction(self, connection, conversation_id, payload):
+        now = utcnow()
+        if not await connection.scalar(select(messages.c.id).where(messages.c.id == payload["message_id"], messages.c.conversation_id == conversation_id)):
+            raise StorageNotFoundError("Message not found")
+        existing = await connection.scalar(select(message_receipts.c.message_id).where(
+            message_receipts.c.message_id == payload["message_id"], message_receipts.c.reader_id == payload["reader"]
+        ))
+        if not existing:
+            await connection.execute(insert(message_receipts).values(
+                message_id=payload["message_id"], reader_id=payload["reader"], created_at=now,
             ))
-            if not existing:
-                await connection.execute(insert(message_receipts).values(
-                    message_id=payload["message_id"], reader_id=payload["reader"], created_at=now,
-                ))
-            sequence = await self._next_sequence(connection, conversation_id)
-            await self._insert_event(connection, conversation_id, sequence, "read_receipt", payload["message_id"], payload, now)
+        sequence = await self._next_sequence(connection, conversation_id)
+        await self._insert_event(connection, conversation_id, sequence, "read_receipt", payload["message_id"], payload, now)
 
     async def add_reaction(self, conversation_id: str, payload: dict[str, Any]) -> None:
         await self.initialize()
-        now = utcnow()
         async with self.engine.begin() as connection:
-            if not await connection.scalar(select(messages.c.id).where(messages.c.id == payload["message_id"], messages.c.conversation_id == conversation_id)):
-                raise StorageNotFoundError("Message not found")
-            existing = await connection.scalar(select(message_reactions.c.message_id).where(
-                message_reactions.c.message_id == payload["message_id"],
-                message_reactions.c.worker_id == payload["worker"],
-                message_reactions.c.reaction == payload["reaction"],
+            await self.add_reaction_in_transaction(connection, conversation_id, payload)
+
+    async def add_reaction_in_transaction(self, connection, conversation_id, payload):
+        now = utcnow()
+        if not await connection.scalar(select(messages.c.id).where(messages.c.id == payload["message_id"], messages.c.conversation_id == conversation_id)):
+            raise StorageNotFoundError("Message not found")
+        existing = await connection.scalar(select(message_reactions.c.message_id).where(
+            message_reactions.c.message_id == payload["message_id"],
+            message_reactions.c.worker_id == payload["worker"],
+            message_reactions.c.reaction == payload["reaction"],
+        ))
+        if not existing:
+            await connection.execute(insert(message_reactions).values(
+                message_id=payload["message_id"], worker_id=payload["worker"],
+                reaction=payload["reaction"], created_at=now,
             ))
-            if not existing:
-                await connection.execute(insert(message_reactions).values(
-                    message_id=payload["message_id"], worker_id=payload["worker"],
-                    reaction=payload["reaction"], created_at=now,
-                ))
-            sequence = await self._next_sequence(connection, conversation_id)
-            await self._insert_event(connection, conversation_id, sequence, "message_reaction", payload["message_id"], payload, now)
+        sequence = await self._next_sequence(connection, conversation_id)
+        await self._insert_event(connection, conversation_id, sequence, "message_reaction", payload["message_id"], payload, now)
 
     async def upsert_activity(self, conversation_id: str, payload: dict[str, Any]) -> None:
         await self.initialize()

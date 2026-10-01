@@ -35,11 +35,11 @@ async def collaborate(action: Literal['catalog', 'read', 'publish', 'subscribe',
     old_text?,new_text?,include_children?}],based_on?:[{document_id,version}]}]}.
     subscribe: {document_id,enabled?,section_id?}. search: {query,offset?,limit?}.
     diff: {document_id,from_version,to_version,section_id,offset?,limit?}.
-    read supports force=true to bypass confirmed context-read deduplication. send: {recipient,content,key,reply_to?,request_id?}.
-    request: {recipient,goal,key,based_on?,dependencies?,artifacts?,priority?:0..3,deadline?:Unix timestamp}; include
+    read supports force=true to bypass confirmed context-read deduplication. send: {recipient,content,summary,key,reply_to?,request_id?}. Only the short public summary appears as @recipient in team chat; content stays in the detailed record. Replies also require their own short summary.
+    request: {recipient,goal,summary,key,based_on?,dependencies?,artifacts?,priority?:0..3,deadline?:Unix timestamp}; include
     acceptance criteria in goal. inspect_request: {identifier}. inspect_message: {identifier,offset?,limit?} reads full message previews.
     wait: {dependencies:[request_id]} suspends your current task until accepted
-    completion. transition: {identifier,state,result?,artifacts?,based_on?};
+    completion. transition: {identifier,state,result?,summary?,artifacts?,based_on?}; summary is a short public progress/reply, result contains full evidence;
     recipient delivers to review, sender accepts completed or requests queued
     rework. Use docs for enduring decisions, messages for short coordination.
     schedule: {identifier,priority?,deadline?}. dependencies: {} returns a graph.
@@ -110,6 +110,8 @@ async def collaborate(action: Literal['catalog', 'read', 'publish', 'subscribe',
         if action == 'send':
             return await s.send(p, ctx.member, conversation=ctx.conversation, **payload)
         if action == 'request':
+            if 'origin_message' in payload:
+                raise ValueError('origin_message is supplied only by the coordinator')
             return await s.create_request(p, ctx.member, conversation=ctx.conversation, parent=ctx.request, **payload)
         if action == 'inspect_message':
             return await s.inspect_message(p, **payload)
@@ -129,8 +131,6 @@ async def collaborate(action: Literal['catalog', 'read', 'publish', 'subscribe',
                         await s._put(c, 'request', p, ctx.request, r)
                 await s.publish_artifacts(p, ctx.request, ctx.instance_id)
             result = await s.transition(p, actor=ctx.member, **payload)
-            if result['state'] == 'completed' and result.get('origin_message') and result['conversation']:
-                await s.store.add_reaction(result['conversation'], {'message_id': result['origin_message'], 'worker': result['recipient'], 'reaction': 'done'})
             return result
         if action == 'snapshot':
             snapshot = await s.snapshot(p)

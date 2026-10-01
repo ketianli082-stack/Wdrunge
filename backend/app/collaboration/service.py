@@ -296,9 +296,33 @@ class Collaboration:
                 await c.execute(text("DELETE FROM collaboration_records WHERE kind='subscription' AND project=:p AND id=:i"), dict(p=project, i=key))
         return {'subscribed': enabled}
 
-    async def send(self, project, sender, recipient, content, key, conversation='', reply_to=None, request_id=None):
+    @staticmethod
+    def _summary(summary, fallback):
+        if summary is None:
+            return fallback
+        if not isinstance(summary, str):
+            raise ValueError('Public summary must be text')
+        value = ' '.join(summary.split())
+        if not value or len(value) > 160:
+            raise ValueError('Public summary must be 1..160 characters; keep full details in content/result')
+        return value
+
+    async def _group_message(self, c, project, conversation, sender, recipient, summary, key):
+        if not conversation:
+            return None
+        from app.agents.identity import member_name
+        identifier = digest(f'{project}:{key}')
+        await self.store.add_chat_message_in_transaction(c, conversation, {
+            'id': identifier, 'sender': sender,
+            'content': f'@{member_name(recipient)} {summary}',
+            'mentions': [{'worker': recipient, 'name': member_name(recipient), 'summary': summary}],
+        })
+        return identifier
+
+    async def send(self, project, sender, recipient, content, key, conversation='', reply_to=None, request_id=None, summary=None):
         if not key or len(key) > 160 or sender not in ROLES or recipient not in ROLES or not content.strip() or len(content) > 4000:
             raise ValueError('Invalid message')
+        summary = self._summary(summary, '有一条协作消息，请查看详细记录。')
         async with self.transaction() as c:
             await self._project(c, project)
             await self._conversation(c, project, conversation)
@@ -309,14 +333,17 @@ class Collaboration:
                 if request['recipient'] != recipient or request['conversation'] != conversation:
                     raise ValueError('Message request target must match recipient and conversation')
             identifier = f'{sender}:{key}'
-            message = dict(id=identifier, sender=sender, recipient=recipient, content=content, conversation=conversation, reply_to=reply_to, target_request=request_id)
+            message = dict(id=identifier, sender=sender, recipient=recipient, content=content, conversation=conversation, reply_to=reply_to, target_request=request_id, summary=summary)
             old = await self._get(c, 'message', project, identifier, False)
-            if old and old != message:
+            if old:
+                old.setdefault('summary', '有一条协作消息，请查看详细记录。')
+            if old and {k: v for k, v in old.items() if k != 'chat_message_id'} != message:
                 raise StorageConflictError('Idempotency key was used for different message')
             if not old:
+                message['chat_message_id'] = await self._group_message(c, project, conversation, sender, recipient, summary, 'message:'+identifier)
                 await self._put(c, 'message', project, identifier, message)
                 await self._event(c, project, recipient, {'type': 'message', **message}, conversation)
-            return message
+            return old or message
 
     async def inbox(self, project, member, context, conversation='', limit=6000, request=None):
         async with self.reading() as c:
@@ -366,8 +393,15 @@ class Collaboration:
             for identifier in event_ids:
                 await c.execute(text('''INSERT OR IGNORE INTO collaboration_receipts(project,context,seq)
                   SELECT project,:ctx,seq FROM collaboration_events WHERE project=:p AND recipient=:m AND seq=:s'''), dict(ctx=f'{member}:{context}', p=project, m=member, s=identifier))
+                event = (await c.execute(text('SELECT conversation,data FROM collaboration_events WHERE project=:p AND recipient=:m AND seq=:s'), {'p': project, 'm': member, 's': identifier})).mappings().first()
+                if event:
+                    payload = json.loads(event['data'])
+                    if event['conversation'] and payload.get('chat_message_id'):
+                        await self.store.add_receipt_in_transaction(c, event['conversation'], {'message_id': payload['chat_message_id'], 'reader': member})
 
-    async def create_request(self, project, sender, recipient, goal, key, conversation='', based_on=None, dependencies=None, artifacts=None, parent=None, priority=1, deadline=None):
+
+    async def create_request(self, project, sender, recipient, goal, key, conversation='', based_on=None, dependencies=None, artifacts=None, parent=None, priority=1, deadline=None, summary=None, origin_message=None):
+        summary = self._summary(summary, '请协作完成这项任务，详见任务记录。')
         if not key or len(key) > 160:
             raise ValueError('A bounded idempotency key is required')
         if priority not in range(4) or (deadline is not None and deadline <= 0):
@@ -378,7 +412,7 @@ class Collaboration:
             await self._project(c, project)
             await self._conversation(c, project, conversation)
             identifier = f'{sender}:{key}'
-            spec = dict(sender=sender, recipient=recipient, goal=goal, conversation=conversation, based_on=based_on or [], dependencies=dependencies or [], artifacts=artifacts or [], parent=parent, priority=priority, deadline=deadline)
+            spec = dict(sender=sender, recipient=recipient, goal=goal, conversation=conversation, based_on=based_on or [], dependencies=dependencies or [], artifacts=artifacts or [], parent=parent, priority=priority, deadline=deadline, summary=summary)
             old = await self._get(c, 'request', project, identifier, False)
             if old:
                 if old['spec'] != spec:
@@ -396,6 +430,12 @@ class Collaboration:
             for path in spec['artifacts']:
                 self._path(project_info['workspace_path'], path)
             request = dict(id=identifier, **spec, spec=spec, state='queued', created=time.time(), attempts=0, result='', delivered=[], needs_review=False)
+            if origin_message:
+                if not await c.scalar(text('SELECT 1 FROM messages WHERE id=:i AND conversation_id=:c'), {'i': origin_message, 'c': conversation}):
+                    raise ValueError('Origin message must belong to the request conversation')
+                request['origin_message'] = origin_message
+            else:
+                request['origin_message'] = await self._group_message(c, project, conversation, sender, recipient, summary, 'request:'+identifier)
             await self._put(c, 'request', project, identifier, request)
             await self._event(c, project, recipient, {'type': 'request', 'request_id': identifier, 'goal': goal[:1000], 'target_request': identifier}, conversation)
             return request
@@ -421,7 +461,8 @@ class Collaboration:
             await self._put(c, 'request', project, identifier, request)
             return request
 
-    async def transition(self, project, identifier, actor, state, result='', artifacts=None, based_on=None):
+    async def transition(self, project, identifier, actor, state, result='', artifacts=None, based_on=None, summary=None):
+        public_summary = self._summary(summary, {'review': '已提交交付，请验收。', 'completed': '验收通过，可以继续后续工作。', 'queued': '请继续处理原任务并重新交付。', 'failed': '任务执行失败，需要处理后重试。', 'blocked': '当前任务等待依赖或问题处理。', 'cancelled': '这项任务已取消。', 'rejected': '暂不执行这项任务。'}.get(state, '任务状态已更新。'))
         async with self.transaction() as c:
             p = await self._project(c, project)
             r = await self._get(c, 'request', project, identifier)
@@ -455,6 +496,10 @@ class Collaboration:
                 await self._cancel_dependents(c, project, identifier)
             await self._put(c, 'request', project, identifier, r)
             await self._event(c, project, r['sender'], {'type': 'request_status', 'request_id': identifier, 'state': state, 'result': r['result'][:1200], 'target_request': r.get('parent')}, r['conversation'])
+            recipient = r['recipient'] if actor != r['recipient'] else r['sender']
+            await self._group_message(c, project, r['conversation'], actor, recipient, public_summary, f'transition:{identifier}:{uuid4().hex}')
+            if state == 'completed' and r.get('origin_message') and r['conversation']:
+                await self.store.add_reaction_in_transaction(c, r['conversation'], {'message_id': r['origin_message'], 'worker': r['recipient'], 'reaction': 'done'})
             return r
 
     async def get_request(self, project, identifier):
