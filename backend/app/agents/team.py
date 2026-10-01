@@ -6,6 +6,7 @@ from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
+from typing import TYPE_CHECKING
 from uuid import uuid4
 
 from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage, ToolMessage
@@ -26,6 +27,10 @@ from app.tools.refresh_frontend_client import refresh_frontend_client
 from app.tools.run_project_check import run_project_check
 from app.tools.write_project_file import make_write_project_file
 from app.tools._workspace import active_workspace, workspace_root
+
+if TYPE_CHECKING:
+    from langgraph.checkpoint.base import BaseCheckpointSaver
+    from app.storage import ChatStore
 
 
 ROLE_CONFIG = {
@@ -130,6 +135,20 @@ class Team:
         self.leader.system_prompt()
         self._lock = asyncio.Lock()
         self._leader_checkpoints: dict[str, LeaderCheckpoint] = {}
+        self._store: ChatStore | None = None
+
+    async def configure_persistence(
+        self, store: "ChatStore", checkpointer: "BaseCheckpointSaver"
+    ) -> None:
+        self._store = store
+        self._leader_checkpoints.clear()
+        for row in await store.load_leader_checkpoints():
+            self._leader_checkpoints[row["conversation_id"]] = LeaderCheckpoint(
+                handoff=ContextCheckpoint.model_validate(row["handoff_json"]),
+                history_cutoff=row["history_cutoff"],
+            )
+        for worker in self.workers.values():
+            await worker.configure_persistence(store, checkpointer)
 
     def snapshot(self) -> list[dict]:
         return [self.leader.snapshot(), *(worker.snapshot() for worker in self.workers.values())]
@@ -224,6 +243,12 @@ class Team:
                         handoff=reset_handoff,
                         history_cutoff=len(history),
                     )
+                    if self._store:
+                        await self._store.save_leader_checkpoint(
+                            conversation_id,
+                            len(history),
+                            reset_handoff.model_dump(mode="json"),
+                        )
                     tool_result = ToolMessage(content="Coordination checkpoint saved. Continue from the handoff.", tool_call_id=call_id)
                     messages = [
                         system,

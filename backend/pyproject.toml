@@ -5,11 +5,16 @@ description = "Wdrunge agent API"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+    "aiosqlite>=0.20,<1",
+    "alembic>=1.14,<2",
     "fastapi>=0.115,<1",
     "langchain>=1,<2",
     "langchain-openai>=1,<2",
     "langgraph>=1,<2",
+    "langgraph-checkpoint-sqlite>=2,<4",
+    "platformdirs>=4,<5",
     "python-dotenv>=1,<2",
+    "sqlalchemy[asyncio]>=2,<3",
     "uvicorn[standard]>=0.34,<1",
 ]
 

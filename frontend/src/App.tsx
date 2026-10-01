@@ -1,78 +1,81 @@
 import { useEffect, useRef, useState, type FormEvent } from "react";
+import { isTauri } from "@tauri-apps/api/core";
+import { open } from "@tauri-apps/plugin-dialog";
 import {
+  createConversation,
+  createProject,
+  getConversation,
   getTeamStatus,
-  streamChat,
-  validateWorkspace,
+  listProjects,
+  streamConversationMessage,
   type Activity,
-  type ChatMessage,
+  type ConversationDetail,
+  type ProjectSummary,
   type TeamChatMessage,
   type TeamMember,
   type TeamUsage,
 } from "./api";
 import OfficeScene from "./OfficeScene";
+import AgentAvatar from "./AgentAvatar";
+import MessageContent from "./MessageContent";
+import { memberName, teamIdentities } from "./TeamIdentity";
 import "./App.css";
 
-type VisibleMessage = TeamChatMessage & { read?: boolean; readBy?: string[]; completedBy?: string[]; time: string };
+type VisibleMessage = TeamChatMessage & {
+  read?: boolean;
+  readBy?: string[];
+  completedBy?: string[];
+  time: string;
+};
 type VisibleActivity = Activity & { time: string };
-type Conversation = {
-  id: string;
-  title: string;
-  workspacePath: string;
-  updatedAt: number;
-  history: ChatMessage[];
+type ConversationView = Omit<ConversationDetail, "messages" | "activities"> & {
   messages: VisibleMessage[];
   activities: VisibleActivity[];
 };
 type Panel = "chat" | "activity";
 
-const STORAGE_KEY = "wdrunge.conversations.v1";
-const ACTIVE_KEY = "wdrunge.activeConversation.v1";
 const initialAgents: TeamMember[] = [
-  { id: "leader", name: "Leader", status: "idle", tools: [], skills: [] },
-  { id: "product", name: "产品", status: "idle", tools: [], skills: [] },
-  { id: "backend", name: "后端开发", status: "idle", tools: [], skills: [] },
-  { id: "designer", name: "美工", status: "idle", tools: [], skills: [] },
-  { id: "frontend", name: "前端开发", status: "idle", tools: [], skills: [] },
-  { id: "testing", name: "测试", status: "idle", tools: [], skills: [] },
+  { id: "leader", name: memberName("leader"), status: "idle", tools: [], skills: [] },
+  { id: "product", name: memberName("product"), status: "idle", tools: [], skills: [] },
+  { id: "backend", name: memberName("backend"), status: "idle", tools: [], skills: [] },
+  { id: "designer", name: memberName("designer"), status: "idle", tools: [], skills: [] },
+  { id: "frontend", name: memberName("frontend"), status: "idle", tools: [], skills: [] },
+  { id: "testing", name: memberName("testing"), status: "idle", tools: [], skills: [] },
 ];
-const initials: Record<string, string> = {
-  leader: "L", product: "产", backend: "后", designer: "美", frontend: "前", testing: "测", user: "我",
-};
 
-function newConversation(): Conversation {
-  return { id: crypto.randomUUID(), title: "新对话", workspacePath: "", updatedAt: Date.now(), history: [], messages: [], activities: [] };
+function clockTime(value = new Date()) {
+  return new Intl.DateTimeFormat("zh-CN", { hour: "2-digit", minute: "2-digit", hour12: false }).format(value);
 }
-function loadConversations(): Conversation[] {
-  try {
-    const saved = JSON.parse(localStorage.getItem(STORAGE_KEY) || "[]");
-    if (Array.isArray(saved)) {
-      return saved.filter((item) =>
-        item && typeof item.id === "string" && Array.isArray(item.history)
-        && Array.isArray(item.messages) && Array.isArray(item.activities),
-      ).map((item) => ({ ...item, workspacePath: typeof item.workspacePath === "string" ? item.workspacePath : "" }));
-    }
-  } catch { /* A damaged local draft starts as a fresh conversation. */ }
-  return [];
-}
-const savedConversations = loadConversations();
-const initialConversations = savedConversations.length ? savedConversations : [newConversation()];
-const savedActiveId = (() => {
-  try { return localStorage.getItem(ACTIVE_KEY); } catch { return null; }
-})();
-const initialActiveId = initialConversations.some((item) => item.id === savedActiveId)
-  ? savedActiveId as string : initialConversations[0].id;
 
-function clockTime() {
-  return new Intl.DateTimeFormat("zh-CN", { hour: "2-digit", minute: "2-digit", hour12: false }).format(new Date());
-}
-function titleFor(content: string) {
-  const oneLine = content.replace(/\s+/g, " ").trim();
-  return oneLine.length > 22 ? `${oneLine.slice(0, 22)}…` : oneLine;
+function toConversationView(detail: ConversationDetail): ConversationView {
+  return {
+    ...detail,
+    messages: detail.messages.map((message) => ({
+      id: message.id,
+      sender: message.sender,
+      content: message.content,
+      mention: message.mention,
+      mentions: message.mentions,
+      read: !!message.mention && message.read_by.includes(message.mention),
+      readBy: message.read_by,
+      completedBy: message.completed_by,
+      time: clockTime(new Date(message.created_at)),
+    })),
+    activities: detail.activities.map((activity) => ({
+      id: activity.id,
+      agent: activity.agent,
+      tool: activity.tool,
+      description: activity.description,
+      phase: activity.phase,
+      time: clockTime(new Date(activity.created_at)),
+    })),
+  };
 }
 
 function App() {
-  const [conversations, setConversations] = useState<Conversation[]>(initialConversations);
-  const [activeId, setActiveId] = useState(initialActiveId);
+  const [projects, setProjects] = useState<ProjectSummary[]>([]);
+  const [activeProjectId, setActiveProjectId] = useState<string | null>(null);
+  const [active, setActive] = useState<ConversationView | null>(null);
   const [agents, setAgents] = useState<TeamMember[]>(initialAgents);
   const [usage, setUsage] = useState<TeamUsage>({
     total_tokens: 0,
@@ -82,101 +85,147 @@ function App() {
   const [search, setSearch] = useState("");
   const [input, setInput] = useState("");
   const [streaming, setStreaming] = useState(false);
+  const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
-  const [workspaceDialog, setWorkspaceDialog] = useState<"new" | "attach" | null>(null);
+  const [projectDialog, setProjectDialog] = useState(false);
+  const [projectName, setProjectName] = useState("");
   const [workspaceDraft, setWorkspaceDraft] = useState("");
-  const [workspaceError, setWorkspaceError] = useState("");
-  const [workspaceSaving, setWorkspaceSaving] = useState(false);
+  const [projectError, setProjectError] = useState("");
+  const [projectSaving, setProjectSaving] = useState(false);
   const controller = useRef<AbortController | null>(null);
   const chatFeed = useRef<HTMLDivElement | null>(null);
-  const active = conversations.find((item) => item.id === activeId) || conversations[0];
-  const nameOf = (id: string) => id === "user" ? "你" : agents.find((agent) => agent.id === id)?.name || id;
 
-  useEffect(() => {
-    try {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(conversations));
-      localStorage.setItem(ACTIVE_KEY, activeId);
-    } catch { /* Storage can be unavailable or full; the active session still works. */ }
-  }, [conversations, activeId]);
+  const activeProject = projects.find((project) => project.id === (active?.project_id || activeProjectId));
+  const nameOf = (id: string) => memberName(id);
+
+  async function openConversation(id: string) {
+    const detail = await getConversation(id);
+    setActive(toConversationView(detail));
+    setActiveProjectId(detail.project_id);
+    setPanel("chat");
+    setInput("");
+    setError("");
+  }
+
+  async function refreshProjects(preferredConversationId?: string) {
+    const items = await listProjects();
+    setProjects(items);
+    if (preferredConversationId) {
+      await openConversation(preferredConversationId);
+      return;
+    }
+    if (active && items.some((project) => project.conversations.some((conversation) => conversation.id === active.id))) return;
+    const firstProject = items[0];
+    setActiveProjectId(firstProject?.id || null);
+    if (firstProject?.conversations[0]) await openConversation(firstProject.conversations[0].id);
+    else setActive(null);
+  }
+
   useEffect(() => {
     const abort = new AbortController();
-    getTeamStatus(abort.signal).then((team) => {
-      setAgents(team.agents);
-      if (team.usage) setUsage(team.usage);
-    }).catch(() => {});
+    Promise.all([
+      getTeamStatus(abort.signal).then((team) => {
+        setAgents(team.agents);
+        if (team.usage) setUsage(team.usage);
+      }),
+      listProjects(abort.signal).then(async (items) => {
+        setProjects(items);
+        const first = items[0];
+        setActiveProjectId(first?.id || null);
+        if (first?.conversations[0]) {
+          const detail = await getConversation(first.conversations[0].id, abort.signal);
+          setActive(toConversationView(detail));
+        }
+      }),
+    ]).catch((cause) => {
+      if (!abort.signal.aborted) setError(cause instanceof Error ? cause.message : "加载项目失败");
+    }).finally(() => setLoading(false));
     return () => abort.abort();
   }, []);
+
   useEffect(() => () => controller.current?.abort(), []);
   useEffect(() => {
-    if (panel === "chat" && chatFeed.current) {
-      chatFeed.current.scrollTop = chatFeed.current.scrollHeight;
-    }
-  }, [activeId, active.messages, panel]);
+    if (panel === "chat" && chatFeed.current) chatFeed.current.scrollTop = chatFeed.current.scrollHeight;
+  }, [active?.id, active?.messages, panel]);
 
-  function updateConversation(id: string, update: (item: Conversation) => Conversation) {
-    setConversations((current) => current.map((item) => item.id === id ? update(item) : item));
+  function updateActive(update: (item: ConversationView) => ConversationView) {
+    setActive((current) => current ? update(current) : current);
   }
-  function startConversation() {
+
+  async function startConversation(projectId = activeProjectId) {
     if (streaming) return;
-    setWorkspaceDraft(active.workspacePath);
-    setWorkspaceError("");
-    setWorkspaceDialog(active.messages.length === 0 ? "attach" : "new");
+    if (!projectId) {
+      setProjectDialog(true);
+      return;
+    }
+    try {
+      setError("");
+      const created = await createConversation(projectId);
+      await refreshProjects(created.id);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "新建对话失败");
+    }
   }
-  async function saveWorkspace(event: FormEvent<HTMLFormElement>) {
+
+  async function saveProject(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     const path = workspaceDraft.trim();
-    if (!path || workspaceSaving || !workspaceDialog) return;
-    setWorkspaceSaving(true); setWorkspaceError("");
+    if (!path || projectSaving) return;
+    setProjectSaving(true);
+    setProjectError("");
     try {
-      const validated = await validateWorkspace(path);
-      if (workspaceDialog === "attach") {
-        updateConversation(active.id, (item) => ({ ...item, workspacePath: validated }));
-      } else {
-        const created = { ...newConversation(), workspacePath: validated };
-        setConversations((current) => [created, ...current]);
-        setActiveId(created.id);
-      }
-      setWorkspaceDialog(null);
-      setPanel("chat"); setInput(""); setError("");
+      const project = await createProject(projectName, path);
+      const conversation = await createConversation(project.id);
+      setProjectDialog(false);
+      setProjectName("");
+      setWorkspaceDraft("");
+      await refreshProjects(conversation.id);
     } catch (cause) {
-      setWorkspaceError(cause instanceof Error ? cause.message : "工作区校验失败");
+      setProjectError(cause instanceof Error ? cause.message : "创建项目失败");
     } finally {
-      setWorkspaceSaving(false);
+      setProjectSaving(false);
     }
   }
-  function selectConversation(id: string) {
-    if (streaming) return;
-    setActiveId(id);
-    setPanel("chat"); setInput(""); setError("");
+
+  async function chooseWorkspace() {
+    if (!isTauri()) return;
+    setProjectError("");
+    try {
+      const selected = await open({
+        directory: true,
+        multiple: false,
+        canCreateDirectories: true,
+        title: "选择项目文件夹",
+        defaultPath: workspaceDraft || undefined,
+      });
+      if (typeof selected === "string") setWorkspaceDraft(selected);
+    } catch (cause) {
+      setProjectError(cause instanceof Error ? cause.message : "无法打开文件夹选择器");
+    }
   }
 
   async function send(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     const content = input.trim();
-    if (!content || streaming) return;
-    if (!active.workspacePath) {
-      setWorkspaceDraft(""); setWorkspaceError(""); setWorkspaceDialog("attach");
-      return;
-    }
-    const sessionId = active.id;
-    const requestHistory: ChatMessage[] = [...active.history, { role: "user", content }];
-    const replyId = crypto.randomUUID();
-    let reply = "";
-    updateConversation(sessionId, (item) => ({
+    if (!content || streaming || !active) return;
+    const conversationId = active.id;
+    const clientMessageId = crypto.randomUUID();
+    let replyId = "";
+    updateActive((item) => ({
       ...item,
-      title: item.history.length ? item.title : titleFor(content),
-      updatedAt: Date.now(),
-      history: requestHistory,
-      messages: [...item.messages, { id: crypto.randomUUID(), sender: "user", content, time: clockTime() }],
+      messages: [...item.messages, { id: clientMessageId, sender: "user", content, time: clockTime() }],
     }));
-    setInput(""); setError(""); setStreaming(true); setPanel("chat");
+    setInput("");
+    setError("");
+    setStreaming(true);
+    setPanel("chat");
     const abort = new AbortController();
     controller.current = abort;
     try {
-      await streamChat(requestHistory, sessionId, active.workspacePath, {
-        onDelta: (delta) => {
-          reply += delta;
-          updateConversation(sessionId, (item) => ({
+      await streamConversationMessage(conversationId, content, clientMessageId, {
+        onDelta: (delta, messageId) => {
+          replyId = messageId || replyId || `reply-${clientMessageId}`;
+          updateActive((item) => ({
             ...item,
             messages: item.messages.some((message) => message.id === replyId)
               ? item.messages.map((message) => message.id === replyId ? { ...message, content: message.content + delta } : message)
@@ -184,102 +233,109 @@ function App() {
           }));
         },
         onStatus: ({ id, status }) => setAgents((current) => current.map((agent) => agent.id === id ? { ...agent, status } : agent)),
-        onMessage: (message) => updateConversation(sessionId, (item) => ({
-          ...item, messages: [...item.messages, { ...message, readBy: [], completedBy: [], time: clockTime() }],
+        onMessage: (message) => updateActive((item) => ({
+          ...item,
+          messages: [...item.messages, { ...message, readBy: [], completedBy: [], time: clockTime() }],
         })),
-        onRead: ({ message_id, reader }) => updateConversation(sessionId, (item) => ({
+        onRead: ({ message_id, reader }) => updateActive((item) => ({
           ...item,
           messages: item.messages.map((message) => message.id === message_id
-            ? { ...message, read: message.mention === reader || message.read, readBy: [...new Set([...(message.readBy || []), reader])] } : message),
+            ? { ...message, read: message.mention === reader || message.read, readBy: [...new Set([...(message.readBy || []), reader])] }
+            : message),
         })),
-        onReaction: ({ message_id, worker }) => updateConversation(sessionId, (item) => ({
+        onReaction: ({ message_id, worker }) => updateActive((item) => ({
           ...item,
           messages: item.messages.map((message) => message.id === message_id
-            ? { ...message, completedBy: [...new Set([...(message.completedBy || []), worker])] } : message),
+            ? { ...message, completedBy: [...new Set([...(message.completedBy || []), worker])] }
+            : message),
         })),
-        onActivity: (activity) => updateConversation(sessionId, (item) => ({
+        onActivity: (activity) => updateActive((item) => ({
           ...item,
           activities: item.activities.some((entry) => entry.id === activity.id)
             ? item.activities.map((entry) => entry.id === activity.id ? { ...entry, ...activity } : entry)
             : [...item.activities, { ...activity, time: clockTime() }],
         })),
         onUsage: setUsage,
+        onTitle: (title) => {
+          setActive((item) => item?.id === conversationId ? { ...item, title } : item);
+          setProjects((items) => items.map((project) => ({
+            ...project,
+            conversations: project.conversations.map((conversation) =>
+              conversation.id === conversationId ? { ...conversation, title } : conversation),
+          })));
+        },
       }, abort.signal);
     } catch (cause) {
       if (!abort.signal.aborted) setError(cause instanceof Error ? cause.message : "请求失败");
     } finally {
-      if (reply) updateConversation(sessionId, (item) => ({
-        ...item, history: [...requestHistory, { role: "assistant", content: reply }],
-      }));
       controller.current = null;
       setStreaming(false);
-      getTeamStatus().then((team) => {
+      try {
+        const [detail, projectItems, team] = await Promise.all([
+          getConversation(conversationId), listProjects(), getTeamStatus(),
+        ]);
+        setActive(toConversationView(detail));
+        setProjects(projectItems);
         setAgents(team.agents);
         if (team.usage) setUsage(team.usage);
-      }).catch(() => {});
+      } catch { /* Keep the streamed view when the refresh is temporarily unavailable. */ }
     }
   }
 
-  const visibleConversations = [...conversations]
-    .sort((a, b) => b.updatedAt - a.updatedAt)
-    .filter((item) => item.title.toLowerCase().includes(search.toLowerCase()));
+  const visibleProjects = projects.map((project) => ({
+    ...project,
+    conversations: project.name.toLowerCase().includes(search.toLowerCase())
+      ? project.conversations
+      : project.conversations.filter((conversation) => conversation.title.toLowerCase().includes(search.toLowerCase())),
+  })).filter((project) => !search || project.name.toLowerCase().includes(search.toLowerCase()) || project.conversations.length > 0);
 
   return <main className="workspace">
-    <aside className="sidebar" aria-label="聊天历史">
+    <aside className="sidebar" aria-label="项目与聊天历史">
       <div className="sidebar-head">
         <div className="brand"><span className="brand-mark">W</span><strong>Wdrunge</strong></div>
-        <button className="new-chat" onClick={startConversation} disabled={streaming}><span>＋</span> 新建对话</button>
-        <label className="history-search"><span>⌕</span><input aria-label="搜索聊天历史" placeholder="搜索对话" value={search} onChange={(event) => setSearch(event.target.value)} /></label>
-        <div className="sidebar-label">最近的对话</div>
+        <button className="new-project" onClick={() => { setProjectError(""); setProjectDialog(true); }} disabled={streaming}><span>＋</span> 新建项目</button>
+        <label className="history-search"><span>⌕</span><input aria-label="搜索项目和对话" placeholder="搜索项目或对话" value={search} onChange={(event) => setSearch(event.target.value)} /></label>
       </div>
-      <nav className="history-list" aria-label="最近的对话">
-        {visibleConversations.map((item) => <button key={item.id} className={`history-item ${item.id === activeId ? "selected" : ""}`} onClick={() => selectConversation(item.id)} disabled={streaming} title={`${item.title}${item.workspacePath ? ` · ${item.workspacePath}` : " · 未设置工作区"}`}><span className="history-icon">◻</span><span>{item.title}</span></button>)}
-        {visibleConversations.length === 0 && <p className="history-empty">没有匹配的对话</p>}
+      <nav className="project-list" aria-label="项目列表">
+        {visibleProjects.map((project) => <section className={`project-group ${project.id === activeProject?.id ? "selected" : ""}`} key={project.id}>
+          <div className="project-row">
+            <button className="project-name" onClick={() => { setActiveProjectId(project.id); if (project.conversations[0]) void openConversation(project.conversations[0].id); else setActive(null); }} title={project.workspace_path}><span className="project-folder">▾</span><span>{project.name}</span></button>
+            <button className="project-new-chat" onClick={() => void startConversation(project.id)} disabled={streaming} title="新建对话">＋</button>
+          </div>
+          <div className="project-conversations">
+            {project.conversations.map((conversation) => <button key={conversation.id} className={`history-item ${conversation.id === active?.id ? "selected" : ""}`} onClick={() => void openConversation(conversation.id)} disabled={streaming} title={conversation.title}><span className="history-icon">◻</span><span>{conversation.title}</span></button>)}
+            {project.conversations.length === 0 && <button className="empty-project-chat" onClick={() => void startConversation(project.id)}>创建第一段对话</button>}
+          </div>
+        </section>)}
+        {!loading && visibleProjects.length === 0 && <div className="history-empty">{search ? "没有匹配的项目或对话" : "还没有项目"}</div>}
       </nav>
       <div className="sidebar-foot"><span className="foot-mark">W</span><span>Agent 团队<small>{agents.length} 位成员已就位</small></span></div>
     </aside>
 
-    <section className="office" aria-label="Agent 办公室">
-      <OfficeScene agents={agents} />
-    </section>
+    <section className="office" aria-label="Agent 办公室"><OfficeScene agents={agents} /></section>
 
     <aside className="right-rail" aria-label="团队交流与工作日志">
       <div className="rail-tabs" role="tablist" aria-label="右侧内容">
         <button role="tab" aria-selected={panel === "chat"} className={panel === "chat" ? "active" : ""} onClick={() => setPanel("chat")}>团队群聊</button>
-        <button role="tab" aria-selected={panel === "activity"} className={panel === "activity" ? "active" : ""} onClick={() => setPanel("activity")}>工作日志 <span>{active.activities.length}</span></button>
+        <button role="tab" aria-selected={panel === "activity"} className={panel === "activity" ? "active" : ""} onClick={() => setPanel("activity")}>工作日志 <span>{active?.activities.length || 0}</span></button>
       </div>
-      {panel === "chat" ? <section className="chat-panel" role="tabpanel" aria-label="团队群聊">
-        <header className="panel-heading"><div><strong>团队群聊</strong><span>Leader · 产品 · 后端 · 美工 · 前端 · 测试</span></div><span className="member-count">6 人</span></header>
-        <div className="workspace-banner"><span title={active.workspacePath}>{active.workspacePath ? `工作区 · ${active.workspacePath}` : "尚未设置工作区"}</span>{(!active.workspacePath || active.history.length === 0) && <button type="button" onClick={() => { setWorkspaceDraft(active.workspacePath); setWorkspaceError(""); setWorkspaceDialog("attach"); }}>{active.workspacePath ? "更改" : "设置工作区"}</button>}</div>
+      {!active ? <section className="chat-panel empty-conversation"><div className="chat-welcome"><span className="welcome-icon">W</span><strong>{activeProject ? activeProject.name : "开始使用 Wdrunge"}</strong><p>{activeProject ? "在此项目中创建一段对话。" : "先创建一个项目，团队会围绕项目工作区持续协作。"}</p><button onClick={() => activeProject ? void startConversation(activeProject.id) : setProjectDialog(true)}>{activeProject ? "新建对话" : "新建项目"}</button></div></section> : panel === "chat" ? <section className="chat-panel" role="tabpanel" aria-label="团队群聊">
+        <header className="panel-heading"><div><strong>{active.project_name} · {active.title}</strong><span>{Object.values(teamIdentities).map((member) => member.name).join(" · ")}</span></div><span className="member-count">6 人</span></header>
+        <div className="workspace-banner"><span title={active.workspace_path}>项目工作区 · {active.workspace_path}</span></div>
         <div className="chat-feed" ref={chatFeed}>
-          {active.messages.length === 0 && <div className="chat-welcome"><span className="welcome-icon">W</span><strong>开始一段对话</strong><p>向 Leader 发送消息。需要协作时，成员会在这里回应。</p></div>}
-          {active.messages.map((message) => <article className={`chat-message ${message.sender === "user" ? "mine" : ""}`} key={message.id}>
-            <span className={`avatar avatar-${message.sender}`}>{initials[message.sender] || "·"}</span>
-            <div className="message-body"><div className="message-meta"><strong>{nameOf(message.sender)}</strong><time>{message.time}</time></div><div className="bubble">
-              {message.mentions?.length ? message.mentions.map((mention) => <p className="mention-line" key={mention.worker}>
-                <span className="mention-token">@{mention.name}<span className={`read-indicator ${(message.readBy || []).includes(mention.worker) ? "read" : "unread"}`} title={`${mention.name}${(message.readBy || []).includes(mention.worker) ? "已读" : "未读"}`} aria-label={`${mention.name}${(message.readBy || []).includes(mention.worker) ? "已读" : "未读"}`} /></span>{" "}{mention.summary}
-              </p>) : message.mention && message.content.startsWith(`@${nameOf(message.mention)}`) ? <p>
-                <span className="mention-token">@{nameOf(message.mention)}<span className={`read-indicator ${message.read ? "read" : "unread"}`} title={message.read ? "已读" : "未读"} aria-label={`${nameOf(message.mention)}${message.read ? "已读" : "未读"}`} /></span>{message.content.slice(nameOf(message.mention).length + 1)}
-              </p> : <p>{message.content}</p>}
-            </div>{!!message.completedBy?.length && <div className="message-reactions" aria-label="任务完成状态">{message.completedBy.map((worker) => <span className="done-reaction" key={worker} title={`${nameOf(worker)}已完成`}><span aria-hidden="true">✓</span> Done · {nameOf(worker)}</span>)}</div>}</div>
-          </article>)}
+          {active.messages.length === 0 && <div className="chat-welcome"><span className="welcome-icon">W</span><strong>开始一段对话</strong><p>向{memberName("leader")}发送消息。团队记录会保存在项目下。</p></div>}
+          {active.messages.map((message) => <article className={`chat-message ${message.sender === "user" ? "mine" : ""}`} key={message.id}><AgentAvatar agent={message.sender} /><div className="message-body"><div className="message-meta"><strong>{nameOf(message.sender)}</strong><time>{message.time}</time></div><div className="bubble"><MessageContent message={message} /></div>{!!message.completedBy?.length && <div className="message-reactions" aria-label="任务完成状态">{message.completedBy.map((worker) => <span className="done-reaction" key={worker} title={`${nameOf(worker)}已完成`}><span aria-hidden="true">✓</span> Done · {nameOf(worker)}</span>)}</div>}</div></article>)}
           {streaming && <div className="processing"><i /><i /><i /><span>团队正在处理</span></div>}
         </div>
-        <div className="composer-area">{error && <p className="error" role="alert">{error}</p>}<form className="composer" onSubmit={send}><textarea aria-label="发送消息" placeholder={active.workspacePath ? "给团队发消息…" : "请先设置工作区…"} value={input} onChange={(event) => setInput(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); event.currentTarget.form?.requestSubmit(); } }} rows={2} /><div className="composer-bottom"><span>Enter 发送 · Shift + Enter 换行</span>{streaming ? <button type="button" onClick={() => controller.current?.abort()} aria-label="停止生成">■</button> : <button type="submit" disabled={!input.trim() || !active.workspacePath} aria-label="发送">↑</button>}</div></form></div>
+        <div className="composer-area">{error && <p className="error" role="alert">{error}</p>}<form className="composer" onSubmit={send}><textarea aria-label="发送消息" placeholder="给团队发消息…" value={input} onChange={(event) => setInput(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); event.currentTarget.form?.requestSubmit(); } }} rows={2} /><div className="composer-bottom"><span>Enter 发送 · Shift + Enter 换行</span>{streaming ? <button type="button" onClick={() => controller.current?.abort()} aria-label="停止生成">■</button> : <button type="submit" disabled={!input.trim()} aria-label="发送">↑</button>}</div></form></div>
       </section> : <section className="log-panel" role="tabpanel" aria-label="工作日志">
-        <div className="usage-dashboard">
-          <div className="usage-total"><span>累计使用</span><strong>{usage.total_tokens.toLocaleString()}</strong><small>TOKENS</small></div>
-          <div className="context-usage"><div className="context-heading">上下文窗口占用</div>{agents.map((agent) => {
-            const item = usage.agents.find((member) => member.id === agent.id);
-            const percent = item?.context_percent ?? 0;
-            return <div className="context-row" key={agent.id} title={`${item?.context_tokens ?? 0} / ${item?.context_window ?? 131072} tokens`}><span>{agent.name}</span><div className="context-track"><i style={{ width: `${Math.min(percent, 100)}%` }} /></div><strong>{percent.toFixed(1)}%</strong></div>;
-          })}</div>
-        </div>
+        <div className="usage-dashboard"><div className="usage-total"><span>累计使用</span><strong>{usage.total_tokens.toLocaleString()}</strong><small>TOKENS</small></div><div className="context-usage"><div className="context-heading">上下文窗口占用</div>{agents.map((agent) => { const item = usage.agents.find((member) => member.id === agent.id); const percent = item?.context_percent ?? 0; return <div className="context-row" key={agent.id} title={`${item?.context_tokens ?? 0} / ${item?.context_window ?? 131072} tokens`}><span title={nameOf(agent.id)}>{nameOf(agent.id)}</span><div className="context-track"><i style={{ width: `${Math.min(percent, 100)}%` }} /></div><strong>{percent.toFixed(1)}%</strong></div>; })}</div></div>
         <header className="panel-heading"><div><strong>工具调用时间线</strong><span>按时间记录 Agent 的工具调用</span></div><span className="member-count">{active.activities.length} 条</span></header>
-        <div className="activity-feed">{active.activities.length === 0 ? <div className="activity-empty">暂无工具调用记录</div> : <ol className="timeline">{[...active.activities].reverse().map((item) => <li key={item.id}><span className={`timeline-dot ${item.phase}`} /><div className="timeline-top"><strong>{nameOf(item.agent)}</strong><time>{item.time}</time></div><p>{item.description}</p><div className="timeline-foot"><code>{item.tool}</code><span className={`activity-phase ${item.phase}`}>{item.phase === "running" ? "进行中" : item.phase === "completed" ? "已完成" : "失败"}</span></div></li>)}</ol>}</div>
+        <div className="activity-feed">{active.activities.length === 0 ? <div className="activity-empty">暂无工具调用记录</div> : <ol className="timeline">{[...active.activities].reverse().map((item) => <li key={item.id}><span className="timeline-avatar"><AgentAvatar agent={item.agent} /><span className={`timeline-dot ${item.phase}`} /></span><div className="timeline-top"><strong>{nameOf(item.agent)}</strong><time>{item.time}</time></div><p>{item.description}</p><div className="timeline-foot"><code>{item.tool}</code><span className={`activity-phase ${item.phase}`}>{item.phase === "running" ? "进行中" : item.phase === "completed" ? "已完成" : "失败"}</span></div></li>)}</ol>}</div>
       </section>}
     </aside>
-    {workspaceDialog && <div className="workspace-dialog-backdrop" role="presentation"><form className="workspace-dialog" onSubmit={saveWorkspace} role="dialog" aria-modal="true" aria-label="设置工作区"><h2>{workspaceDialog === "new" ? "新建对话" : "设置工作区"}</h2><p>输入本机项目文件夹的绝对路径。团队会在这个目录中读取和修改文件。</p><label htmlFor="workspace-path">工作区目录</label><input id="workspace-path" autoFocus placeholder="/Users/you/Codes/project" value={workspaceDraft} onChange={(event) => setWorkspaceDraft(event.target.value)} />{workspaceError && <p className="workspace-dialog-error" role="alert">{workspaceError}</p>}<div className="workspace-dialog-actions"><button type="button" onClick={() => setWorkspaceDialog(null)} disabled={workspaceSaving}>取消</button><button type="submit" disabled={!workspaceDraft.trim() || workspaceSaving}>{workspaceSaving ? "检查中…" : "使用此工作区"}</button></div></form></div>}
+
+    {projectDialog && <div className="workspace-dialog-backdrop" role="presentation"><form className="workspace-dialog" onSubmit={saveProject} role="dialog" aria-modal="true" aria-label="新建项目"><h2>新建项目</h2><p>项目对应一个本机工作区，并可以包含多段独立对话。</p><label htmlFor="project-name">项目名称</label><input id="project-name" autoFocus placeholder="默认使用文件夹名称" value={projectName} onChange={(event) => setProjectName(event.target.value)} /><label htmlFor="workspace-path">工作区目录</label><div className="workspace-picker"><input id="workspace-path" placeholder="选择或输入项目文件夹" value={workspaceDraft} onChange={(event) => setWorkspaceDraft(event.target.value)} /><button type="button" onClick={() => void chooseWorkspace()} disabled={!isTauri() || projectSaving}>{isTauri() ? "选择文件夹…" : "浏览器不支持选择"}</button></div>{!isTauri() && <small className="workspace-browser-hint">浏览器无法读取文件夹的真实绝对路径，请手动输入；桌面版可直接选择。</small>}{projectError && <p className="workspace-dialog-error" role="alert">{projectError}</p>}<div className="workspace-dialog-actions"><button type="button" onClick={() => setProjectDialog(false)} disabled={projectSaving}>取消</button><button type="submit" disabled={!workspaceDraft.trim() || projectSaving}>{projectSaving ? "创建中…" : "创建项目"}</button></div></form></div>}
   </main>;
 }
 

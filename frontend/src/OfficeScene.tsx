@@ -347,7 +347,8 @@ export default function OfficeScene({ agents, animate = true, actionOverride = n
           if (label) { label.dataset.action = clip.action; label.dataset.input = clip.input; label.dataset.reachError = characters.get(desk.role)!.group.userData.reachError.toFixed(3); label.dataset.wristAngle = characters.get(desk.role)!.group.userData.wristAngle.toFixed(1); }
           changed = motion || changed;
           for (const [screenIndex, screen] of desk.model.screens.entries()) {
-            screen.mesh.material.color.setScalar(1 + lighting.night * .05);
+            const lightScreen = screen.kind !== "code" && screen.kind !== "terminal" && screen.kind !== "metrics";
+            screen.mesh.material.color.setScalar(lightScreen ? 1 - lighting.night * .55 : 1 + lighting.night * .05);
             changed = screen.update(work.elapsed, state, roleMotion, { role: desk.role, clip, screenIndex, previewTime: frameTime, work }) || changed;
           }
           if (label) { label.dataset.screenMode = desk.model.screens.map(screen => screen.mesh.userData.mode).join(","); label.dataset.editing = work.editing.toFixed(2); }
