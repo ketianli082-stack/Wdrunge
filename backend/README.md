@@ -184,3 +184,19 @@ when needed. WAL reads use separate read transactions without taking the writer
 mutex. Message `request_id` targets a specific role instance's request, avoiding
 cross-talk between concurrent tasks. External requests remain project/conversation
 scoped. Cancelled verification commands terminate their process groups.
+
+
+Delivery documents: the “交付文档” panel browses the project's actual workspace,
+including unregistered files and empty folders. `/api/projects/{id}/delivery/tree`
+returns a bounded directory snapshot; `/events` pushes native filesystem updates
+via SSE (100 ms debounce, 1-second reconciliation). Clients reconnect automatically
+and refresh the open preview on changes. Disconnects release the file watcher.
+`/preview?path=...` renders Markdown, UTF-8 text (up to 2 MiB), images or PDFs;
+`/file?path=...` serves the resource, with `download=true` for downloads. The preview
+covers the 3D scene without unmounting it; closing returns to the scene.
+
+This browser excludes hidden paths, symlinks, dependency/build directories and
+limits listings to 10,000 entries. Paths stay within the selected project. HTML and
+unsupported resources are downloads, not executable pages. Raw responses disable
+caching and use a sandbox CSP. File previews reflect current disk contents;
+registered document revision history remains in “协作记录与管理”.

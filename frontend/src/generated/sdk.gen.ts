@@ -2,7 +2,7 @@
 
 import type { Client, Options as Options2, TDataShape } from './client';
 import { client } from './client.gen';
-import type { ChatStreamApiChatStreamPostData, ChatStreamApiChatStreamPostErrors, ChatStreamApiChatStreamPostResponse, ChatStreamApiChatStreamPostResponses, CommandApiProjectsProjectIdCollaborationCommandsPostData, CommandApiProjectsProjectIdCollaborationCommandsPostErrors, CommandApiProjectsProjectIdCollaborationCommandsPostResponses, ConversationDetailApiConversationsConversationIdGetData, ConversationDetailApiConversationsConversationIdGetErrors, ConversationDetailApiConversationsConversationIdGetResponses, ConversationMessageStreamApiConversationsConversationIdMessagesStreamPostData, ConversationMessageStreamApiConversationsConversationIdMessagesStreamPostErrors, ConversationMessageStreamApiConversationsConversationIdMessagesStreamPostResponse, ConversationMessageStreamApiConversationsConversationIdMessagesStreamPostResponses, CreateConversationApiProjectsProjectIdConversationsPostData, CreateConversationApiProjectsProjectIdConversationsPostErrors, CreateConversationApiProjectsProjectIdConversationsPostResponses, CreateProjectApiProjectsPostData, CreateProjectApiProjectsPostErrors, CreateProjectApiProjectsPostResponses, HealthApiHealthGetData, HealthApiHealthGetResponses, ListProjectsApiProjectsGetData, ListProjectsApiProjectsGetResponses, PauseApiProjectsProjectIdCollaborationPausePostData, PauseApiProjectsProjectIdCollaborationPausePostErrors, PauseApiProjectsProjectIdCollaborationPausePostResponses, SnapshotApiProjectsProjectIdCollaborationGetData, SnapshotApiProjectsProjectIdCollaborationGetErrors, SnapshotApiProjectsProjectIdCollaborationGetResponses, TeamStatusApiTeamGetData, TeamStatusApiTeamGetResponses, ValidateWorkspaceApiWorkspacesValidatePostData, ValidateWorkspaceApiWorkspacesValidatePostErrors, ValidateWorkspaceApiWorkspacesValidatePostResponses } from './types.gen';
+import type { ChatStreamApiChatStreamPostData, ChatStreamApiChatStreamPostErrors, ChatStreamApiChatStreamPostResponse, ChatStreamApiChatStreamPostResponses, CommandApiProjectsProjectIdCollaborationCommandsPostData, CommandApiProjectsProjectIdCollaborationCommandsPostErrors, CommandApiProjectsProjectIdCollaborationCommandsPostResponses, ConversationDetailApiConversationsConversationIdGetData, ConversationDetailApiConversationsConversationIdGetErrors, ConversationDetailApiConversationsConversationIdGetResponses, ConversationMessageStreamApiConversationsConversationIdMessagesStreamPostData, ConversationMessageStreamApiConversationsConversationIdMessagesStreamPostErrors, ConversationMessageStreamApiConversationsConversationIdMessagesStreamPostResponse, ConversationMessageStreamApiConversationsConversationIdMessagesStreamPostResponses, CreateConversationApiProjectsProjectIdConversationsPostData, CreateConversationApiProjectsProjectIdConversationsPostErrors, CreateConversationApiProjectsProjectIdConversationsPostResponses, CreateProjectApiProjectsPostData, CreateProjectApiProjectsPostErrors, CreateProjectApiProjectsPostResponses, EventsApiProjectsProjectIdDeliveryEventsGetData, EventsApiProjectsProjectIdDeliveryEventsGetErrors, EventsApiProjectsProjectIdDeliveryEventsGetResponses, HealthApiHealthGetData, HealthApiHealthGetResponses, ListProjectsApiProjectsGetData, ListProjectsApiProjectsGetResponses, PauseApiProjectsProjectIdCollaborationPausePostData, PauseApiProjectsProjectIdCollaborationPausePostErrors, PauseApiProjectsProjectIdCollaborationPausePostResponses, ReadFileApiProjectsProjectIdDeliveryFileGetData, ReadFileApiProjectsProjectIdDeliveryFileGetErrors, ReadFileApiProjectsProjectIdDeliveryFileGetResponses, ReadPreviewApiProjectsProjectIdDeliveryPreviewGetData, ReadPreviewApiProjectsProjectIdDeliveryPreviewGetErrors, ReadPreviewApiProjectsProjectIdDeliveryPreviewGetResponses, SnapshotApiProjectsProjectIdCollaborationGetData, SnapshotApiProjectsProjectIdCollaborationGetErrors, SnapshotApiProjectsProjectIdCollaborationGetResponses, TeamStatusApiTeamGetData, TeamStatusApiTeamGetResponses, TreeApiProjectsProjectIdDeliveryTreeGetData, TreeApiProjectsProjectIdDeliveryTreeGetErrors, TreeApiProjectsProjectIdDeliveryTreeGetResponses, ValidateWorkspaceApiWorkspacesValidatePostData, ValidateWorkspaceApiWorkspacesValidatePostErrors, ValidateWorkspaceApiWorkspacesValidatePostResponses } from './types.gen';
 
 export type Options<TData extends TDataShape = TDataShape, ThrowOnError extends boolean = boolean, TResponse = unknown> = Options2<TData, ThrowOnError, TResponse> & {
     /**
@@ -46,6 +46,26 @@ export const pauseApiProjectsProjectIdCollaborationPausePost = <ThrowOnError ext
         ...options.headers
     }
 });
+
+/**
+ * Tree
+ */
+export const treeApiProjectsProjectIdDeliveryTreeGet = <ThrowOnError extends boolean = false>(options: Options<TreeApiProjectsProjectIdDeliveryTreeGetData, ThrowOnError>) => (options.client ?? client).get<TreeApiProjectsProjectIdDeliveryTreeGetResponses, TreeApiProjectsProjectIdDeliveryTreeGetErrors, ThrowOnError>({ url: '/api/projects/{project_id}/delivery/tree', ...options });
+
+/**
+ * Read Preview
+ */
+export const readPreviewApiProjectsProjectIdDeliveryPreviewGet = <ThrowOnError extends boolean = false>(options: Options<ReadPreviewApiProjectsProjectIdDeliveryPreviewGetData, ThrowOnError>) => (options.client ?? client).get<ReadPreviewApiProjectsProjectIdDeliveryPreviewGetResponses, ReadPreviewApiProjectsProjectIdDeliveryPreviewGetErrors, ThrowOnError>({ url: '/api/projects/{project_id}/delivery/preview', ...options });
+
+/**
+ * Read File
+ */
+export const readFileApiProjectsProjectIdDeliveryFileGet = <ThrowOnError extends boolean = false>(options: Options<ReadFileApiProjectsProjectIdDeliveryFileGetData, ThrowOnError>) => (options.client ?? client).get<ReadFileApiProjectsProjectIdDeliveryFileGetResponses, ReadFileApiProjectsProjectIdDeliveryFileGetErrors, ThrowOnError>({ url: '/api/projects/{project_id}/delivery/file', ...options });
+
+/**
+ * Events
+ */
+export const eventsApiProjectsProjectIdDeliveryEventsGet = <ThrowOnError extends boolean = false>(options: Options<EventsApiProjectsProjectIdDeliveryEventsGetData, ThrowOnError>) => (options.client ?? client).get<EventsApiProjectsProjectIdDeliveryEventsGetResponses, EventsApiProjectsProjectIdDeliveryEventsGetErrors, ThrowOnError>({ url: '/api/projects/{project_id}/delivery/events', ...options });
 
 /**
  * Health

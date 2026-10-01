@@ -23,6 +23,7 @@ from app import conversation_title
 from app.collaboration.service import Collaboration
 from app.collaboration.runtime import Scheduler
 from app.collaboration import api as collaboration_api
+from app.collaboration.delivery import router as delivery_router
 from app.agents.team import get_team
 from app.storage import ChatStore, StorageConflictError, StorageNotFoundError, get_store
 
@@ -87,6 +88,7 @@ app = FastAPI(
     lifespan=lifespan,
 )
 app.include_router(collaboration_api.router)
+app.include_router(delivery_router)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[

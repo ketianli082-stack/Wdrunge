@@ -16,6 +16,7 @@ import {
   type TeamUsage,
 } from "./api";
 import CollaborationPanel from "./CollaborationPanel";
+import { DeliveryPreview, useDeliveryFiles } from "./DeliveryFiles";
 import OfficeScene from "./OfficeScene";
 import AgentAvatar from "./AgentAvatar";
 import MessageContent from "./MessageContent";
@@ -97,6 +98,15 @@ function App() {
   const chatFeed = useRef<HTMLDivElement | null>(null);
 
   const activeProject = projects.find((project) => project.id === (active?.project_id || activeProjectId));
+  const [openFile, setOpenFile] = useState<{project: string; path: string} | null>(null);
+  const deliveryFiles = useDeliveryFiles(activeProject?.id);
+  useEffect(() => { setOpenFile(null); }, [activeProject?.id]);
+  function showFile(path: string) {
+    if (activeProject) {
+      setOpenFile({project: activeProject.id, path});
+      if (window.innerWidth <= 880) document.querySelector('.office')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    }
+  }
   const nameOf = (id: string) => memberName(id);
 
   async function openConversation(id: string) {
@@ -326,15 +336,15 @@ function App() {
       <div className="sidebar-foot"><span className="foot-mark">W</span><span>Agent 团队<small>{agents.length} 位成员已就位</small></span></div>
     </aside>
 
-    <section className="office" aria-label="Agent 办公室"><OfficeScene agents={agents} /></section>
+    <section className="office" aria-label="Agent 办公室"><div style={{width:'100%',height:'100%'}} inert={!!openFile}><OfficeScene agents={agents} /></div>{openFile && activeProject?.id === openFile.project && <DeliveryPreview key={`${openFile.project}:${openFile.path}`} project={openFile.project} path={openFile.path} revision={deliveryFiles.revision} status={deliveryFiles.status} onClose={() => setOpenFile(null)} onOpen={showFile} />}</section>
 
     <aside className="right-rail" aria-label="团队交流与工作日志">
       <div className="rail-tabs" role="tablist" aria-label="右侧内容">
         <button role="tab" aria-selected={panel === "chat"} className={panel === "chat" ? "active" : ""} onClick={() => setPanel("chat")}>团队群聊</button>
         <button role="tab" aria-selected={panel === "activity"} className={panel === "activity" ? "active" : ""} onClick={() => setPanel("activity")}>工作日志 <span>{active?.activities.length || 0}</span></button>
-        <button role="tab" aria-selected={panel === "collaboration"} className={panel === "collaboration" ? "active" : ""} onClick={() => setPanel("collaboration")}>项目协作</button>
+        <button role="tab" aria-selected={panel === "collaboration"} className={panel === "collaboration" ? "active" : ""} onClick={() => setPanel("collaboration")}>交付文档</button>
       </div>
-      {panel === "collaboration" && activeProject ? <CollaborationPanel key={activeProject.id} project={activeProject.id} /> : !active ? <section className="chat-panel empty-conversation"><div className="chat-welcome"><span className="welcome-icon">W</span><strong>{activeProject ? activeProject.name : "开始使用 Wdrunge"}</strong><p>{activeProject ? "在此项目中创建一段对话。" : "先创建一个项目，团队会围绕项目工作区持续协作。"}</p><button onClick={() => activeProject ? void startConversation(activeProject.id) : setProjectDialog(true)}>{activeProject ? "新建对话" : "新建项目"}</button></div></section> : panel === "chat" ? <section className="chat-panel" role="tabpanel" aria-label="团队群聊">
+      {panel === "collaboration" && activeProject ? <CollaborationPanel key={activeProject.id} project={activeProject.id} files={deliveryFiles} selected={openFile?.path || null} onOpen={showFile} /> : !active ? <section className="chat-panel empty-conversation"><div className="chat-welcome"><span className="welcome-icon">W</span><strong>{activeProject ? activeProject.name : "开始使用 Wdrunge"}</strong><p>{activeProject ? "在此项目中创建一段对话。" : "先创建一个项目，团队会围绕项目工作区持续协作。"}</p><button onClick={() => activeProject ? void startConversation(activeProject.id) : setProjectDialog(true)}>{activeProject ? "新建对话" : "新建项目"}</button></div></section> : panel === "chat" ? <section className="chat-panel" role="tabpanel" aria-label="团队群聊">
         <header className="panel-heading"><div><strong>{active.project_name} · {active.title}</strong><span>{Object.values(teamIdentities).map((member) => member.name).join(" · ")}</span></div><span className="member-count">6 人</span></header>
         <div className="workspace-banner"><span title={active.workspace_path}>项目工作区 · {active.workspace_path}</span></div>
         <div className="chat-feed" ref={chatFeed}>

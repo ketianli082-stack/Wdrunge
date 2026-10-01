@@ -173,6 +173,76 @@ export type ConversationSummaryResponse = {
 };
 
 /**
+ * FileEntry
+ */
+export type FileEntry = {
+    /**
+     * Path
+     */
+    path: string;
+    /**
+     * Name
+     */
+    name: string;
+    /**
+     * Kind
+     */
+    kind: 'file' | 'folder';
+    /**
+     * Size
+     */
+    size?: number;
+    /**
+     * Modified
+     */
+    modified?: number;
+};
+
+/**
+ * FilePreview
+ */
+export type FilePreview = {
+    /**
+     * Path
+     */
+    path: string;
+    /**
+     * Kind
+     */
+    kind: 'markdown' | 'text' | 'image' | 'pdf' | 'unsupported';
+    /**
+     * Content
+     */
+    content?: string;
+    /**
+     * Size
+     */
+    size: number;
+    /**
+     * Truncated
+     */
+    truncated?: boolean;
+};
+
+/**
+ * FileTree
+ */
+export type FileTree = {
+    /**
+     * Entries
+     */
+    entries: Array<FileEntry>;
+    /**
+     * Revision
+     */
+    revision: string;
+    /**
+     * Truncated
+     */
+    truncated: boolean;
+};
+
+/**
  * HTTPValidationError
  */
 export type HttpValidationError = {
@@ -523,6 +593,136 @@ export type PauseApiProjectsProjectIdCollaborationPausePostErrors = {
 export type PauseApiProjectsProjectIdCollaborationPausePostError = PauseApiProjectsProjectIdCollaborationPausePostErrors[keyof PauseApiProjectsProjectIdCollaborationPausePostErrors];
 
 export type PauseApiProjectsProjectIdCollaborationPausePostResponses = {
+    /**
+     * Successful Response
+     */
+    200: unknown;
+};
+
+export type TreeApiProjectsProjectIdDeliveryTreeGetData = {
+    body?: never;
+    path: {
+        /**
+         * Project Id
+         */
+        project_id: string;
+    };
+    query?: never;
+    url: '/api/projects/{project_id}/delivery/tree';
+};
+
+export type TreeApiProjectsProjectIdDeliveryTreeGetErrors = {
+    /**
+     * Validation Error
+     */
+    422: HttpValidationError;
+};
+
+export type TreeApiProjectsProjectIdDeliveryTreeGetError = TreeApiProjectsProjectIdDeliveryTreeGetErrors[keyof TreeApiProjectsProjectIdDeliveryTreeGetErrors];
+
+export type TreeApiProjectsProjectIdDeliveryTreeGetResponses = {
+    /**
+     * Successful Response
+     */
+    200: FileTree;
+};
+
+export type TreeApiProjectsProjectIdDeliveryTreeGetResponse = TreeApiProjectsProjectIdDeliveryTreeGetResponses[keyof TreeApiProjectsProjectIdDeliveryTreeGetResponses];
+
+export type ReadPreviewApiProjectsProjectIdDeliveryPreviewGetData = {
+    body?: never;
+    path: {
+        /**
+         * Project Id
+         */
+        project_id: string;
+    };
+    query: {
+        /**
+         * Path
+         */
+        path: string;
+    };
+    url: '/api/projects/{project_id}/delivery/preview';
+};
+
+export type ReadPreviewApiProjectsProjectIdDeliveryPreviewGetErrors = {
+    /**
+     * Validation Error
+     */
+    422: HttpValidationError;
+};
+
+export type ReadPreviewApiProjectsProjectIdDeliveryPreviewGetError = ReadPreviewApiProjectsProjectIdDeliveryPreviewGetErrors[keyof ReadPreviewApiProjectsProjectIdDeliveryPreviewGetErrors];
+
+export type ReadPreviewApiProjectsProjectIdDeliveryPreviewGetResponses = {
+    /**
+     * Successful Response
+     */
+    200: FilePreview;
+};
+
+export type ReadPreviewApiProjectsProjectIdDeliveryPreviewGetResponse = ReadPreviewApiProjectsProjectIdDeliveryPreviewGetResponses[keyof ReadPreviewApiProjectsProjectIdDeliveryPreviewGetResponses];
+
+export type ReadFileApiProjectsProjectIdDeliveryFileGetData = {
+    body?: never;
+    path: {
+        /**
+         * Project Id
+         */
+        project_id: string;
+    };
+    query: {
+        /**
+         * Path
+         */
+        path: string;
+        /**
+         * Download
+         */
+        download?: boolean;
+    };
+    url: '/api/projects/{project_id}/delivery/file';
+};
+
+export type ReadFileApiProjectsProjectIdDeliveryFileGetErrors = {
+    /**
+     * Validation Error
+     */
+    422: HttpValidationError;
+};
+
+export type ReadFileApiProjectsProjectIdDeliveryFileGetError = ReadFileApiProjectsProjectIdDeliveryFileGetErrors[keyof ReadFileApiProjectsProjectIdDeliveryFileGetErrors];
+
+export type ReadFileApiProjectsProjectIdDeliveryFileGetResponses = {
+    /**
+     * Successful Response
+     */
+    200: unknown;
+};
+
+export type EventsApiProjectsProjectIdDeliveryEventsGetData = {
+    body?: never;
+    path: {
+        /**
+         * Project Id
+         */
+        project_id: string;
+    };
+    query?: never;
+    url: '/api/projects/{project_id}/delivery/events';
+};
+
+export type EventsApiProjectsProjectIdDeliveryEventsGetErrors = {
+    /**
+     * Validation Error
+     */
+    422: HttpValidationError;
+};
+
+export type EventsApiProjectsProjectIdDeliveryEventsGetError = EventsApiProjectsProjectIdDeliveryEventsGetErrors[keyof EventsApiProjectsProjectIdDeliveryEventsGetErrors];
+
+export type EventsApiProjectsProjectIdDeliveryEventsGetResponses = {
     /**
      * Successful Response
      */
