@@ -268,3 +268,14 @@ without double counting them on completion/cancellation. The UI polls every thre
 seconds. Concurrent contexts are separate windows; a role displays the largest
 active context instead of summing unrelated windows. No estimated tokens are shown
 before the provider returns usage.
+
+`write_project_file` now accepts either complete `content` or partial
+`edits: [{old_text, new_text}]`, never both. Each nonempty old_text must match
+exactly once in the current file. Edits apply sequentially in memory and commit
+atomically only after the entire batch succeeds. Per-path locks serialize agent
+writes; unrelated edits use the latest file contents. Optional `expected_hash`
+rejects a stale full-file version. `read_project_file` accepts `offset`, `limit`
+and `include_hash=true` to read larger files in parts and obtain that SHA-256.
+Managed Markdown still requires `collaborate publish`. These are exact text
+replacements, not Git patch syntax. External editors do not participate in the
+process-local lock; a hash/content check detects changes observed before replace.

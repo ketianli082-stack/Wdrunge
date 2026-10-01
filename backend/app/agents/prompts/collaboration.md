@@ -61,3 +61,12 @@ provisional work explicitly; a published draft is not a running implementation.
 Declare based_on document versions and request dependencies. Accept prerequisite
 deliveries before publishing dependent artifacts. Contract changes must notify
 frontend/testing and trigger compatibility checks and regression testing.
+
+
+For ordinary project files, read relevant content first (read_project_file supports
+character offset/limit and include_hash=true). Use write_project_file with edits
+[{old_text, new_text}] for changes to existing files; each old_text must match once.
+Use content for creating files or intentional whole-file rewrites. Never send both.
+Use expected_hash from the read when the edit depends on the full file version;
+if matching or hash validation fails, re-read and reconcile before retrying.
+These file edits do not replace collaborate publish for managed shared documents.

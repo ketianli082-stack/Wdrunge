@@ -3,19 +3,29 @@
 from app.tools.validation import tool
 
 from app.tools._workspace import resolve_allowed
+from app.tools._file_edits import file_hash
+from typing import Annotated
+from pydantic import Field
 
 
 def make_read_project_file(allowed_roots: tuple[str, ...]):
     @tool("read_project_file")
-    def read_project_file(path: str) -> str:
-        """Read a project text file by its path relative to the selected workspace."""
+    def read_project_file(path: str, offset: Annotated[int, Field(ge=0)] = 0, limit: Annotated[int, Field(ge=1, le=30000)] = 30000, include_hash: bool = False) -> str:
+        """Read UTF-8 text at a relative path. offset/limit page through characters.
+        include_hash=true includes the full-file SHA-256 for write_project_file's
+        expected_hash. Read relevant content before making exact partial edits.
+        """
         target = resolve_allowed(path, allowed_roots)
         if not target.is_file():
             return f"File not found: {path}"
         try:
-            content = target.read_text(encoding="utf-8")
+            data = target.read_bytes()
+            content = data.decode("utf-8")
         except UnicodeDecodeError:
             return f"Not a UTF-8 text file: {path}"
-        return content[:30000] + ("\n[truncated]" if len(content) > 30000 else "")
+        excerpt = content[offset:offset+limit]
+        if len(content) > offset+limit:
+            excerpt += f"\n[truncated; next_offset={offset+limit}]"
+        return (f"[sha256={file_hash(data)}; characters={len(content)}]\n" if include_hash else "") + excerpt
 
     return read_project_file
