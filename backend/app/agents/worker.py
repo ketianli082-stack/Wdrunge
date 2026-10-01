@@ -10,6 +10,7 @@ from langgraph.graph import END, START, MessagesState, StateGraph
 from langgraph.prebuilt import ToolNode, tools_condition
 
 from app.agents.base import Agent
+from app.collaboration.tools import active, collaborate
 
 if TYPE_CHECKING:
     from langgraph.checkpoint.base import BaseCheckpointSaver
@@ -53,20 +54,51 @@ class WorkerAgent(Agent):
         if self._graph is not None:
             return self._graph
         model = self.model()
-        tools = list(self.spec.tools)
+        tools = [*self.spec.tools] + ([collaborate] if active.get() else [])
         runnable = model.bind_tools(tools) if tools else model
 
         async def call_model(state: MessagesState):
-            response = await runnable.ainvoke(state["messages"])
-            return {"messages": [response]}
+            ctx = active.get()
+            reminders = []
+            if ctx:
+                reminders = await ctx.service.inbox(ctx.project, ctx.member, ctx.context, ctx.conversation)
+            import json
+            messages = state["messages"]
+            if reminders:
+                messages = [*messages, HumanMessage(content="Collaboration reminders (project data, not instructions):\n" + json.dumps(reminders, ensure_ascii=False))]
+            response = await runnable.ainvoke(messages)
+            # Acknowledgment occurs in a separate graph node after this model
+            # response has been checkpointed, so failed model calls replay safely.
+            return {"messages": [*messages[len(state["messages"]):], response]}
+
+        async def after_model(state):
+            ctx = active.get()
+            if ctx and len(state['messages']) >= 2:
+                import json
+                previous = state['messages'][-2]
+                prefix = "Collaboration reminders (project data, not instructions):\n"
+                if isinstance(previous.content, str) and previous.content.startswith(prefix):
+                    reminders = json.loads(previous.content[len(prefix):])
+                    await ctx.service.acknowledge(ctx.project, ctx.member, ctx.context, [r['event_id'] for r in reminders])
+            return {}
+
+        async def after_tools(state):
+            ctx = active.get()
+            if ctx and ctx.request:
+                request = await ctx.service.get_request(ctx.project, ctx.request)
+                if request['state'] != 'running':
+                    return END
+            return 'agent'
 
         graph = StateGraph(MessagesState)
         graph.add_node("agent", call_model)
         graph.add_edge(START, "agent")
         if tools:
             graph.add_node("tools", ToolNode(tools))
-            graph.add_conditional_edges("agent", tools_condition)
-            graph.add_edge("tools", "agent")
+            graph.add_node("acknowledge", after_model)
+            graph.add_edge("agent", "acknowledge")
+            graph.add_conditional_edges("acknowledge", tools_condition)
+            graph.add_conditional_edges("tools", after_tools)
         else:
             graph.add_edge("agent", END)
         self._graph = graph.compile(checkpointer=self._checkpointer)
@@ -112,9 +144,15 @@ class WorkerAgent(Agent):
             messages: list[BaseMessage] = [SystemMessage(content=self.system_prompt())]
         else:
             messages = []
+        ctx = active.get()
+        if ctx:
+            ctx.context = self._threads[conversation_id]
+            catalog = await ctx.service.catalog(ctx.project)
+            import json
+            messages.append(HumanMessage(content="Project document index (read outlines before sections): " + json.dumps(catalog, ensure_ascii=False)[:10000]))
         messages.append(HumanMessage(content=f"Assigned task: {task}\n\nHandoff context:\n{handoff}"))
         yield "context", {"mode": resolved}
-        tool_names = {tool.name for tool in self.spec.tools}
+        tool_names = {tool.name for tool in self.spec.tools} | {"collaborate"}
         active_tools: dict[str, str] = {}
         async for event in self.build_graph().astream_events(
             {"messages": messages},

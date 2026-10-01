@@ -2,7 +2,7 @@
 
 import type { Client, Options as Options2, TDataShape } from './client';
 import { client } from './client.gen';
-import type { ChatStreamApiChatStreamPostData, ChatStreamApiChatStreamPostErrors, ChatStreamApiChatStreamPostResponse, ChatStreamApiChatStreamPostResponses, ConversationDetailApiConversationsConversationIdGetData, ConversationDetailApiConversationsConversationIdGetErrors, ConversationDetailApiConversationsConversationIdGetResponses, ConversationMessageStreamApiConversationsConversationIdMessagesStreamPostData, ConversationMessageStreamApiConversationsConversationIdMessagesStreamPostErrors, ConversationMessageStreamApiConversationsConversationIdMessagesStreamPostResponse, ConversationMessageStreamApiConversationsConversationIdMessagesStreamPostResponses, CreateConversationApiProjectsProjectIdConversationsPostData, CreateConversationApiProjectsProjectIdConversationsPostErrors, CreateConversationApiProjectsProjectIdConversationsPostResponses, CreateProjectApiProjectsPostData, CreateProjectApiProjectsPostErrors, CreateProjectApiProjectsPostResponses, HealthApiHealthGetData, HealthApiHealthGetResponses, ListProjectsApiProjectsGetData, ListProjectsApiProjectsGetResponses, TeamStatusApiTeamGetData, TeamStatusApiTeamGetResponses, ValidateWorkspaceApiWorkspacesValidatePostData, ValidateWorkspaceApiWorkspacesValidatePostErrors, ValidateWorkspaceApiWorkspacesValidatePostResponses } from './types.gen';
+import type { ChatStreamApiChatStreamPostData, ChatStreamApiChatStreamPostErrors, ChatStreamApiChatStreamPostResponse, ChatStreamApiChatStreamPostResponses, CommandApiProjectsProjectIdCollaborationCommandsPostData, CommandApiProjectsProjectIdCollaborationCommandsPostErrors, CommandApiProjectsProjectIdCollaborationCommandsPostResponses, ConversationDetailApiConversationsConversationIdGetData, ConversationDetailApiConversationsConversationIdGetErrors, ConversationDetailApiConversationsConversationIdGetResponses, ConversationMessageStreamApiConversationsConversationIdMessagesStreamPostData, ConversationMessageStreamApiConversationsConversationIdMessagesStreamPostErrors, ConversationMessageStreamApiConversationsConversationIdMessagesStreamPostResponse, ConversationMessageStreamApiConversationsConversationIdMessagesStreamPostResponses, CreateConversationApiProjectsProjectIdConversationsPostData, CreateConversationApiProjectsProjectIdConversationsPostErrors, CreateConversationApiProjectsProjectIdConversationsPostResponses, CreateProjectApiProjectsPostData, CreateProjectApiProjectsPostErrors, CreateProjectApiProjectsPostResponses, HealthApiHealthGetData, HealthApiHealthGetResponses, ListProjectsApiProjectsGetData, ListProjectsApiProjectsGetResponses, PauseApiProjectsProjectIdCollaborationPausePostData, PauseApiProjectsProjectIdCollaborationPausePostErrors, PauseApiProjectsProjectIdCollaborationPausePostResponses, SnapshotApiProjectsProjectIdCollaborationGetData, SnapshotApiProjectsProjectIdCollaborationGetErrors, SnapshotApiProjectsProjectIdCollaborationGetResponses, TeamStatusApiTeamGetData, TeamStatusApiTeamGetResponses, ValidateWorkspaceApiWorkspacesValidatePostData, ValidateWorkspaceApiWorkspacesValidatePostErrors, ValidateWorkspaceApiWorkspacesValidatePostResponses } from './types.gen';
 
 export type Options<TData extends TDataShape = TDataShape, ThrowOnError extends boolean = boolean, TResponse = unknown> = Options2<TData, ThrowOnError, TResponse> & {
     /**
@@ -17,6 +17,35 @@ export type Options<TData extends TDataShape = TDataShape, ThrowOnError extends 
      */
     meta?: Record<string, unknown>;
 };
+
+/**
+ * Snapshot
+ */
+export const snapshotApiProjectsProjectIdCollaborationGet = <ThrowOnError extends boolean = false>(options: Options<SnapshotApiProjectsProjectIdCollaborationGetData, ThrowOnError>) => (options.client ?? client).get<SnapshotApiProjectsProjectIdCollaborationGetResponses, SnapshotApiProjectsProjectIdCollaborationGetErrors, ThrowOnError>({ url: '/api/projects/{project_id}/collaboration', ...options });
+
+/**
+ * Command
+ */
+export const commandApiProjectsProjectIdCollaborationCommandsPost = <ThrowOnError extends boolean = false>(options: Options<CommandApiProjectsProjectIdCollaborationCommandsPostData, ThrowOnError>) => (options.client ?? client).post<CommandApiProjectsProjectIdCollaborationCommandsPostResponses, CommandApiProjectsProjectIdCollaborationCommandsPostErrors, ThrowOnError>({
+    url: '/api/projects/{project_id}/collaboration/commands',
+    ...options,
+    headers: {
+        'Content-Type': 'application/json',
+        ...options.headers
+    }
+});
+
+/**
+ * Pause
+ */
+export const pauseApiProjectsProjectIdCollaborationPausePost = <ThrowOnError extends boolean = false>(options: Options<PauseApiProjectsProjectIdCollaborationPausePostData, ThrowOnError>) => (options.client ?? client).post<PauseApiProjectsProjectIdCollaborationPausePostResponses, PauseApiProjectsProjectIdCollaborationPausePostErrors, ThrowOnError>({
+    url: '/api/projects/{project_id}/collaboration/pause',
+    ...options,
+    headers: {
+        'Content-Type': 'application/json',
+        ...options.headers
+    }
+});
 
 /**
  * Health

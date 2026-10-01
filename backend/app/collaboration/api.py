@@ -1,0 +1,60 @@
+"""Project collaboration API and explicit user controls."""
+from typing import Literal
+from fastapi import APIRouter, HTTPException
+from pydantic import BaseModel, Field
+from app.collaboration.tools import Context, active, collaborate
+from app.storage import StorageNotFoundError, StorageConflictError
+
+router = APIRouter(prefix='/api/projects/{project_id}/collaboration', tags=['Collaboration'])
+_service = None
+
+
+def configure(service):
+    global _service
+    _service = service
+
+
+class Command(BaseModel):
+    member: Literal['leader', 'product', 'backend', 'frontend', 'designer', 'testing'] = 'leader'
+    conversation: str = ''
+    action: Literal['catalog', 'read', 'publish', 'subscribe', 'send', 'request', 'inspect_request', 'transition', 'snapshot']
+    payload: dict = Field(default_factory=dict)
+
+
+@router.get('')
+async def snapshot(project_id: str):
+    if _service is None:
+        raise HTTPException(503, 'Collaboration is not initialized')
+    try:
+        return await _service.snapshot(project_id)
+    except StorageNotFoundError as exc:
+        raise HTTPException(404, str(exc)) from exc
+
+
+@router.post('/commands')
+async def command(project_id: str, body: Command):
+    if _service is None:
+        raise HTTPException(503, 'Collaboration is not initialized')
+    async with _service.transaction() as c:
+        try:
+            await _service._project(c, project_id)
+            await _service._conversation(c, project_id, body.conversation)
+        except (StorageNotFoundError, ValueError) as exc:
+            raise HTTPException(404, str(exc)) from exc
+    token = active.set(Context(_service, project_id, body.member, body.conversation, 'user'))
+    try:
+        result = await collaborate.ainvoke({'action': body.action, 'payload': body.payload})
+        if 'error' in result:
+            raise HTTPException(409, result['error'])
+        return result
+    finally:
+        active.reset(token)
+
+
+class Pause(BaseModel):
+    paused: bool
+
+
+@router.post('/pause')
+async def pause(project_id: str, body: Pause):
+    return await _service.set_paused(project_id, body.paused)

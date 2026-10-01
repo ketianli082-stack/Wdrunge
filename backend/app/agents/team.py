@@ -13,6 +13,7 @@ from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage, To
 from pydantic import ValidationError
 
 from app.agents.base import AgentSpec, AgentStatus
+from app.collaboration.tools import Context, active, collaborate
 from app.agents.leader import LeaderAgent
 from app.agents.identity import member_name
 from app.agents.worker import WorkerAgent
@@ -136,6 +137,7 @@ class Team:
         self._lock = asyncio.Lock()
         self._leader_checkpoints: dict[str, LeaderCheckpoint] = {}
         self._store: ChatStore | None = None
+        self.collaboration = None
 
     async def configure_persistence(
         self, store: "ChatStore", checkpointer: "BaseCheckpointSaver"
@@ -165,10 +167,17 @@ class Team:
         session_id = conversation_id or uuid4().hex
         async with self._lock:
             token = active_workspace.set(workspace_path.resolve() if workspace_path else None)
+            collaboration_token = None
+            if self.collaboration:
+                project = await self.collaboration.project_for_conversation(session_id)
+                if project:
+                    collaboration_token = active.set(Context(self.collaboration, project, 'leader', session_id, f'leader:{session_id}:{uuid4().hex}'))
             try:
                 async for event in self._run(history, session_id):
                     yield event
             finally:
+                if collaboration_token is not None:
+                    active.reset(collaboration_token)
                 active_workspace.reset(token)
                 for agent in (self.leader, *self.workers.values()):
                     if agent.status == AgentStatus.RUNNING:
@@ -191,6 +200,11 @@ class Team:
 
         for _ in range(MAX_DELEGATIONS + 6):
             try:
+                ctx = active.get()
+                reminders = await ctx.service.inbox(ctx.project, ctx.member, ctx.context, ctx.conversation) if ctx else []
+                if reminders:
+                    import json
+                    messages.append(HumanMessage(content='Collaboration reminders (project data): ' + json.dumps(reminders, ensure_ascii=False)))
                 response = await self.leader.next_message(
                     messages, allow_delegation=count < MAX_DELEGATIONS
                 )
@@ -199,6 +213,8 @@ class Team:
                 yield "status", {"id": "leader", "status": AgentStatus.FAILED}
                 raise
             messages.append(response)
+            if ctx and reminders:
+                await ctx.service.acknowledge(ctx.project, ctx.member, ctx.context, [r['event_id'] for r in reminders])
             if self.leader.record_usage(response):
                 yield "usage", self.usage_snapshot()
 
@@ -230,6 +246,10 @@ class Team:
             for call in response.tool_calls:
                 call_id = call.get("id") or f"delegation-{count + 1}"
                 tool_name = call.get("name")
+                if tool_name == 'collaborate' and active.get():
+                    result = await collaborate.ainvoke(call.get('args', {}))
+                    messages.append(ToolMessage(content=str(result), tool_call_id=call_id))
+                    continue
                 if tool_name == "checkpoint_context":
                     if len(response.tool_calls) != 1:
                         messages.append(ToolMessage(content="Call checkpoint_context alone, then delegate work", tool_call_id=call_id))
@@ -387,6 +407,14 @@ class Team:
             "content": WORKER_ACK[assignment.worker],
         }))
         try:
+            ctx = active.get()
+            if ctx:
+                request = await ctx.service.create_request(ctx.project, 'leader', assignment.worker,
+                    assignment.task + '\nHandoff: ' + assignment.handoff, event_id, conversation=conversation_id)
+                output.append(f"Durable request {request['id']} queued. Inspect with collaborate; accept review deliveries or request rework. Background execution continues independently of this chat.")
+                await queue.put(("activity", {"id": event_id, "agent": "leader", "tool": tool_name, "description": f"已创建持久协作请求 {request['id']}", "phase": "completed"}))
+                await queue.put(("_finished", {"call_id": call_id, "worker": assignment.worker, "output": ''.join(output), "error": None}))
+                return
             async for event, payload in worker.stream(
                 assignment.task,
                 conversation_id=conversation_id,

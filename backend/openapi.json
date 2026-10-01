@@ -6,6 +6,146 @@
     "version": "0.1.0"
   },
   "paths": {
+    "/api/projects/{project_id}/collaboration": {
+      "get": {
+        "tags": [
+          "Collaboration"
+        ],
+        "summary": "Snapshot",
+        "operationId": "snapshot_api_projects__project_id__collaboration_get",
+        "parameters": [
+          {
+            "name": "project_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Project Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/projects/{project_id}/collaboration/commands": {
+      "post": {
+        "tags": [
+          "Collaboration"
+        ],
+        "summary": "Command",
+        "operationId": "command_api_projects__project_id__collaboration_commands_post",
+        "parameters": [
+          {
+            "name": "project_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Project Id"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Command"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/projects/{project_id}/collaboration/pause": {
+      "post": {
+        "tags": [
+          "Collaboration"
+        ],
+        "summary": "Pause",
+        "operationId": "pause_api_projects__project_id__collaboration_pause_post",
+        "parameters": [
+          {
+            "name": "project_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Project Id"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Pause"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/health": {
       "get": {
         "tags": [
@@ -452,6 +592,53 @@
         ],
         "title": "ChatRequest"
       },
+      "Command": {
+        "properties": {
+          "member": {
+            "type": "string",
+            "enum": [
+              "leader",
+              "product",
+              "backend",
+              "frontend",
+              "designer",
+              "testing"
+            ],
+            "title": "Member",
+            "default": "leader"
+          },
+          "conversation": {
+            "type": "string",
+            "title": "Conversation",
+            "default": ""
+          },
+          "action": {
+            "type": "string",
+            "enum": [
+              "catalog",
+              "read",
+              "publish",
+              "subscribe",
+              "send",
+              "request",
+              "inspect_request",
+              "transition",
+              "snapshot"
+            ],
+            "title": "Action"
+          },
+          "payload": {
+            "additionalProperties": true,
+            "type": "object",
+            "title": "Payload"
+          }
+        },
+        "type": "object",
+        "required": [
+          "action"
+        ],
+        "title": "Command"
+      },
       "ConversationCreate": {
         "properties": {
           "title": {
@@ -485,12 +672,10 @@
           },
           "created_at": {
             "type": "string",
-            "format": "date-time",
             "title": "Created At"
           },
           "updated_at": {
             "type": "string",
-            "format": "date-time",
             "title": "Updated At"
           },
           "project_name": {
@@ -551,12 +736,10 @@
           },
           "created_at": {
             "type": "string",
-            "format": "date-time",
             "title": "Created At"
           },
           "updated_at": {
             "type": "string",
-            "format": "date-time",
             "title": "Updated At"
           }
         },
@@ -620,6 +803,19 @@
         ],
         "title": "MessageCreate"
       },
+      "Pause": {
+        "properties": {
+          "paused": {
+            "type": "boolean",
+            "title": "Paused"
+          }
+        },
+        "type": "object",
+        "required": [
+          "paused"
+        ],
+        "title": "Pause"
+      },
       "PersistedActivityResponse": {
         "properties": {
           "id": {
@@ -648,7 +844,6 @@
           },
           "created_at": {
             "type": "string",
-            "format": "date-time",
             "title": "Created At"
           }
         },
@@ -725,7 +920,6 @@
           },
           "created_at": {
             "type": "string",
-            "format": "date-time",
             "title": "Created At"
           }
         },
@@ -785,12 +979,10 @@
           },
           "created_at": {
             "type": "string",
-            "format": "date-time",
             "title": "Created At"
           },
           "updated_at": {
             "type": "string",
-            "format": "date-time",
             "title": "Updated At"
           },
           "conversations": {

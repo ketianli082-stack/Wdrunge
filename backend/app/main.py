@@ -20,6 +20,9 @@ from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from pydantic import BaseModel, Field, field_serializer, model_validator
 
 from app import conversation_title
+from app.collaboration.service import Collaboration
+from app.collaboration.runtime import Scheduler
+from app.collaboration import api as collaboration_api
 from app.agents.team import get_team
 from app.storage import ChatStore, StorageConflictError, StorageNotFoundError, get_store
 
@@ -28,14 +31,18 @@ logger = logging.getLogger(__name__)
 store: ChatStore = get_store()
 _checkpoint_connection: aiosqlite.Connection | None = None
 _runtime_store_identity: int | None = None
+_collaboration_scheduler = None
 
 
 async def ensure_runtime() -> None:
     """Initialize application tables and the durable LangGraph checkpointer."""
-    global _checkpoint_connection, _runtime_store_identity
+    global _checkpoint_connection, _runtime_store_identity, _collaboration_scheduler
     await store.initialize()
     if _runtime_store_identity == id(store):
         return
+    if _collaboration_scheduler is not None:
+        await _collaboration_scheduler.close()
+        _collaboration_scheduler = None
     if _checkpoint_connection is not None:
         await _checkpoint_connection.close()
     checkpoint_path = str(store.sqlite_path) if store.sqlite_path else ":memory:"
@@ -45,16 +52,27 @@ async def ensure_runtime() -> None:
     team = get_team()
     if hasattr(team, "configure_persistence"):
         await team.configure_persistence(store, checkpointer)
+    collaboration = Collaboration(store)
+    await collaboration.initialize()
+    collaboration_api.configure(collaboration)
+    if hasattr(team, "configure_persistence"):
+        team.collaboration = collaboration
+        team._checkpointer = checkpointer
+        _collaboration_scheduler = Scheduler(collaboration, team)
+        await _collaboration_scheduler.start()
     _runtime_store_identity = id(store)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _checkpoint_connection, _runtime_store_identity
+    global _checkpoint_connection, _runtime_store_identity, _collaboration_scheduler
     await ensure_runtime()
     app.state.team = get_team()  # All six agents are ready and idle at startup.
     try:
         yield
     finally:
+        if _collaboration_scheduler is not None:
+            await _collaboration_scheduler.close()
+            _collaboration_scheduler = None
         if _checkpoint_connection is not None:
             await _checkpoint_connection.close()
             _checkpoint_connection = None
@@ -68,6 +86,7 @@ app = FastAPI(
     version="0.1.0",
     lifespan=lifespan,
 )
+app.include_router(collaboration_api.router)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[

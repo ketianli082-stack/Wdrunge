@@ -63,6 +63,30 @@ export type ChatRequest = {
 };
 
 /**
+ * Command
+ */
+export type Command = {
+    /**
+     * Member
+     */
+    member?: 'leader' | 'product' | 'backend' | 'frontend' | 'designer' | 'testing';
+    /**
+     * Conversation
+     */
+    conversation?: string;
+    /**
+     * Action
+     */
+    action: 'catalog' | 'read' | 'publish' | 'subscribe' | 'send' | 'request' | 'inspect_request' | 'transition' | 'snapshot';
+    /**
+     * Payload
+     */
+    payload?: {
+        [key: string]: unknown;
+    };
+};
+
+/**
  * ConversationCreate
  */
 export type ConversationCreate = {
@@ -180,6 +204,16 @@ export type MessageCreate = {
      * Client Message Id
      */
     client_message_id: string;
+};
+
+/**
+ * Pause
+ */
+export type Pause = {
+    /**
+     * Paused
+     */
+    paused: boolean;
 };
 
 /**
@@ -409,6 +443,90 @@ export type WorkspaceResponse = {
      * Path
      */
     path: string;
+};
+
+export type SnapshotApiProjectsProjectIdCollaborationGetData = {
+    body?: never;
+    path: {
+        /**
+         * Project Id
+         */
+        project_id: string;
+    };
+    query?: never;
+    url: '/api/projects/{project_id}/collaboration';
+};
+
+export type SnapshotApiProjectsProjectIdCollaborationGetErrors = {
+    /**
+     * Validation Error
+     */
+    422: HttpValidationError;
+};
+
+export type SnapshotApiProjectsProjectIdCollaborationGetError = SnapshotApiProjectsProjectIdCollaborationGetErrors[keyof SnapshotApiProjectsProjectIdCollaborationGetErrors];
+
+export type SnapshotApiProjectsProjectIdCollaborationGetResponses = {
+    /**
+     * Successful Response
+     */
+    200: unknown;
+};
+
+export type CommandApiProjectsProjectIdCollaborationCommandsPostData = {
+    body: Command;
+    path: {
+        /**
+         * Project Id
+         */
+        project_id: string;
+    };
+    query?: never;
+    url: '/api/projects/{project_id}/collaboration/commands';
+};
+
+export type CommandApiProjectsProjectIdCollaborationCommandsPostErrors = {
+    /**
+     * Validation Error
+     */
+    422: HttpValidationError;
+};
+
+export type CommandApiProjectsProjectIdCollaborationCommandsPostError = CommandApiProjectsProjectIdCollaborationCommandsPostErrors[keyof CommandApiProjectsProjectIdCollaborationCommandsPostErrors];
+
+export type CommandApiProjectsProjectIdCollaborationCommandsPostResponses = {
+    /**
+     * Successful Response
+     */
+    200: unknown;
+};
+
+export type PauseApiProjectsProjectIdCollaborationPausePostData = {
+    body: Pause;
+    path: {
+        /**
+         * Project Id
+         */
+        project_id: string;
+    };
+    query?: never;
+    url: '/api/projects/{project_id}/collaboration/pause';
+};
+
+export type PauseApiProjectsProjectIdCollaborationPausePostErrors = {
+    /**
+     * Validation Error
+     */
+    422: HttpValidationError;
+};
+
+export type PauseApiProjectsProjectIdCollaborationPausePostError = PauseApiProjectsProjectIdCollaborationPausePostErrors[keyof PauseApiProjectsProjectIdCollaborationPausePostErrors];
+
+export type PauseApiProjectsProjectIdCollaborationPausePostResponses = {
+    /**
+     * Successful Response
+     */
+    200: unknown;
 };
 
 export type HealthApiHealthGetData = {

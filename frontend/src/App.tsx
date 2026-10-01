@@ -15,6 +15,7 @@ import {
   type TeamMember,
   type TeamUsage,
 } from "./api";
+import CollaborationPanel from "./CollaborationPanel";
 import OfficeScene from "./OfficeScene";
 import AgentAvatar from "./AgentAvatar";
 import MessageContent from "./MessageContent";
@@ -32,7 +33,7 @@ type ConversationView = Omit<ConversationDetail, "messages" | "activities"> & {
   messages: VisibleMessage[];
   activities: VisibleActivity[];
 };
-type Panel = "chat" | "activity";
+type Panel = "chat" | "activity" | "collaboration";
 
 const initialAgents: TeamMember[] = [
   { id: "leader", name: memberName("leader"), status: "idle", tools: [], skills: [] },
@@ -318,8 +319,9 @@ function App() {
       <div className="rail-tabs" role="tablist" aria-label="右侧内容">
         <button role="tab" aria-selected={panel === "chat"} className={panel === "chat" ? "active" : ""} onClick={() => setPanel("chat")}>团队群聊</button>
         <button role="tab" aria-selected={panel === "activity"} className={panel === "activity" ? "active" : ""} onClick={() => setPanel("activity")}>工作日志 <span>{active?.activities.length || 0}</span></button>
+        <button role="tab" aria-selected={panel === "collaboration"} className={panel === "collaboration" ? "active" : ""} onClick={() => setPanel("collaboration")}>项目协作</button>
       </div>
-      {!active ? <section className="chat-panel empty-conversation"><div className="chat-welcome"><span className="welcome-icon">W</span><strong>{activeProject ? activeProject.name : "开始使用 Wdrunge"}</strong><p>{activeProject ? "在此项目中创建一段对话。" : "先创建一个项目，团队会围绕项目工作区持续协作。"}</p><button onClick={() => activeProject ? void startConversation(activeProject.id) : setProjectDialog(true)}>{activeProject ? "新建对话" : "新建项目"}</button></div></section> : panel === "chat" ? <section className="chat-panel" role="tabpanel" aria-label="团队群聊">
+      {panel === "collaboration" && activeProject ? <CollaborationPanel key={activeProject.id} project={activeProject.id} /> : !active ? <section className="chat-panel empty-conversation"><div className="chat-welcome"><span className="welcome-icon">W</span><strong>{activeProject ? activeProject.name : "开始使用 Wdrunge"}</strong><p>{activeProject ? "在此项目中创建一段对话。" : "先创建一个项目，团队会围绕项目工作区持续协作。"}</p><button onClick={() => activeProject ? void startConversation(activeProject.id) : setProjectDialog(true)}>{activeProject ? "新建对话" : "新建项目"}</button></div></section> : panel === "chat" ? <section className="chat-panel" role="tabpanel" aria-label="团队群聊">
         <header className="panel-heading"><div><strong>{active.project_name} · {active.title}</strong><span>{Object.values(teamIdentities).map((member) => member.name).join(" · ")}</span></div><span className="member-count">6 人</span></header>
         <div className="workspace-banner"><span title={active.workspace_path}>项目工作区 · {active.workspace_path}</span></div>
         <div className="chat-feed" ref={chatFeed}>

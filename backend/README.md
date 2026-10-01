@@ -89,3 +89,36 @@ Set `QWEN_CONTEXT_WINDOW` to the actual context limit of the configured model. T
 - `app/tools/` contains one Python module per tool. File tools are restricted to each role's assigned project paths.
 
 The Leader can select any subset of members and call a member more than once over successive turns. Independent assignments in `delegate_tasks` run concurrently; dependent work waits for their results. For example, designer and frontend can exchange refinements over several calls. Greetings need no delegation. All members are initialized as `idle` on API startup and become `running` only during their assignment.
+
+## Project collaboration
+
+The project collaboration panel displays managed Markdown documents, directed
+messages, durable requests and delivery acceptance. Agents use `collaborate` to
+read an outline, read versioned section bodies, subscribe, publish exact edits,
+send idempotent messages, request assistance and suspend on dependencies.
+
+`GET /api/projects/{id}/collaboration` is the durable project snapshot.
+`POST /api/projects/{id}/collaboration/commands` executes a typed action envelope;
+`POST .../pause` pauses new scheduling. This is a local single-user API, like the
+existing chat API; the `member` field is a user-selected attribution, not remote
+multi-user authentication. Agent identities are injected by the runtime.
+
+A publication validates whole-document versions and explicit `based_on` document
+versions. Multiple documents can publish as one logical batch. Committed SQLite
+revision snapshots retain full history. A pending journal is saved before atomic
+file replacement; recovery completes interrupted materialization before publishing
+notifications. Files externally changed after journaling are preserved and block
+publication for manual reconciliation. External edits to published documents are
+reported by the catalog and can be imported with `external: true` and a summary.
+Ordinary agent file writes cannot overwrite registered documents.
+
+Reminders enter before each model call; worker receipts are persisted only after
+the response checkpoint. Deliveries can repeat after a crash and carry stable
+IDs. They are scoped to the member, context generation and source conversation.
+Document subscriptions are project-wide. Request execution uses bounded background
+slots, releases blocked slots, and survives browser disconnects. Agent results go
+to `review`; the sender or user must accept them before they count as completed.
+Dependent workers may wake for review to inspect and accept a child delivery.
+Starting a persisted delegation now queues durable work; Leader reports its request
+ID and can inspect/accept it with the collaboration tool. Legacy stateless chat
+retains the original synchronous delegation behavior.
