@@ -1,6 +1,6 @@
 """Batch function-call schema for independent specialist assignments."""
 
-from langchain_core.tools import tool
+from app.tools.validation import tool
 from pydantic import BaseModel, Field, model_validator
 
 from app.tools.delegate_task import Delegation

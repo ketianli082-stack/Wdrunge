@@ -1,6 +1,6 @@
 from datetime import datetime, timezone
 
-from langchain_core.tools import tool
+from app.tools.validation import tool
 
 
 @tool

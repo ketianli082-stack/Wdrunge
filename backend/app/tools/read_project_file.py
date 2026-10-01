@@ -1,6 +1,6 @@
 """Read a UTF-8 project file within a role's scope."""
 
-from langchain_core.tools import tool
+from app.tools.validation import tool
 
 from app.tools._workspace import resolve_allowed
 

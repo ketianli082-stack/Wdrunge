@@ -1,6 +1,6 @@
 """Structured Leader handoff for starting a clean coordination context."""
 
-from langchain_core.tools import tool
+from app.tools.validation import tool
 from pydantic import BaseModel, Field
 
 

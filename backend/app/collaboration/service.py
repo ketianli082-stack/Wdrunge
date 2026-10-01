@@ -85,11 +85,21 @@ class Collaboration:
         if conversation and not await c.scalar(text('SELECT id FROM conversations WHERE id=:id AND project_id=:p'), {'id': conversation, 'p': project}):
             raise ValueError('Conversation does not belong to project')
 
+    @staticmethod
+    def _decode_record(kind, value):
+        record = json.loads(value)
+        # Older builds accepted object/list delivery results. Preserve their
+        # evidence as JSON text when loading, and persist it on the next update.
+        if kind == 'request' and not isinstance(record.get('result'), str):
+            result = record.get('result')
+            record['result'] = '' if result is None else json.dumps(result, ensure_ascii=False)
+        return record
+
     async def _get(self, c, kind, project, identifier, required=True):
         value = await c.scalar(text('SELECT data FROM collaboration_records WHERE kind=:k AND project=:p AND id=:i'), {'k': kind, 'p': project, 'i': identifier})
         if value is None and required:
             raise StorageNotFoundError(f'{kind} not found')
-        return json.loads(value) if value else None
+        return self._decode_record(kind, value) if value else None
 
     async def _put(self, c, kind, project, identifier, data):
         await c.execute(text('''INSERT INTO collaboration_records(kind,project,id,data,state,owner,updated)
@@ -99,7 +109,7 @@ class Collaboration:
 
     async def _list(self, c, kind, project):
         rows = await c.scalars(text('SELECT data FROM collaboration_records WHERE kind=:k AND project=:p ORDER BY updated,id'), {'k': kind, 'p': project})
-        return [json.loads(r) for r in rows]
+        return [self._decode_record(kind, r) for r in rows]
 
     async def _event(self, c, project, recipient, data, conversation=''):
         await c.execute(text('INSERT INTO collaboration_events(project,recipient,conversation,data,created) VALUES(:p,:r,:v,:d,:t)'), dict(p=project, r=recipient, v=conversation, d=json.dumps(data, ensure_ascii=False), t=time.time()))

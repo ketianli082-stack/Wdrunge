@@ -3,7 +3,7 @@
 import sys
 from typing import Literal
 
-from langchain_core.tools import tool
+from app.tools.validation import tool
 
 from app.tools._workspace import resolve_allowed
 from app.tools._process import run_process

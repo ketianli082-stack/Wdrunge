@@ -2,7 +2,7 @@
 
 from pathlib import Path
 
-from langchain_core.tools import tool
+from app.tools.validation import tool
 
 from app.tools._workspace import resolve_allowed
 

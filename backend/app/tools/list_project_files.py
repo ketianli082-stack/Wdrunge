@@ -1,6 +1,6 @@
 """List files visible to one specialist."""
 
-from langchain_core.tools import tool
+from app.tools.validation import tool
 
 from app.tools._workspace import effective_roots, workspace_root
 

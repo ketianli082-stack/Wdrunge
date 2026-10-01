@@ -3,10 +3,10 @@ from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import Literal
 
-from langchain_core.tools import tool
+from app.tools.validation import tool
 
 from app.collaboration.service import Collaboration
-from app.collaboration.payloads import TransitionPayload
+from app.collaboration.payloads import TransitionPayload, validate_payload
 
 
 @dataclass
@@ -54,6 +54,7 @@ async def collaborate(action: Literal['catalog', 'read', 'publish', 'subscribe',
         return {'error': 'Collaboration requires a persisted project conversation'}
     s, p = ctx.service, ctx.project
     try:
+        payload = validate_payload(action, payload)
         if ctx.request and action in {'publish','send','request','wait','transition','decision'}:
             import time
             current = await s.get_request(p, ctx.request)

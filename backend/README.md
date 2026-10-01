@@ -255,3 +255,16 @@ Do not enable this local debug operation across multiple API worker processes.
 Collaboration transitions validate `result` as plain text before publishing files
 or changing state. Malformed tool payloads return a correction error to the agent
 instead of terminating the whole request.
+
+All agent tools now reject unknown arguments and incorrect types. Every
+`collaborate` action validates its nested payload before project I/O; coordinator
+and worker tool boundaries return failed tool results so the model can correct a
+call. Cancellation still propagates. Legacy request results stored as JSON
+objects/lists load as JSON text, preserving their delivery evidence for acceptance.
+Unexpected tool exceptions remain logged for diagnosis.
+
+Token snapshots include live scheduler instances after each model usage report,
+without double counting them on completion/cancellation. The UI polls every three
+seconds. Concurrent contexts are separate windows; a role displays the largest
+active context instead of summing unrelated windows. No estimated tokens are shown
+before the provider returns usage.

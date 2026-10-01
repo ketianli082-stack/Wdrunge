@@ -296,7 +296,11 @@ class Team:
                     activity = {'id': uuid4().hex, 'agent': 'leader', 'tool': 'collaborate',
                                 'description': COLLABORATION_LABELS.get(action, '协调团队工作')}
                     yield 'activity', {**activity, 'phase': 'running'}
-                    result = await collaborate.ainvoke(call.get('args', {}))
+                    try:
+                        result = await collaborate.ainvoke(call.get('args', {}))
+                    except Exception as exc:
+                        from app.tools.validation import tool_error
+                        result = {'error': tool_error(exc)}
                     yield 'activity', {**activity, 'phase': 'failed' if isinstance(result, dict) and result.get('error') else 'completed'}
                     messages.append(ToolMessage(content=str(result), tool_call_id=call_id))
                     continue

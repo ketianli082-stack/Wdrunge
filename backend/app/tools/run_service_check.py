@@ -10,7 +10,7 @@ from typing import Literal
 from urllib.error import HTTPError, URLError
 from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener
 
-from langchain_core.tools import tool
+from app.tools.validation import tool
 from app.tools._workspace import resolve_allowed
 
 
