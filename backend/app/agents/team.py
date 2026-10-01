@@ -179,6 +179,16 @@ class Team:
 
     def usage_snapshot(self) -> dict:
         members = [self.leader.usage_snapshot(), *(worker.usage_snapshot() for worker in self.workers.values())]
+        scheduler = getattr(self, 'scheduler', None)
+        if scheduler:
+            for member in members:
+                live = [worker for worker in scheduler.active_workers.values() if worker.spec.id == member['id']]
+                if live:
+                    member['total_tokens'] += sum(worker.total_tokens for worker in live)
+                    # Each instance has its own context window; adding contexts
+                    # would invent an occupancy that no model actually sees.
+                    member['context_tokens'] = max(worker.context_tokens for worker in live)
+                    member['context_percent'] = round(member['context_tokens'] / member['context_window'] * 100, 1)
         return {"total_tokens": sum(member["total_tokens"] for member in members), "agents": members}
 
     async def stream(

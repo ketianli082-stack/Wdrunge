@@ -22,6 +22,7 @@ class Scheduler:
         self.loop = None
         self.owner = uuid4().hex
         self.running_roles = {}
+        self.active_workers = {}
         self.team.scheduler = self
         self.last_maintenance = 0
 
@@ -67,6 +68,7 @@ class Scheduler:
         role = request['recipient']
         self.running_roles[role] = self.running_roles.get(role, 0)+1
         worker = WorkerAgent(self.team.workers[role].spec)
+        self.active_workers[id(worker)] = worker
         token = active.set(Context(self.service, project, request['recipient'], request['conversation'], f"request:{request['id']}:{request['attempts']}", request['id']))
         workspace_token = active_workspace.set(Path(workspace))
         source_token = source_workspace.set(Path(workspace))
@@ -101,6 +103,7 @@ class Scheduler:
         finally:
             self.team.workers[role].total_tokens += worker.total_tokens
             self.team.workers[role].context_tokens = worker.context_tokens
+            self.active_workers.pop(id(worker), None)
             self.running_roles[role] -= 1
             if not self.running_roles[role]:
                 del self.running_roles[role]

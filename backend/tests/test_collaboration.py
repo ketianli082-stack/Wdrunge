@@ -592,3 +592,48 @@ def test_malformed_delivery_result_is_recoverable_before_publication(tmp_path, m
         assert (await s.get_request(p, r['id']))['state'] == 'review'
         await store.close()
     run(scenario())
+
+
+def test_live_usage_counts_concurrent_instances_before_completion(tmp_path, monkeypatch):
+    from app.agents.team import Team
+    from app.agents.worker import WorkerAgent
+    from app.collaboration.runtime import Scheduler
+    from langchain_core.messages import AIMessage
+    from langgraph.checkpoint.memory import InMemorySaver
+
+    async def scenario():
+        store, s, p, workspace = await setup(tmp_path)
+        team = Team()
+        await team.configure_persistence(store, InMemorySaver())
+        scheduler = Scheduler(s, team)
+        release = asyncio.Event()
+        started = asyncio.Queue()
+        async def stream(self, task, **kwargs):
+            amount = int(task)
+            self.record_usage(AIMessage(content='working', usage_metadata={'input_tokens': amount, 'output_tokens': 10, 'total_tokens': amount+10}))
+            yield 'usage', {}
+            await started.put(True)
+            await release.wait()
+            yield 'content', {'content': 'done'}
+        monkeypatch.setattr(WorkerAgent, 'stream', stream)
+        await s.create_request(p, 'leader', 'frontend', '100', 'one')
+        await s.create_request(p, 'leader', 'frontend', '200', 'two')
+        tasks = [asyncio.create_task(scheduler.execute(*(await s.claim(scheduler.owner)))) for _ in range(2)]
+        await started.get()
+        await started.get()
+        def usage():
+            result = team.usage_snapshot()
+            return result, next(a for a in result['agents'] if a['id'] == 'frontend')
+        total, member = usage()
+        assert total['total_tokens'] == member['total_tokens'] == 320
+        assert member['context_tokens'] == 200
+        assert len(scheduler.active_workers) == 2
+        tasks[0].cancel()
+        await asyncio.gather(tasks[0], return_exceptions=True)
+        assert usage()[0]['total_tokens'] == 320
+        release.set()
+        await tasks[1]
+        assert usage()[0]['total_tokens'] == 320
+        assert not scheduler.active_workers
+        await store.close()
+    run(scenario())
