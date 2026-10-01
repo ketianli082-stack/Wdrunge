@@ -303,14 +303,16 @@ class Collaboration:
                 await c.execute(text('''INSERT OR IGNORE INTO collaboration_receipts(project,context,seq)
                   SELECT project,:ctx,seq FROM collaboration_events WHERE project=:p AND recipient=:m AND seq=:s'''), dict(ctx=f'{member}:{context}', p=project, m=member, s=identifier))
 
-    async def create_request(self, project, sender, recipient, goal, key, conversation='', based_on=None, dependencies=None, artifacts=None, parent=None):
+    async def create_request(self, project, sender, recipient, goal, key, conversation='', based_on=None, dependencies=None, artifacts=None, parent=None, priority=1, deadline=None):
+        if priority not in range(4) or (deadline is not None and deadline <= 0):
+            raise ValueError('Priority must be 0..3 and deadline a positive Unix timestamp')
         if sender not in ROLES or recipient not in ROLES - {'leader'} or not goal.strip() or len(goal) > 8000:
             raise ValueError('Invalid request')
         async with self.transaction() as c:
             await self._project(c, project)
             await self._conversation(c, project, conversation)
             identifier = f'{sender}:{key}'
-            spec = dict(sender=sender, recipient=recipient, goal=goal, conversation=conversation, based_on=based_on or [], dependencies=dependencies or [], artifacts=artifacts or [], parent=parent)
+            spec = dict(sender=sender, recipient=recipient, goal=goal, conversation=conversation, based_on=based_on or [], dependencies=dependencies or [], artifacts=artifacts or [], parent=parent, priority=priority, deadline=deadline)
             old = await self._get(c, 'request', project, identifier, False)
             if old:
                 if old['spec'] != spec:
@@ -374,6 +376,8 @@ class Collaboration:
                     raise StorageConflictError('Dependencies are not completed')
                 r['delivered'] = delivered
             r.update(state=state, result=result or r['result'], needs_review=False)
+            if state == 'cancelled':
+                await self._cancel_dependents(c, project, identifier)
             await self._put(c, 'request', project, identifier, r)
             await self._event(c, project, r['sender'], {'type': 'request_status', 'request_id': identifier, 'state': state, 'result': r['result'][:1200]}, r['conversation'])
             return r
@@ -391,6 +395,7 @@ class Collaboration:
         async with self.transaction() as c:
             rows = (await c.execute(text("SELECT project,data FROM collaboration_records WHERE kind='request' AND state IN ('queued','blocked','running') ORDER BY updated"))).mappings().all()
             busy = {(row['project'], json.loads(row['data'])['recipient']) for row in rows if json.loads(row['data'])['state'] == 'running'}
+            rows = sorted(rows, key=lambda row: (-json.loads(row['data']).get('priority', 1), json.loads(row['data'])['created']))
             for row in rows:
                 project, r = row['project'], json.loads(row['data'])
                 paused = await self._get(c, 'settings', project, 'project', False)
@@ -399,6 +404,12 @@ class Collaboration:
                 if r['state'] == 'running' or (project, r['recipient']) in busy:
                     continue
                 deps = [await self._get(c, 'request', project, d) for d in r['dependencies']]
+                if any(d['state'] in {'cancelled', 'rejected', 'failed'} for d in deps):
+                    if r.get('blocked_reason') != 'dependency_failed':
+                        r.update(state='blocked', blocked_reason='dependency_failed')
+                        await self._put(c, 'request', project, r['id'], r)
+                        await self._event(c, project, 'leader', {'type': 'dependency_failed', 'request_id': r['id']}, r['conversation'])
+                    continue
                 if any(d['state'] not in {'completed', 'review'} for d in deps):
                     continue
                 if r['attempts'] >= 12:
@@ -466,3 +477,54 @@ class Collaboration:
         async with self.transaction() as c:
             for key in keys:
                 await self._put(c, 'read', project, key, {'confirmed': True})
+
+
+    async def _cancel_dependents(self, c, project, identifier):
+        requests = await self._list(c, 'request', project)
+        cancelled = {identifier}
+        while True:
+            changed = False
+            for r in requests:
+                if r['state'] not in TERMINAL and r['id'] not in cancelled and (set(r['dependencies']) & cancelled or r.get('parent') in cancelled):
+                    r.update(state='cancelled', result=f"Cancelled because prerequisite or parent {identifier} was cancelled")
+                    cancelled.add(r['id'])
+                    await self._put(c, 'request', project, r['id'], r)
+                    await self._event(c, project, r['sender'], {'type': 'request_status', 'request_id': r['id'], 'state': 'cancelled', 'result': r['result']}, r['conversation'])
+                    changed = True
+            if not changed:
+                break
+
+    async def scheduling_tick(self, now=None):
+        now = now or time.time()
+        async with self.transaction() as c:
+            rows = (await c.execute(text("SELECT project,data FROM collaboration_records WHERE kind='request' AND state NOT IN ('completed','cancelled','rejected','failed')"))).mappings().all()
+            for row in rows:
+                r = json.loads(row['data'])
+                if r.get('deadline') and r['deadline'] <= now and not r.get('escalated_at'):
+                    r.update(escalated_at=now, priority=min(3, r.get('priority', 1)+1))
+                    await self._put(c, 'request', row['project'], r['id'], r)
+                    await self._event(c, row['project'], 'leader', {'type': 'request_overdue', 'request_id': r['id'], 'state': r['state'], 'deadline': r['deadline']}, r['conversation'])
+
+    async def schedule_request(self, project, identifier, actor, priority=None, deadline=None):
+        async with self.transaction() as c:
+            r = await self._get(c, 'request', project, identifier)
+            if actor not in {r['sender'], 'leader'} or r['state'] in TERMINAL:
+                raise ValueError('Only sender or leader may schedule an active request')
+            if priority is not None:
+                if priority not in range(4):
+                    raise ValueError('Priority must be 0..3')
+                r['priority'] = priority
+            if deadline is not None:
+                if deadline <= 0:
+                    raise ValueError('Deadline must be a positive Unix timestamp')
+                r['deadline'] = deadline
+                r.pop('escalated_at', None)
+            await self._put(c, 'request', project, identifier, r)
+            return r
+
+    async def dependency_graph(self, project):
+        async with self.transaction() as c:
+            await self._project(c, project)
+            requests = await self._list(c, 'request', project)
+            return {'nodes': [{key: r.get(key) for key in ('id','goal','state','recipient','priority','deadline','blocked_reason')} for r in requests],
+                    'edges': [{'from': r['id'], 'to': dependency, 'type': 'depends_on'} for r in requests for dependency in r['dependencies']]}

@@ -12,3 +12,7 @@
 .collaboration-request code{display:block;overflow-wrap:anywhere}
 .collaboration-reader>button{display:block;width:100%;margin-top:4px;border:0}
 .collaboration-panel [role=alert]{color:#b42318}
+.collaboration-dependencies{font-size:12px;margin:8px 0;display:flex;gap:6px;flex-wrap:wrap}
+.collaboration-dependencies a{color:#2563eb;border:1px solid #dbeafe;border-radius:4px;padding:3px 6px}
+.collaboration-request:target{outline:2px solid #3b82f6;scroll-margin-top:16px}
+.collaboration-controls input{min-width:0;flex:1;border:1px solid #dce3eb;border-radius:6px;padding:6px}

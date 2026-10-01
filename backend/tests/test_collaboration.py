@@ -171,3 +171,23 @@ def test_commonmark_index_and_bounded_pages():
     assert len(first) <= 30 and cursor and not fragmented
     rest, following, fragmented = page(body, cursor, 30)
     assert len(rest) <= 30 and following and fragmented
+
+
+def test_priority_deadline_escalation_and_cancellation_graph(tmp_path):
+    async def scenario():
+        store, s, p, workspace = await setup(tmp_path)
+        low = await s.create_request(p, 'leader', 'frontend', 'Low priority', 'low', priority=0)
+        high = await s.create_request(p, 'leader', 'frontend', 'Urgent', 'high', priority=3, deadline=100)
+        downstream = await s.create_request(p, 'leader', 'testing', 'Test urgent', 'test', dependencies=[high['id']])
+        assert (await s.claim())[2]['id'] == high['id']
+        await s.scheduling_tick(now=200)
+        await s.scheduling_tick(now=300)
+        events = await s.inbox(p, 'leader', 'ctx')
+        assert sum(e['type'] == 'request_overdue' for e in events) == 1
+        graph = await s.dependency_graph(p)
+        assert graph['edges'] == [{'from': downstream['id'], 'to': high['id'], 'type': 'depends_on'}]
+        await s.transition(p, high['id'], 'leader', 'cancelled')
+        assert (await s.get_request(p, downstream['id']))['state'] == 'cancelled'
+        assert (await s.claim())[2]['id'] == low['id']
+        await store.close()
+    run(scenario())

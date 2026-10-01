@@ -77,7 +77,7 @@ export type Command = {
     /**
      * Action
      */
-    action: 'catalog' | 'read' | 'publish' | 'subscribe' | 'send' | 'request' | 'inspect_request' | 'transition' | 'snapshot' | 'search' | 'diff';
+    action: 'catalog' | 'read' | 'publish' | 'subscribe' | 'send' | 'request' | 'inspect_request' | 'transition' | 'snapshot' | 'search' | 'diff' | 'schedule' | 'dependencies';
     /**
      * Payload
      */

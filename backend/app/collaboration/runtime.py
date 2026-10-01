@@ -14,6 +14,7 @@ class Scheduler:
         self.service, self.team = service, team
         self.concurrency = concurrency
         self.jobs = set()
+        self.executions = {}
         self.loop = None
 
     async def start(self):
@@ -32,13 +33,20 @@ class Scheduler:
     async def run(self):
         while True:
             try:
+                await self.service.scheduling_tick()
+                for task, (project, identifier) in list(self.executions.items()):
+                    request = await self.service.get_request(project, identifier)
+                    if request['state'] == 'cancelled':
+                        task.cancel()
                 while len(self.jobs) < self.concurrency:
                     job = await self.service.claim()
                     if not job:
                         break
                     task = asyncio.create_task(self.execute(*job))
                     self.jobs.add(task)
+                    self.executions[task] = (job[0], job[2]['id'])
                     task.add_done_callback(self.jobs.discard)
+                    task.add_done_callback(lambda t: self.executions.pop(t, None))
             except Exception:
                 logger.exception('Collaboration scheduler tick failed')
             await asyncio.sleep(.25)

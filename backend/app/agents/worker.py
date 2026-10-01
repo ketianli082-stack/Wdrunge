@@ -4,7 +4,7 @@ from collections.abc import AsyncIterator
 from typing import TYPE_CHECKING, Literal
 from uuid import uuid4
 
-from langchain_core.messages import AIMessageChunk, BaseMessage, HumanMessage, SystemMessage
+from langchain_core.messages import AIMessage, AIMessageChunk, BaseMessage, HumanMessage, SystemMessage
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.graph import END, START, MessagesState, StateGraph
 from langgraph.prebuilt import ToolNode, tools_condition
@@ -60,6 +60,10 @@ class WorkerAgent(Agent):
         async def call_model(state: MessagesState):
             ctx = active.get()
             reminders = []
+            if ctx and ctx.request:
+                current = await ctx.service.get_request(ctx.project, ctx.request)
+                if current['state'] != 'running':
+                    return {'messages': [AIMessage(content='Request execution suspended.')]}
             if ctx:
                 reminders = await ctx.service.inbox(ctx.project, ctx.member, ctx.context, ctx.conversation)
             import json
@@ -97,7 +101,18 @@ class WorkerAgent(Agent):
         graph.add_node("agent", call_model)
         graph.add_edge(START, "agent")
         if tools:
-            graph.add_node("tools", ToolNode(tools))
+            tool_node = ToolNode(tools)
+
+            async def guarded_tools(state, config):
+                ctx = active.get()
+                if ctx and ctx.request:
+                    current = await ctx.service.get_request(ctx.project, ctx.request)
+                    if current['state'] != 'running':
+                        from langchain_core.messages import ToolMessage
+                        return {'messages': [ToolMessage(content='Request is no longer running; tool skipped.', tool_call_id=call['id']) for call in state['messages'][-1].tool_calls]}
+                return await tool_node.ainvoke(state, config)
+
+            graph.add_node("tools", guarded_tools)
             graph.add_node("acknowledge", after_model)
             graph.add_edge("agent", "acknowledge")
             graph.add_conditional_edges("acknowledge", tools_condition)

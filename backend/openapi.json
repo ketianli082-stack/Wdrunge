@@ -625,7 +625,9 @@
               "transition",
               "snapshot",
               "search",
-              "diff"
+              "diff",
+              "schedule",
+              "dependencies"
             ],
             "title": "Action"
           },

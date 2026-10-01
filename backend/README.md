@@ -130,3 +130,11 @@ whole Markdown blocks; oversized blocks carry `fragment: true` and a continuatio
 cursor. Repeated reads are suppressed only after successful model processing and
 checkpointing, scoped to a context and version; `force: true` rereads explicitly.
 Reminder aggregation preserves every included revision summary and event ID.
+
+Scheduling: requests accept priority 0–3 (highest first, FIFO within a priority)
+and an optional Unix deadline. A missed deadline produces one durable Leader
+escalation and raises priority once; it does not silently cancel work. `schedule`
+updates these fields. `dependencies` exposes nodes and directed prerequisite edges.
+Cancellation propagates to dependent requests and children; unrelated work remains
+active. The scheduler cancels affected running jobs, and tool/model boundaries check
+request state before continuing. Already completed filesystem writes are retained.
