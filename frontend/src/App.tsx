@@ -5,6 +5,7 @@ import {
   createConversation,
   createProject,
   getConversation,
+  getConversationEvents,
   getTeamStatus,
   listProjects,
   streamConversationMessage,
@@ -15,6 +16,7 @@ import {
   type TeamMember,
   type TeamUsage,
 } from "./api";
+import { applyConversationEvent } from "./conversationEvents";
 import CollaborationPanel from "./CollaborationPanel";
 import { DeliveryPreview, useDeliveryFiles } from "./DeliveryFiles";
 import OfficeScene from "./OfficeScene";
@@ -28,8 +30,9 @@ type VisibleMessage = TeamChatMessage & {
   readBy?: string[];
   completedBy?: string[];
   time: string;
+  createdAt?: number;
 };
-type VisibleActivity = Activity & { time: string };
+type VisibleActivity = Activity & { time: string; createdAt?: number };
 type ConversationView = Omit<ConversationDetail, "messages" | "activities"> & {
   messages: VisibleMessage[];
   activities: VisibleActivity[];
@@ -62,6 +65,7 @@ function toConversationView(detail: ConversationDetail): ConversationView {
       readBy: message.read_by,
       completedBy: message.completed_by,
       time: clockTime(new Date(message.created_at)),
+      createdAt: Date.parse(message.created_at),
     })),
     activities: detail.activities.map((activity) => ({
       id: activity.id,
@@ -70,6 +74,7 @@ function toConversationView(detail: ConversationDetail): ConversationView {
       description: activity.description,
       phase: activity.phase,
       time: clockTime(new Date(activity.created_at)),
+      createdAt: Date.parse(activity.created_at),
     })),
   };
 }
@@ -167,6 +172,28 @@ function App() {
     return () => { abort.abort(); clearInterval(timer); };
   }, [active?.id, streaming]);
 
+  useEffect(() => {
+    if (!active?.id) return;
+    const id = active.id;
+    const abort = new AbortController();
+    let cursor = 0;
+    let timer: ReturnType<typeof setTimeout>;
+    async function poll() {
+      let delay = 1000;
+      try {
+        const page = await getConversationEvents(id, cursor, abort.signal);
+        if (abort.signal.aborted) return;
+        setActive(current => current?.id === id
+          ? page.events.reduce((view, event) => applyConversationEvent(view, event), current) : current);
+        cursor = page.cursor;
+        if (page.has_more) delay = 0;
+      } catch { /* Retry from the same cursor; no background events are dropped. */ }
+      finally { if (!abort.signal.aborted) timer = setTimeout(poll, delay); }
+    }
+    void poll();
+    return () => { abort.abort(); clearTimeout(timer); };
+  }, [active?.id]);
+
   useEffect(() => () => controller.current?.abort(), []);
   useEffect(() => {
     if (panel === "chat" && chatFeed.current) chatFeed.current.scrollTop = chatFeed.current.scrollHeight;
@@ -237,7 +264,7 @@ function App() {
     let replyId = "";
     updateActive((item) => ({
       ...item,
-      messages: [...item.messages, { id: clientMessageId, sender: "user", content, time: clockTime() }],
+      messages: [...item.messages, { id: clientMessageId, sender: "user", content, time: clockTime(), createdAt: Date.now() }],
     }));
     setInput("");
     setError("");
@@ -253,13 +280,12 @@ function App() {
             ...item,
             messages: item.messages.some((message) => message.id === replyId)
               ? item.messages.map((message) => message.id === replyId ? { ...message, content: message.content + delta } : message)
-              : [...item.messages, { id: replyId, sender: "leader", content: delta, time: clockTime() }],
+              : [...item.messages, { id: replyId, sender: "leader", content: delta, time: clockTime(), createdAt: Date.now() }],
           }));
         },
         onStatus: ({ id, status }) => setAgents((current) => current.map((agent) => agent.id === id ? { ...agent, status } : agent)),
-        onMessage: (message) => updateActive((item) => ({
-          ...item,
-          messages: [...item.messages, { ...message, readBy: [], completedBy: [], time: clockTime() }],
+        onMessage: (message) => updateActive(item => applyConversationEvent(item, {
+          sequence: 0, type: 'chat_message', payload: message, created_at: new Date().toISOString(),
         })),
         onRead: ({ message_id, reader }) => updateActive((item) => ({
           ...item,
@@ -273,11 +299,8 @@ function App() {
             ? { ...message, completedBy: [...new Set([...(message.completedBy || []), worker])] }
             : message),
         })),
-        onActivity: (activity) => updateActive((item) => ({
-          ...item,
-          activities: item.activities.some((entry) => entry.id === activity.id)
-            ? item.activities.map((entry) => entry.id === activity.id ? { ...entry, ...activity } : entry)
-            : [...item.activities, { ...activity, time: clockTime() }],
+        onActivity: (activity) => updateActive(item => applyConversationEvent(item, {
+          sequence: 0, type: 'activity', payload: activity, created_at: new Date().toISOString(),
         })),
         onUsage: setUsage,
         onTitle: (title) => {

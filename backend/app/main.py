@@ -12,7 +12,7 @@ from uuid import uuid4
 
 import aiosqlite
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from langchain_core.messages import AIMessage, HumanMessage
@@ -191,6 +191,19 @@ class PersistedActivityResponse(UtcTimestampResponse):
     created_at: datetime
 
 
+class ConversationEventResponse(UtcTimestampResponse):
+    sequence: int
+    type: str
+    payload: dict
+    created_at: datetime
+
+
+class ConversationEventsResponse(BaseModel):
+    events: list[ConversationEventResponse]
+    cursor: int
+    has_more: bool
+
+
 class ConversationDetailResponse(ConversationSummaryResponse):
     project_name: str
     workspace_path: str
@@ -302,6 +315,14 @@ async def conversation_detail(conversation_id: str):
     await ensure_runtime()
     try:
         return await store.get_conversation_detail(conversation_id)
+    except StorageNotFoundError as error:
+        raise storage_http_error(error) from error
+
+
+@app.get("/api/conversations/{conversation_id}/events", response_model=ConversationEventsResponse, tags=["Projects"])
+async def conversation_events(conversation_id: str, after: int = Query(0, ge=0), limit: int = Query(200, ge=1, le=500)):
+    try:
+        return await store.conversation_event_page(conversation_id, after, limit)
     except StorageNotFoundError as error:
         raise storage_http_error(error) from error
 

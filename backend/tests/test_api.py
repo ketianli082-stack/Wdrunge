@@ -213,3 +213,31 @@ def test_project_conversation_relationships_are_logical(monkeypatch, tmp_path):
             assert all(connection.execute(f"PRAGMA foreign_key_list({table})").fetchall() == [] for table in tables)
         finally:
             connection.close()
+
+
+def test_background_event_pages_are_ordered_scoped_and_resumable(tmp_path, monkeypatch):
+    import asyncio
+    from app.storage import ChatStore
+    from app import main
+    store = ChatStore(f'sqlite+aiosqlite:///{tmp_path / "events.db"}')
+    async def seed():
+        p = await store.create_project('Events', str(tmp_path))
+        c = await store.create_conversation(p['id'])
+        other = await store.create_conversation(p['id'])
+        activity = dict(id='worker-tool', agent='product', tool='read_project_file', description='Read document', phase='running')
+        await store.upsert_activity(c['id'], activity)
+        await store.upsert_activity(c['id'], {**activity, 'phase':'completed'})
+        await store.upsert_activity(other['id'], {**activity, 'id':'other-tool'})
+        return c['id']
+    cid = asyncio.run(seed())
+    monkeypatch.setattr(main, 'store', store)
+    client = TestClient(main.app)
+    first = client.get(f'/api/conversations/{cid}/events?limit=1').json()
+    assert first['has_more']
+    second = client.get(f'/api/conversations/{cid}/events', params={'after':first['cursor']}).json()
+    assert [e['payload']['phase'] for e in first['events'] + second['events']] == ['running', 'completed']
+    assert not second['has_more']
+    assert client.get(f'/api/conversations/{cid}/events', params={'after':second['cursor']}).json()['events'] == []
+    assert client.get('/api/conversations/missing/events').status_code == 404
+    assert client.get(f'/api/conversations/{cid}/events?after=-1').status_code == 422
+    asyncio.run(store.close())

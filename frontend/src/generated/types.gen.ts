@@ -143,6 +143,48 @@ export type ConversationDetailResponse = {
 };
 
 /**
+ * ConversationEventResponse
+ */
+export type ConversationEventResponse = {
+    /**
+     * Sequence
+     */
+    sequence: number;
+    /**
+     * Type
+     */
+    type: string;
+    /**
+     * Payload
+     */
+    payload: {
+        [key: string]: unknown;
+    };
+    /**
+     * Created At
+     */
+    created_at: string;
+};
+
+/**
+ * ConversationEventsResponse
+ */
+export type ConversationEventsResponse = {
+    /**
+     * Events
+     */
+    events: Array<ConversationEventResponse>;
+    /**
+     * Cursor
+     */
+    cursor: number;
+    /**
+     * Has More
+     */
+    has_more: boolean;
+};
+
+/**
  * ConversationSummaryResponse
  */
 export type ConversationSummaryResponse = {
@@ -872,6 +914,45 @@ export type ConversationDetailApiConversationsConversationIdGetResponses = {
 };
 
 export type ConversationDetailApiConversationsConversationIdGetResponse = ConversationDetailApiConversationsConversationIdGetResponses[keyof ConversationDetailApiConversationsConversationIdGetResponses];
+
+export type ConversationEventsApiConversationsConversationIdEventsGetData = {
+    body?: never;
+    path: {
+        /**
+         * Conversation Id
+         */
+        conversation_id: string;
+    };
+    query?: {
+        /**
+         * After
+         */
+        after?: number;
+        /**
+         * Limit
+         */
+        limit?: number;
+    };
+    url: '/api/conversations/{conversation_id}/events';
+};
+
+export type ConversationEventsApiConversationsConversationIdEventsGetErrors = {
+    /**
+     * Validation Error
+     */
+    422: HttpValidationError;
+};
+
+export type ConversationEventsApiConversationsConversationIdEventsGetError = ConversationEventsApiConversationsConversationIdEventsGetErrors[keyof ConversationEventsApiConversationsConversationIdEventsGetErrors];
+
+export type ConversationEventsApiConversationsConversationIdEventsGetResponses = {
+    /**
+     * Successful Response
+     */
+    200: ConversationEventsResponse;
+};
+
+export type ConversationEventsApiConversationsConversationIdEventsGetResponse = ConversationEventsApiConversationsConversationIdEventsGetResponses[keyof ConversationEventsApiConversationsConversationIdEventsGetResponses];
 
 export type TeamStatusApiTeamGetData = {
     body?: never;

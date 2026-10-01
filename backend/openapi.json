@@ -561,6 +561,71 @@
         }
       }
     },
+    "/api/conversations/{conversation_id}/events": {
+      "get": {
+        "tags": [
+          "Projects"
+        ],
+        "summary": "Conversation Events",
+        "operationId": "conversation_events_api_conversations__conversation_id__events_get",
+        "parameters": [
+          {
+            "name": "conversation_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Conversation Id"
+            }
+          },
+          {
+            "name": "after",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 0,
+              "default": 0,
+              "title": "After"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 500,
+              "minimum": 1,
+              "default": 200,
+              "title": "Limit"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConversationEventsResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/team": {
       "get": {
         "tags": [
@@ -920,6 +985,61 @@
           "activities"
         ],
         "title": "ConversationDetailResponse"
+      },
+      "ConversationEventResponse": {
+        "properties": {
+          "sequence": {
+            "type": "integer",
+            "title": "Sequence"
+          },
+          "type": {
+            "type": "string",
+            "title": "Type"
+          },
+          "payload": {
+            "additionalProperties": true,
+            "type": "object",
+            "title": "Payload"
+          },
+          "created_at": {
+            "type": "string",
+            "title": "Created At"
+          }
+        },
+        "type": "object",
+        "required": [
+          "sequence",
+          "type",
+          "payload",
+          "created_at"
+        ],
+        "title": "ConversationEventResponse"
+      },
+      "ConversationEventsResponse": {
+        "properties": {
+          "events": {
+            "items": {
+              "$ref": "#/components/schemas/ConversationEventResponse"
+            },
+            "type": "array",
+            "title": "Events"
+          },
+          "cursor": {
+            "type": "integer",
+            "title": "Cursor"
+          },
+          "has_more": {
+            "type": "boolean",
+            "title": "Has More"
+          }
+        },
+        "type": "object",
+        "required": [
+          "events",
+          "cursor",
+          "has_more"
+        ],
+        "title": "ConversationEventsResponse"
       },
       "ConversationSummaryResponse": {
         "properties": {

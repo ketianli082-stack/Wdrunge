@@ -91,6 +91,12 @@ async function requestJson<T>(path: string, init?: RequestInit): Promise<T> {
   return data;
 }
 
+export type ConversationEvent = { sequence: number; type: string; payload: Record<string, unknown>; created_at: string };
+export async function getConversationEvents(id: string, after: number, signal?: AbortSignal) {
+  return requestJson<{events: ConversationEvent[]; cursor: number; has_more: boolean}>(
+    `/api/conversations/${encodeURIComponent(id)}/events?after=${after}`, { signal });
+}
+
 export async function getTeamStatus(signal?: AbortSignal): Promise<TeamStatusResponse> {
   const response = await fetch(`${API_BASE_URL}/api/team`, { signal });
   if (!response.ok) throw new Error(`Team status failed (${response.status})`);

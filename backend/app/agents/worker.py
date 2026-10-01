@@ -28,6 +28,17 @@ TOOL_LABELS = {
 }
 
 
+COLLABORATION_LABELS = {
+    'catalog': '查看交付文档目录', 'read': '读取文档章节', 'publish': '发布文档修订',
+    'subscribe': '订阅文档变化', 'send': '在群里 @ 成员沟通', 'request': '发起协作任务',
+    'inspect_request': '查看任务进展', 'wait': '等待依赖交付', 'transition': '更新任务交付与验收状态',
+    'snapshot': '查看团队任务', 'search': '检索文档', 'diff': '查看文档变更',
+    'schedule': '调整任务安排', 'dependencies': '查看任务依赖', 'decision': '记录项目决策',
+    'maintenance': '检查文档状态', 'handoff': '查看阶段交接', 'recover': '恢复交付',
+    'inspect_message': '读取协作消息详情', 'history': '查看文档修订历史',
+}
+
+
 class WorkerAgent(Agent):
     def __init__(self, spec):
         super().__init__(spec)
@@ -187,7 +198,7 @@ class WorkerAgent(Agent):
         messages.append(HumanMessage(content=f"Assigned task: {task}\n\nHandoff context:\n{handoff}"))
         yield "context", {"mode": resolved}
         tool_names = {tool.name for tool in self.spec.tools} | {"collaborate"}
-        active_tools: dict[str, str] = {}
+        active_tools: dict[str, tuple[str, str]] = {}
         async for event in self.build_graph().astream_events(
             {"messages": messages},
             config={"configurable": {"thread_id": self._threads[conversation_id]},
@@ -199,19 +210,20 @@ class WorkerAgent(Agent):
             name = event.get("name", "")
             run_id = str(event.get("run_id", ""))
             if kind == "on_tool_start" and name in tool_names:
-                active_tools[run_id] = name
+                description = COLLABORATION_LABELS.get(event.get('data', {}).get('input', {}).get('action'), '协调团队工作') if name == 'collaborate' else TOOL_LABELS.get(name, '调用工具')
+                active_tools[run_id] = (name, description)
                 yield "activity", {
                     "id": run_id,
                     "tool": name,
-                    "description": TOOL_LABELS.get(name, "调用工具"),
+                    "description": description,
                     "phase": "running",
                 }
             elif kind in {"on_tool_end", "on_tool_error"} and run_id in active_tools:
-                tool_name = active_tools.pop(run_id)
+                tool_name, description = active_tools.pop(run_id)
                 yield "activity", {
                     "id": run_id,
                     "tool": tool_name,
-                    "description": TOOL_LABELS.get(tool_name, "调用工具"),
+                    "description": description,
                     "phase": "failed" if kind == "on_tool_error" else "completed",
                 }
             elif kind == "on_chat_model_stream" and event.get("metadata", {}).get("langgraph_node") == "agent":

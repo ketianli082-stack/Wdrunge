@@ -267,7 +267,13 @@ class Team:
                 call_id = call.get("id") or f"delegation-{count + 1}"
                 tool_name = call.get("name")
                 if tool_name == 'collaborate' and active.get():
+                    from app.agents.worker import COLLABORATION_LABELS
+                    action = call.get('args', {}).get('action', '')
+                    activity = {'id': uuid4().hex, 'agent': 'leader', 'tool': 'collaborate',
+                                'description': COLLABORATION_LABELS.get(action, '协调团队工作')}
+                    yield 'activity', {**activity, 'phase': 'running'}
                     result = await collaborate.ainvoke(call.get('args', {}))
+                    yield 'activity', {**activity, 'phase': 'failed' if isinstance(result, dict) and result.get('error') else 'completed'}
                     messages.append(ToolMessage(content=str(result), tool_call_id=call_id))
                     continue
                 if tool_name == "checkpoint_context":

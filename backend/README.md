@@ -207,3 +207,9 @@ so this is not a count of tool calls. A failed request can be explicitly requeue
 by its sender or Leader (also via “重试原任务” in the panel). Retried requests retain
 their ID, dependencies and unpublished workspace; they are not duplicated or
 silently restarted. Dependencies resume once their prerequisites are reviewable.
+
+Conversation activity and team messages also have a cursor-based durable feed:
+`GET /api/conversations/{id}/events?after=0&limit=200`. The UI consumes this feed
+while Leader SSE is open, so background workers remain visible during delegation.
+Pages replay safely, preserve streaming assistant text and retain tool start times.
+Leader collaboration/acceptance tools appear on the same timeline.

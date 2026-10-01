@@ -52,3 +52,21 @@ test('tolerates incomplete Markdown arriving in streaming chunks', () => {
   for (let i = 0; i <= document.length; i++) assert.doesNotThrow(() => render(document.slice(0, i)));
   assert.ok(render(document).includes('<table>'));
 });
+
+// Real background-worker events arrive while the Leader SSE is still waiting.
+import { applyConversationEvent } from '../src/conversationEvents';
+test('background log replay preserves streamed text and deduplicates tool phases and mentions', () => {
+  const at = '2026-10-01T04:00:00Z';
+  let view = { messages: [{id:'reply', sender:'leader', content:'正在组织', time:'12:00'}], activities: [] };
+  const start = {sequence:1, type:'activity', created_at:at, payload:{id:'tool',agent:'product',tool:'read_project_file',description:'读取项目文件',phase:'running'}};
+  view = applyConversationEvent(view, start);
+  view = applyConversationEvent(view, {...start, sequence:2, payload:{...start.payload, phase:'completed'}});
+  view = applyConversationEvent(view, start);
+  const chat = {sequence:3, type:'chat_message', created_at:at, payload:{id:'mention',sender:'frontend',content:'@后端 接口已接入',mentions:[{worker:'backend',name:'后端',summary:'接口已接入'}]}};
+  view = applyConversationEvent(applyConversationEvent(view, chat), chat);
+  view = applyConversationEvent(view, {sequence:4,type:'assistant_completed',created_at:at,payload:{id:'reply',content:'stale'}});
+  assert.equal(view.messages[0].content, '正在组织');
+  assert.equal(view.messages.length, 2);
+  assert.equal(view.activities.length, 1);
+  assert.equal((view.activities[0] as {phase:string}).phase, 'completed');
+});

@@ -447,6 +447,20 @@ class ChatStore:
             event_type=event_type, entity_id=entity_id, payload_json=payload, created_at=now,
         ))
 
+    async def conversation_event_page(self, conversation_id: str, after: int = 0, limit: int = 200):
+        await self.initialize()
+        async with self.engine.connect() as connection:
+            if not await self._conversation_exists(connection, conversation_id):
+                raise StorageNotFoundError("Conversation not found")
+            rows = (await connection.execute(select(conversation_events).where(
+                conversation_events.c.conversation_id == conversation_id,
+                conversation_events.c.sequence > after,
+            ).order_by(conversation_events.c.sequence).limit(limit + 1))).mappings().all()
+        page = rows[:limit]
+        return {"events": [{"sequence": r["sequence"], "type": r["event_type"],
+                            "payload": r["payload_json"], "created_at": r["created_at"]} for r in page],
+                "cursor": page[-1]["sequence"] if page else after, "has_more": len(rows) > limit}
+
     async def get_conversation_detail(self, conversation_id: str) -> dict[str, Any]:
         await self.initialize()
         async with self.engine.connect() as connection:
