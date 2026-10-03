@@ -7,6 +7,8 @@ not asked to maintain physical FOREIGN KEY constraints.
 
 from __future__ import annotations
 
+import asyncio
+from contextlib import asynccontextmanager
 import os
 from datetime import UTC, datetime
 from pathlib import Path
@@ -233,6 +235,59 @@ def utcnow() -> datetime:
     return datetime.now(UTC)
 
 
+async def complete(awaitable, release=None):
+    """Await a database operation to completion even if the caller is cancelled, then
+    deliver the cancellation. Cancelling an in-flight aiosqlite statement makes
+    SQLAlchemy invalidate the connection without closing it, so a write transaction
+    it had begun keeps the SQLite write lock until garbage collection and every other
+    writer fails with "database is locked". `release` frees a result (such as a new
+    connection) that the cancelled caller will never receive."""
+    task = asyncio.ensure_future(awaitable)
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                pass
+        if not task.cancelled() and task.exception() is None and release is not None:
+            await complete(release(task.result()))
+        raise
+
+
+class CancelSafeConnection:
+    """AsyncConnection whose statements finish before a cancellation is delivered."""
+    COMPLETE = {'execute', 'exec_driver_sql', 'scalar', 'scalars', 'run_sync', 'commit', 'rollback'}
+
+    def __init__(self, connection):
+        self._connection = connection
+
+    def __getattr__(self, name):
+        value = getattr(self._connection, name)
+        if name in self.COMPLETE:
+            return lambda *args, **kwargs: complete(value(*args, **kwargs))
+        return value
+
+
+@asynccontextmanager
+async def write_transaction(engine: AsyncEngine, begin: str | None = None):
+    """A write transaction that always ends in commit or rollback, never in an
+    invalidated connection still holding the write lock (see complete())."""
+    connection = await complete(engine.connect(), release=lambda connection: connection.close())
+    try:
+        if begin:
+            await complete(connection.exec_driver_sql(begin))
+        try:
+            yield CancelSafeConnection(connection)
+            await complete(connection.commit())
+        except BaseException:
+            await complete(connection.rollback())
+            raise
+    finally:
+        await complete(connection.close())
+
+
 def default_database_path() -> Path:
     configured = os.getenv("WDRUNGE_DATABASE_PATH")
     if configured:
@@ -260,6 +315,9 @@ class ChatStore:
             event.listen(self.engine.sync_engine, "connect", self._configure_sqlite)
         self._initialized = False
 
+    def write(self):
+        return write_transaction(self.engine)
+
     @staticmethod
     def _configure_sqlite(dbapi_connection, _connection_record) -> None:
         cursor = dbapi_connection.cursor()
@@ -280,7 +338,7 @@ class ChatStore:
         path = self.sqlite_path
         if path:
             path.parent.mkdir(parents=True, exist_ok=True)
-        async with self.engine.begin() as connection:
+        async with self.write() as connection:
             await connection.run_sync(metadata.create_all)
             if path:
                 # create_all does not add columns to databases created before them.
@@ -295,7 +353,7 @@ class ChatStore:
     async def clear_records(self) -> None:
         """Clear app-owned rows atomically; never remove workspace files or schema."""
         await self.initialize()
-        async with self.engine.begin() as connection:
+        async with self.write() as connection:
             existing = set(await connection.scalars(text("SELECT name FROM sqlite_master WHERE type='table'")))
             # These SQLite tables belong to collaboration and LangGraph, not Alembic.
             extra = ('collaboration_receipts', 'collaboration_events', 'collaboration_sections',
@@ -332,7 +390,7 @@ class ChatStore:
         await self.initialize()
         project_id = str(uuid4())
         now = utcnow()
-        async with self.engine.begin() as connection:
+        async with self.write() as connection:
             existing = await connection.scalar(
                 select(projects.c.id).where(projects.c.workspace_path == workspace_path)
             )
@@ -370,7 +428,7 @@ class ChatStore:
         await self.initialize()
         conversation_id = str(uuid4())
         now = utcnow()
-        async with self.engine.begin() as connection:
+        async with self.write() as connection:
             if not await self._project_exists(connection, project_id):
                 raise StorageNotFoundError("Project not found")
             await connection.execute(insert(conversations).values(
@@ -414,7 +472,7 @@ class ChatStore:
 
     async def add_user_message(self, conversation_id: str, content: str, message_id: str) -> dict[str, Any]:
         await self.initialize()
-        async with self.engine.begin() as connection:
+        async with self.write() as connection:
             return await self.add_user_message_in_transaction(connection, conversation_id, content, message_id)
 
     async def add_user_message_in_transaction(self, connection, conversation_id, content, message_id):
@@ -435,7 +493,7 @@ class ChatStore:
     async def set_initial_title(self, conversation_id: str, title: str) -> None:
         await self.initialize()
         now = utcnow()
-        async with self.engine.begin() as connection:
+        async with self.write() as connection:
             await connection.execute(
                 update(conversations)
                 .where(conversations.c.id == conversation_id, conversations.c.title == "新对话")
@@ -444,7 +502,7 @@ class ChatStore:
 
     async def add_chat_message(self, conversation_id: str, payload: dict[str, Any]) -> None:
         await self.initialize()
-        async with self.engine.begin() as connection:
+        async with self.write() as connection:
             await self.add_chat_message_in_transaction(connection, conversation_id, payload)
 
     async def add_chat_message_in_transaction(self, connection, conversation_id, payload):
@@ -464,7 +522,7 @@ class ChatStore:
     async def start_assistant_message(self, conversation_id: str, message_id: str, content: str) -> None:
         await self.initialize()
         now = utcnow()
-        async with self.engine.begin() as connection:
+        async with self.write() as connection:
             sequence = await self._next_sequence(connection, conversation_id)
             await connection.execute(insert(messages).values(
                 id=message_id, conversation_id=conversation_id, sequence=sequence,
@@ -476,12 +534,12 @@ class ChatStore:
         values: dict[str, Any] = {"content": content, "status": status}
         if status != "streaming":
             values["completed_at"] = utcnow()
-        async with self.engine.begin() as connection:
+        async with self.write() as connection:
             await connection.execute(update(messages).where(messages.c.id == message_id).values(**values))
 
     async def add_receipt(self, conversation_id: str, payload: dict[str, Any]) -> None:
         await self.initialize()
-        async with self.engine.begin() as connection:
+        async with self.write() as connection:
             await self.add_receipt_in_transaction(connection, conversation_id, payload)
 
     async def add_receipt_in_transaction(self, connection, conversation_id, payload):
@@ -502,7 +560,7 @@ class ChatStore:
 
     async def add_reaction(self, conversation_id: str, payload: dict[str, Any]) -> None:
         await self.initialize()
-        async with self.engine.begin() as connection:
+        async with self.write() as connection:
             await self.add_reaction_in_transaction(connection, conversation_id, payload)
 
     async def add_reaction_in_transaction(self, connection, conversation_id, payload):
@@ -525,7 +583,7 @@ class ChatStore:
     async def upsert_activity(self, conversation_id: str, payload: dict[str, Any]) -> None:
         await self.initialize()
         now = utcnow()
-        async with self.engine.begin() as connection:
+        async with self.write() as connection:
             existing = await connection.scalar(select(activities.c.id).where(activities.c.id == payload["id"]))
             if existing:
                 await connection.execute(update(activities).where(activities.c.id == payload["id"]).values(
@@ -545,7 +603,7 @@ class ChatStore:
     async def add_event(self, conversation_id: str, event_type: str, payload: dict[str, Any]) -> None:
         await self.initialize()
         now = utcnow()
-        async with self.engine.begin() as connection:
+        async with self.write() as connection:
             sequence = await self._next_sequence(connection, conversation_id)
             await self._insert_event(connection, conversation_id, sequence, event_type, payload.get("id"), payload, now)
 
@@ -633,7 +691,7 @@ class ChatStore:
         rows = [{'conversation_id': conversation_id, 'tool_call_id': str(call['id'])[:120], 'agent_id': agent_id,
                  'tool': str(call['tool'])[:120], 'status': call['status'], 'arguments': call['arguments'][:8000],
                  'result': call['result'][:8000], 'created_at': utcnow()} for call in calls]
-        async with self.engine.begin() as connection:
+        async with self.write() as connection:
             await connection.execute(sqlite_insert(tool_calls).values(rows).on_conflict_do_nothing())
             newest = select(tool_calls.c.created_at).order_by(tool_calls.c.created_at.desc()).offset(keep).limit(1)
             await connection.execute(delete(tool_calls).where(tool_calls.c.created_at <= newest.scalar_subquery()))
@@ -649,7 +707,7 @@ class ChatStore:
                                  project_id=None, conversation_id=None, request_id=None, attempt=None, purpose=None,
                                  model=None, output_tokens=None, latency_ms=None, retries=None) -> None:
         await self.initialize()
-        async with self.engine.begin() as connection:
+        async with self.write() as connection:
             await connection.execute(insert(agent_usage).values(
                 id=uuid4().hex, agent_id=agent_id, total_tokens=total,
                 context_tokens=context, cached_tokens=cached, created_at=utcnow(),
@@ -713,7 +771,7 @@ class ChatStore:
 
     async def save_compaction(self, scope: str, stage: str, record: dict) -> None:
         await self.initialize()
-        async with self.engine.begin() as connection:
+        async with self.write() as connection:
             await connection.execute(insert(context_compactions).values(
                 id=record['id'], scope=scope, stage=stage, record_json=record, created_at=utcnow(),
             ))
@@ -742,7 +800,7 @@ class ChatStore:
 
     async def save_context_memory(self, scope: str, state: dict) -> None:
         await self.initialize()
-        async with self.engine.begin() as connection:
+        async with self.write() as connection:
             existing = await connection.scalar(select(context_memory.c.scope).where(context_memory.c.scope == scope))
             values = dict(state_json=state, updated_at=utcnow())
             if existing:
@@ -758,7 +816,7 @@ class ChatStore:
     async def save_leader_checkpoint(self, conversation_id: str, history_cutoff: int, handoff: dict[str, Any]) -> None:
         await self.initialize()
         now = utcnow()
-        async with self.engine.begin() as connection:
+        async with self.write() as connection:
             if not await self._conversation_exists(connection, conversation_id):
                 return
             existing = await connection.scalar(select(leader_checkpoints.c.conversation_id).where(leader_checkpoints.c.conversation_id == conversation_id))
@@ -777,7 +835,7 @@ class ChatStore:
     async def save_agent_session(self, conversation_id: str, agent_id: str, thread_id: str, context_tokens: int | None) -> None:
         await self.initialize()
         now = utcnow()
-        async with self.engine.begin() as connection:
+        async with self.write() as connection:
             if not await self._conversation_exists(connection, conversation_id):
                 return
             existing = await connection.scalar(select(agent_sessions.c.thread_id).where(
@@ -795,7 +853,7 @@ class ChatStore:
 
     async def delete_agent_session(self, conversation_id: str, agent_id: str) -> None:
         await self.initialize()
-        async with self.engine.begin() as connection:
+        async with self.write() as connection:
             await connection.execute(delete(agent_sessions).where(
                 agent_sessions.c.conversation_id == conversation_id, agent_sessions.c.agent_id == agent_id
             ))

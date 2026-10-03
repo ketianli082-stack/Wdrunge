@@ -29,7 +29,8 @@ def test_environment_panel_and_task_journal(tmp_path):
     state = dict(document=[], request=[task], message=[], goal=[], settings=[], journal=[journal])
     environment = dict(host=dict(os='macOS', userland='BSD'), reserved_ports=[17420, 1420],
                        services=[dict(name='api', kind='http', port=8100, host='127.0.0.1', status='verified', source='agent',
-                                      claimed=True, owner='backend', command=dict(argv=['python3', 'app.py'], cwd='backend'))],
+                                      claimed=True, owner='backend', command=dict(argv=['python3', 'app.py'], cwd='backend'),
+                                      runtime=dict(state='running', process_id='p1', kept=True, started_by='backend'))],
                        commands=[dict(name='test', argv=['pytest', '-q'], cwd='backend', status='verified')])
     actions = []
     def api(route):
@@ -48,6 +49,9 @@ def test_environment_panel_and_task_journal(tmp_path):
                 service = dict(name=body['payload']['name'], kind='http', port=body['payload'].get('port', 8101), status='declared',
                                source='user', claimed=True)
                 environment['services'].append(service); data = service
+        elif path == 'projects/p/collaboration/services/api/stop':
+            actions.append(dict(action='stop_service', payload='api'))
+            environment['services'][0]['runtime'] = dict(state='stopped'); data = dict(stopped='api', process_id='p1')
         elif path.endswith('/files'): data = dict(files=[])
         elif path.endswith('/events'): data = dict(events=[], cursor=0, has_more=False)
         elif path == 'execution/capabilities': data = dict(pending=0)
@@ -67,6 +71,10 @@ def test_environment_panel_and_task_journal(tmp_path):
             page.get_by_text('项目环境（端口、地址与命令）', exact=True).click()
             page.get_by_text('平台保留端口：17420, 1420', exact=False).wait_for()
             page.get_by_text('python3 app.py', exact=True).wait_for()
+            page.get_by_text('运行中（backend 启动，任务结束后保留） · 已验证', exact=True).wait_for()
+            page.get_by_role('button', name='停止', exact=True).click()
+            page.get_by_text('未运行 · 已验证', exact=True).wait_for()
+            assert dict(action='stop_service', payload='api') in actions
             page.get_by_text('登记或修改服务', exact=True).click()
             page.get_by_label('服务名称（如 api、web、db）').fill('web')
             page.get_by_role('button', name='保存', exact=True).click()

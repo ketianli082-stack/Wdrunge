@@ -46,13 +46,27 @@ def protected_paths(root):
     return found
 
 
+def host_path() -> str:
+    """The host PATH without the platform's own virtual environment. Project commands
+    run with the interpreters the user has; Wdrunge's dependencies (installed only in
+    its venv) would otherwise make missing project dependencies look satisfied."""
+    bin_dir = 'Scripts' if os.name == 'nt' else 'bin'
+    own = {Path(sys.prefix, bin_dir).resolve()} if sys.prefix != sys.base_prefix else set()
+    if os.environ.get('VIRTUAL_ENV'):
+        own.add(Path(os.environ['VIRTUAL_ENV'], bin_dir).resolve())
+    return os.pathsep.join(entry for entry in os.environ.get('PATH', '').split(os.pathsep)
+                           if entry and Path(entry).resolve() not in own)
+
+
 def clean_environment(scratch, directory):
     # Never forward provider credentials, Python injection variables or host HOME.
     environment = {key: os.environ[key] for key in ('PATH', 'LANG', 'LC_ALL', 'SYSTEMROOT', 'WINDIR') if key in os.environ}
+    if 'PATH' in environment:
+        environment['PATH'] = host_path()
     environment.update(HOME=str(scratch), TMPDIR=str(scratch), TMP=str(scratch), TEMP=str(scratch),
         XDG_CACHE_HOME=str(scratch / 'cache'), npm_config_cache=str(scratch / 'npm-cache'),
         PIP_CACHE_DIR=str(scratch / 'pip-cache'), UV_CACHE_DIR=str(scratch / 'uv-cache'),
-        PYTHONNOUSERSITE='1', PYTHONUNBUFFERED='1', PIP_REQUIRE_VIRTUALENV='true', UV_PYTHON_DOWNLOADS='never', GIT_CONFIG_NOSYSTEM='1',
+        PYTHONNOUSERSITE='1', PYTHONUNBUFFERED='1', PYTHONDONTWRITEBYTECODE='1', PIP_REQUIRE_VIRTUALENV='true', UV_PYTHON_DOWNLOADS='never', GIT_CONFIG_NOSYSTEM='1',
         GIT_CONFIG_GLOBAL=os.devnull, npm_config_userconfig=os.devnull,
         WDRUNGE_DATABASE_PATH=str(scratch / 'service.db'),
         WDRUNGE_DATABASE_URL=f'sqlite+aiosqlite:///{scratch / "service.db"}')
@@ -63,7 +77,8 @@ def clean_environment(scratch, directory):
     return environment
 
 
-def command_line(argv, workspace, directory, scratch, *, network=False, read_paths=(), write_paths=None, browser=False):
+def command_line(argv, workspace, directory, scratch, *, network=False, read_paths=(), write_paths=None, browser=False,
+                 lifeline=None):
     status = capability()
     if not status['available']:
         raise SandboxUnavailable(status['detail'])
@@ -91,7 +106,10 @@ def command_line(argv, workspace, directory, scratch, *, network=False, read_pat
     protected = protected_paths(workspace)
     launcher = Path(__file__).with_name('limit_exec.py').resolve()
     reads += [launcher, Path(sys.executable).resolve()]
-    payload = [sys.executable, '-I', str(launcher), 'browser' if browser else 'command', invocation, *argv[1:]]
+    # The lifeline (an inherited pipe fd) stops the command when the backend dies;
+    # bwrap --die-with-parent already does that on Linux.
+    watched = str(lifeline) if lifeline is not None and status['backend'] == 'seatbelt' else '-'
+    payload = [sys.executable, '-I', str(launcher), 'browser' if browser else 'command', watched, invocation, *argv[1:]]
     if status['backend'] == 'seatbelt':
         quote = lambda path: json.dumps(str(path))
         rules = ['(version 1)', '(deny default)', '(allow process*)', '(allow sysctl-read)',

@@ -1,5 +1,6 @@
 """Bounded background execution; blocked jobs release their execution slots."""
 import asyncio
+from contextlib import aclosing
 import logging
 import time
 from uuid import uuid4
@@ -144,13 +145,14 @@ class Scheduler:
                            + (f'\n{plan}' if (plan := await self.service.task_brief(project, request)) else '')
                            + (f'\n{drafts}' if (drafts := await self.service.draft_brief(project, request)) else '')
                            + (f'\n\n{brief}' if brief else ''))
-            async for event, data in worker.stream(task, conversation_id=conversation_id, context_mode=mode, handoff=handoff):
-                if event == 'context':
-                    await self.service.journal_set_thread(project, identifier, instance, worker._threads[conversation_id])
-                elif event == 'content':
-                    output.append(data['content'])
-                elif event == 'activity' and request['conversation']:
-                    await self.team._store.upsert_activity(request['conversation'], {**data, 'agent': role})
+            async with aclosing(worker.stream(task, conversation_id=conversation_id, context_mode=mode, handoff=handoff)) as events:
+                async for event, data in events:
+                    if event == 'context':
+                        await self.service.journal_set_thread(project, identifier, instance, worker._threads[conversation_id])
+                    elif event == 'content':
+                        output.append(data['content'])
+                    elif event == 'activity' and request['conversation']:
+                        await self.team._store.upsert_activity(request['conversation'], {**data, 'agent': role})
             current = await self.service.get_request(project, identifier)
             if current['state'] == 'running' and current.get('instance_id') == instance:
                 from app.collaboration.delivery_checks import delivery_findings
@@ -158,8 +160,9 @@ class Scheduler:
                     await self.service.set_findings(project, identifier, await delivery_findings(self.service, project, current, isolated.work))
                 except Exception:
                     logger.warning('Delivery checks failed', exc_info=True)
-                await self.service.publish_artifacts(project, identifier, instance)
-                await self.service.transition(project, identifier, request['recipient'], 'review', result=''.join(output)[-4000:] or 'Execution finished; inspect artifacts before accepting.', artifacts=request['artifacts'], expected_instance=instance)
+                result = ''.join(output)[-4000:] or 'Execution finished; inspect artifacts before accepting.'
+                await self.service.publish_artifacts(project, identifier, instance, references=result)
+                await self.service.transition(project, identifier, request['recipient'], 'review', result=result, artifacts=request['artifacts'], expected_instance=instance)
                 outcome = 'delivered'
             else:
                 outcome = {'review': 'delivered', 'completed': 'delivered', 'cancelled': 'cancelled', 'failed': 'failed',
@@ -191,7 +194,19 @@ class Scheduler:
             except BaseException:
                 logger.warning('Could not record the attempt outcome in the task journal', exc_info=True)
             from app.execution.processes import processes
-            await processes.close(workspace=active_workspace.get())
+            delivered = outcome == 'delivered'
+            if delivered:
+                # Services the task declared are deliverables: they keep serving colleagues
+                # and the user. Anything else it started stops unless it asked keep_running.
+                for job in processes.owned_jobs():
+                    if job.process.returncode is None and job.service and job.service in (request.get('services') or ()):
+                        processes.keep_service(job)
+            await processes.close(workspace=active_workspace.get(), keep_services=delivered)
+            if delivered:
+                # Its delivery is merged: kept services move from the task snapshot to the
+                # project root, so colleagues and the user see the project as merged.
+                processes.background(processes.relaunch_delivered(active_workspace.get(), Path(workspace)),
+                                     'move kept services to the project root')
             self.team.workers[role].total_tokens += worker.total_tokens
             self.team.workers[role].cache_input_tokens += worker.cache_input_tokens
             self.team.workers[role].cached_tokens += worker.cached_tokens

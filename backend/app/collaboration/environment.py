@@ -150,6 +150,28 @@ def discover(root: str) -> list[dict]:
     return found
 
 
+async def service_runtime(root, service) -> dict:
+    """Whether a registry service is serving now. `status: verified` only records that
+    it once served; this is the live state."""
+    from app.execution.processes import processes
+    job = processes.service_job(root, name=service['name'], port=service.get('port'))
+    if job:
+        return job.runtime()
+    if service.get('port') and await port_open(service['port'], timeout=.2):
+        return {'state': 'listening', 'note': 'the port answers, but no team process serves it'}
+    return {'state': 'stopped'}
+
+
+def runtime_label(runtime: dict) -> str:
+    if runtime['state'] != 'running':
+        return runtime['state']
+    label = f"yes (process {runtime['process_id']}, started by {runtime.get('started_by') or 'a task'}"
+    label += ', kept after its task' if runtime.get('kept') else ''
+    if runtime.get('stale'):
+        label += f", STALE: newer project changes in {', '.join(runtime['stale'][:3])} — restart it"
+    return label + ')'
+
+
 class EnvironmentMixin:
     """Methods of Collaboration; records live in collaboration_records."""
 
@@ -157,10 +179,11 @@ class EnvironmentMixin:
         if discover_manifests:
             await self.discover_services(project)
         async with self.reading() as c:
+            root = (await self._project(c, project))['workspace_path']
             services = await self._list(c, 'service', project)
             commands = await self._list(c, 'command', project)
-        return {'host': host_facts(), 'reserved_ports': sorted(platform_ports()),
-                'services': sorted(services, key=lambda s: s['name']),
+        services = [{**s, 'runtime': await service_runtime(root, s)} for s in sorted(services, key=lambda s: s['name'])]
+        return {'host': host_facts(), 'reserved_ports': sorted(platform_ports()), 'services': services,
                 'commands': sorted(commands, key=lambda s: s['name'])}
 
     async def environment_brief(self, project) -> dict:
@@ -168,13 +191,16 @@ class EnvironmentMixin:
         data = await self.environment(project)
         services = [{key: value for key, value in {
             'name': s['name'], 'kind': s.get('kind'), 'url': service_url(s), 'port': s.get('port'), 'status': s.get('status'),
+            'running': runtime_label(s['runtime']),
             'owner': s.get('owner'), 'start': ' '.join(s['command']['argv']) if s.get('command') else None,
             'cwd': (s.get('command') or {}).get('cwd'), 'note': s.get('note')}.items() if value} for s in data['services'][:20]]
         commands = [{'name': c['name'], 'run': ' '.join(c['argv']), 'cwd': c.get('cwd', '.'), 'status': c.get('status')}
                     for c in data['commands'][:15]]
         return {'host': data['host'], 'reserved_ports': data['reserved_ports'], 'services': services, 'commands': commands,
                 'rule': 'Use these service ports and commands. Never use reserved ports. Register a new service with '
-                        'collaboration_register_service to get a free port; refer to services by name.'}
+                        'collaboration_register_service to get a free port; refer to services by name. A running '
+                        'service is already serving the project: use it instead of starting another copy; restart '
+                        'it (keep_running=true) only when you changed its code or it is marked stale.'}
 
     async def trusted_ports(self, project) -> dict[int, str]:
         async with self.reading() as c:

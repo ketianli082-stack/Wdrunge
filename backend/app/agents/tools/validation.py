@@ -200,6 +200,12 @@ def exception_result(exc: Exception, *, tool_name=None, schema=None) -> dict:
     elif type(source).__name__ == 'SandboxUnavailable' or isinstance(source, ImportError):
         category, code, policy = 'environment_unavailable', 'missing_capability', 'after_environment_change'
         advice = 'Inspect environment capabilities and report the missing runtime/sandbox. Prepare required dependencies only within authorized scope; do not bypass isolation.'
+    elif type(source).__name__ == 'StorageConflictError':
+        # Optimistic-lock and state conflicts are expected coordination outcomes, not defects.
+        category, code, policy = 'operation_rejected', 'state_conflict', 'after_state_change'
+        advice = ('The stored state moved on (newer version, changed dependency or task state). Re-read the current '
+                  'document/task/goal, reconcile your change with it, then retry with the current version; if the '
+                  'state does not allow this operation, report that instead of retrying.')
     elif isinstance(source, (ValueError, LookupError)):
         category, code, policy = 'operation_rejected', 'invalid_state_or_value', 'inspect_before_retry'
         advice = 'Inspect the stated constraint and current file/request state. Correct the value or use the documented supported operation before retrying.'

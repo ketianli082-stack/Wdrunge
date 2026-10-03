@@ -1,4 +1,5 @@
 """Browser evidence collected in a sandboxed, fresh Playwright context."""
+import hashlib
 import json
 from pathlib import Path
 import sys
@@ -91,5 +92,16 @@ async def browser_verify(url: str, actions: list[BrowserAction] = [], allowed_or
             'page_errors', 'Inspect console, page_errors, http_errors and screenshot. Check service readiness or report the application defect before rechecking.',
             'inspect_before_retry'))
     if screenshot.is_file():
-        evidence['screenshot'] = str(screenshot)
+        evidence['screenshot'] = str(named_by_content(screenshot))
     return evidence
+
+
+def named_by_content(screenshot: Path) -> Path:
+    """Identical screenshots share one path, so repeated checks of an unchanged page
+    leave one file; delivery merges only the screenshots a report or result cites."""
+    named = screenshot.with_name(f'browser-{hashlib.sha256(screenshot.read_bytes()).hexdigest()[:16]}.png')
+    if named.exists():
+        screenshot.unlink()
+    else:
+        screenshot.rename(named)
+    return named

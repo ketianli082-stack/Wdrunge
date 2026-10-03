@@ -836,6 +836,38 @@ export type PauseApiProjectsProjectIdCollaborationPausePostResponses = {
     200: unknown;
 };
 
+export type StopServiceApiProjectsProjectIdCollaborationServicesNameStopPostData = {
+    body?: never;
+    path: {
+        /**
+         * Project Id
+         */
+        project_id: string;
+        /**
+         * Name
+         */
+        name: string;
+    };
+    query?: never;
+    url: '/api/projects/{project_id}/collaboration/services/{name}/stop';
+};
+
+export type StopServiceApiProjectsProjectIdCollaborationServicesNameStopPostErrors = {
+    /**
+     * Validation Error
+     */
+    422: HttpValidationError;
+};
+
+export type StopServiceApiProjectsProjectIdCollaborationServicesNameStopPostError = StopServiceApiProjectsProjectIdCollaborationServicesNameStopPostErrors[keyof StopServiceApiProjectsProjectIdCollaborationServicesNameStopPostErrors];
+
+export type StopServiceApiProjectsProjectIdCollaborationServicesNameStopPostResponses = {
+    /**
+     * Successful Response
+     */
+    200: unknown;
+};
+
 export type ExportJournalApiProjectsProjectIdCollaborationRequestsRequestIdJournalGetData = {
     body?: never;
     path: {

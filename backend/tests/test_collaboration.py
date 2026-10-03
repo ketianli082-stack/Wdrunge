@@ -294,6 +294,13 @@ def test_workspace_conflict_preserves_original_and_refreshes_dependency(tmp_path
         merge_text('line\n', 'change1\n', 'change2\n')
 
 
+def test_workspace_sync_keeps_env_templates_but_not_secrets(tmp_path):
+    from app.collaboration.workspaces import files
+    for name in ('.env', '.env.local', '.env.example', '.env.sample', 'app.py'):
+        (tmp_path/name).write_text('X=1\n')
+    assert sorted(files(tmp_path)) == ['.env.example', '.env.sample', 'app.py']
+
+
 def test_real_worker_graph_uses_isolated_request_workspace(tmp_path, monkeypatch):
     from app.agents.team import Team
     from app.agents.worker import WorkerAgent
@@ -745,3 +752,35 @@ def test_file_tools_point_to_published_documents_missing_from_snapshot(tmp_path)
             active.reset(tokens[0])
         await store.close()
     run(scenario())
+
+
+def test_only_screenshots_cited_by_the_delivery_are_merged(tmp_path):
+    async def scenario():
+        store, s, p, workspace = await setup(tmp_path)
+        r = await s.create_request(p, 'leader', 'testing', 'Verify page', 'verify', artifacts=['docs/testing/notes.txt'])
+        job = (await s.claim())[2]
+        w = await s.prepare_workspace(p, r['id'])
+        shots = w.work/'docs'/'testing'
+        shots.mkdir(parents=True)
+        for name in ('browser-aaaaaaaaaaaaaaaa.png', 'browser-bbbbbbbbbbbbbbbb.png', 'browser-cccccccccccccccc.png'):
+            (shots/name).write_bytes(b'\x89PNG' + name.encode())
+        (shots/'notes.txt').write_text('Page renders: docs/testing/browser-aaaaaaaaaaaaaaaa.png\n')
+        await s.publish(p, 'testing', [{'path': 'docs/testing/report.md', 'base_version': 0, 'summary': 'Report',
+                                         'content': '# Report\n![ok](browser-bbbbbbbbbbbbbbbb.png)\n'}])
+        await s.publish_artifacts(p, r['id'], job['instance_id'], references='passed')
+        merged = await s.get_request(p, r['id'])
+        assert (workspace/'docs/testing/browser-aaaaaaaaaaaaaaaa.png').is_file()   # cited by a delivered file
+        assert (workspace/'docs/testing/browser-bbbbbbbbbbbbbbbb.png').is_file()   # cited by a published report
+        assert not (workspace/'docs/testing/browser-cccccccccccccccc.png').exists()  # a retake nobody cites
+        assert merged['unmerged_screenshots'] == ['docs/testing/browser-cccccccccccccccc.png']
+        await store.close()
+    run(scenario())
+
+
+def test_identical_browser_screenshots_share_one_file(tmp_path):
+    from app.agents.tools.browser_verify import named_by_content
+    first, second = tmp_path/'browser-1.png', tmp_path/'browser-2.png'
+    first.write_bytes(b'same'); second.write_bytes(b'same')
+    assert named_by_content(first) == named_by_content(second)
+    files = list(tmp_path.iterdir())
+    assert len(files) == 1 and files[0].name.startswith('browser-') and len(files[0].stem) == len('browser-') + 16

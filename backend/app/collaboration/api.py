@@ -66,6 +66,25 @@ async def pause(project_id: str, body: Pause):
         raise HTTPException(404, str(exc)) from exc
 
 
+@router.post('/services/{name}/stop')
+async def stop_service(project_id: str, name: str):
+    """Stop the running process of a registry service (e.g. one kept after its task)."""
+    if _service is None:
+        raise HTTPException(503, 'Collaboration is not initialized')
+    from app.execution.processes import processes
+    try:
+        async with _service.reading() as c:
+            root = (await _service._project(c, project_id))['workspace_path']
+            record = await _service._get(c, 'service', project_id, name, False)
+    except StorageNotFoundError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    job = processes.service_job(root, name=name, port=(record or {}).get('port'))
+    if job is None:
+        raise HTTPException(404, f'Service {name} is not running')
+    await processes.stop(job)
+    return {'stopped': name, 'process_id': job.id}
+
+
 @router.get('/requests/{request_id}/journal', response_class=PlainTextResponse)
 async def export_journal(project_id: str, request_id: str):
     """Export a task's work journal as Markdown, for download on request."""

@@ -1,5 +1,6 @@
-"""Delivery checks flag platform leaks, registry mismatches, misplaced evidence, size
-and unregistered generated files, and reach the reviewer without blocking delivery."""
+"""Delivery checks flag Wdrunge paths and ports, registry mismatches, misplaced evidence,
+size and unregistered generated files, and reach the reviewer without blocking delivery.
+Wording about the platform or the team is left to the prompts."""
 import asyncio
 import json
 from pathlib import Path
@@ -64,10 +65,10 @@ def test_findings_cover_leaks_ports_evidence_size_and_generated_files(tmp_path):
         findings = await delivery_findings(s, p, request, workspace)
         found = kinds(findings)
         assert ('platform_leak', 'backend/app.py', 2) in found        # Wdrunge workspace path
-        assert ('platform_leak', 'backend/app.py', 3) in found        # platform tool name
         assert ('platform_leak', 'backend/app.py', 4) in found        # the platform's own port
-        assert ('platform_leak', 'docs/api-contract.md', 3) in found  # team member
-        assert ('platform_leak', 'docs/api-contract.md', 9) in found  # sandbox note
+        # Wording (tool names, team members, sandbox notes) is not checked.
+        assert not {('platform_leak', 'backend/app.py', 3), ('platform_leak', 'docs/api-contract.md', 3),
+                    ('platform_leak', 'docs/api-contract.md', 9)} & found
         assert ('port_mismatch', 'docs/api-contract.md', 4) in found
         assert not any(f['line'] in {1, 2} and f['kind'] == 'port_mismatch' for f in findings)  # registered port agrees
         assert ('evidence_in_contract', 'docs/api-contract.md', 5) in found
@@ -82,6 +83,26 @@ def test_findings_cover_leaks_ports_evidence_size_and_generated_files(tmp_path):
         await s.register_command(p, 'backend', 'export-openapi', ['python3', 'scripts/export.py', '-o', 'backend/openapi.json'])
         again = await delivery_findings(s, p, request, workspace)
         assert not any(f['kind'] == 'generated_without_command' for f in again)
+        await store.close()
+    asyncio.run(run())
+
+
+def test_lockfiles_are_not_counted_and_platform_wording_is_not_checked(tmp_path):
+    async def run():
+        store, s, p, conv, workspace = await setup(tmp_path)
+        goal = await s.create_goal(p, 'leader', conv, 'Hello world', ['page shows the message'], 'g', scale='small')
+        write(workspace, 'frontend/package-lock.json', '{\n' + '"x": 1,\n' * 1500 + '}')
+        write(workspace, 'frontend/vite.config.js', '\n'.join([
+            "// 服务 web：固定监听 127.0.0.1:8101（不使用保留端口 1420 / 17420）",
+            "// 服务名 api（服务注册表中的名称）",
+            "// 均为注册表 verified 状态",
+            "export default {}"]))
+        request = await s.create_request(p, 'leader', 'frontend', 'Web', 'web', conversation=conv, goal_id=goal['id'],
+                                         acceptance_criteria=['works'], artifacts=['frontend/'])
+        findings = await delivery_findings(s, p, request, workspace)
+        assert not any(f['kind'] == 'oversized' for f in findings)
+        assert not any(f['path'].endswith('package-lock.json') for f in findings)
+        assert not any(f['kind'] == 'platform_leak' for f in findings)
         await store.close()
     asyncio.run(run())
 

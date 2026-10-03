@@ -39,6 +39,12 @@ export default function CollaborationPanel({ project, conversation, onOpen }: { 
     if (!response.ok) throw new Error(typeof body.detail === 'string' ? body.detail : '操作失败');
     return body;
   }
+  async function stopService(name: string) {
+    const response = await fetch(`${url}/services/${encodeURIComponent(name)}/stop`, { method: 'POST' });
+    const body = await response.json();
+    if (!response.ok) throw new Error(typeof body.detail === 'string' ? body.detail : '停止服务失败');
+    return body;
+  }
   async function refresh(signal?: AbortSignal) {
     const response = await fetch(url, { signal });
     if (!response.ok) throw new Error('无法读取协作记录');
@@ -79,7 +85,7 @@ export default function CollaborationPanel({ project, conversation, onOpen }: { 
     {!messages.length && <p className="collaboration-empty">暂无协作记录，成员的 @ 摘要与回复会显示在群聊中。</p>}
     {messages.map(m => <article className="collaboration-request" key={m.id}><strong>{memberName(m.sender)} → {memberName(m.recipient)}</strong><p>{m.summary || '协作消息'}</p><details className="collaboration-details"><summary>查看详细记录</summary><MessageContent message={{ id: m.id, sender: m.sender, content: m.content }} /></details></article>)}
     <details className="collaboration-project-records" onToggle={e => setEnvironmentOpen((e.target as HTMLDetailsElement).open)}><summary>项目环境（端口、地址与命令）</summary>
-      {environmentOpen && <EnvironmentPanel busy={busy} command={command} act={act} />}
+      {environmentOpen && <EnvironmentPanel busy={busy} command={command} stopService={stopService} act={act} />}
     </details>
     <details className="collaboration-project-records"><summary>项目记录与文档维护</summary>
     <h3>已登记文档与修订历史</h3>

@@ -184,7 +184,9 @@ class PlanningMixin:
         if request.get('documents'):
             lines.append(f"Documents to publish with collaboration_publish: {request['documents']}.")
         if request.get('services'):
-            lines.append(f"Services to deliver running and verified (start with execute_command ready_port): {request['services']}.")
+            lines.append(f"Services to deliver running: {request['services']}. Start each with execute_command(background=true, "
+                         "ready_port=<its port>) and deliver while it serves; it is kept running after your task for "
+                         "colleagues and the user (a running copy is replaced only with keep_running=true).")
         if request.get('needs'):
             lines.append(f"This task started when these deliverables became available: {request['needs']}.")
         if request.get('goal_id'):
@@ -196,7 +198,9 @@ class PlanningMixin:
             owner = next((t for t in tasks if t.get('verification') == 'end_to_end' and t['state'] not in {'cancelled', 'rejected'}), None)
             if request.get('verification') == 'end_to_end':
                 lines.append('You own the end-to-end verification of this goal: verify the integrated result against the goal '
-                             'criteria and record evidence. Other tasks only checked their own deliverables.')
+                             'criteria and record evidence. Other tasks only checked their own deliverables. Services marked '
+                             'running in the environment are the delivered ones: verify against them; restart one only if it '
+                             'is stopped or stale.')
             elif owner:
                 lines.append(f"Verify only your own deliverable. End-to-end verification belongs to task {owner['id']} "
                              f"({owner['recipient']}); do not repeat it.")

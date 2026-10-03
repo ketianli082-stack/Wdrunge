@@ -36,6 +36,8 @@ def test_goal_scale_bounds_criteria_and_is_required_from_leader(tmp_path):
         try:
             refused = await execute_collaboration('create_goal', {'objective': 'X', 'criteria': ['x'], 'key': 'g3'})
             assert 'Choose the goal scale' in refused['error']
+            scaled = await execute_collaboration('create_goal', {'objective': 'X', 'criteria': ['x'], 'key': 'g3', 'scale': 'small'})
+            assert scaled['task_criteria_limit'] == 3
         finally:
             active.reset(token)
         token = active.set(Context(s, p, 'leader', conv, 'user'))
@@ -91,7 +93,10 @@ def test_dependents_start_on_a_published_document_or_verified_service(tmp_path):
     asyncio.run(run())
 
 
-def test_delivery_requires_declared_documents_published_and_services_verified(tmp_path):
+def test_delivery_requires_declared_documents_published_and_services_verified(tmp_path, monkeypatch):
+    from app.execution.processes import processes
+    serving = {}
+    monkeypatch.setattr(processes, 'service_job', lambda project, name=None, port=None: serving.get(name))
     async def run():
         store, s, p, conv = await setup(tmp_path)
         r = await s.create_request(p, 'leader', 'backend', 'API', 'api', conversation=conv, documents=['docs/api.md'], services=['api'])
@@ -103,6 +108,10 @@ def test_delivery_requires_declared_documents_published_and_services_verified(tm
             await s.transition(p, r['id'], 'backend', 'review', result='done', expected_instance=job['instance_id'])
         port = (await s.register_service(p, 'backend', 'api'))['port']
         await s.observe_service(p, 'backend', port, 'api', ['python3', 'app.py'], '.')
+        # Verified once is not enough: the declared service must still be serving.
+        with pytest.raises(ValueError, match="service 'api' is not running"):
+            await s.transition(p, r['id'], 'backend', 'review', result='done', expected_instance=job['instance_id'])
+        serving['api'] = object()
         delivered = await s.transition(p, r['id'], 'backend', 'review', result='done', expected_instance=job['instance_id'])
         assert delivered['state'] == 'review'
         await store.close()
@@ -152,5 +161,32 @@ def test_task_tools_accept_typed_deliverables_and_needs(tmp_path):
             assert 'needs=[{document' in serial['error']
         finally:
             active.reset(token)
+        await store.close()
+    asyncio.run(run())
+
+
+def test_leader_prompt_states_the_criteria_limits_it_is_held_to():
+    from pathlib import Path
+    from app.collaboration.planning import CRITERIA_LIMITS
+    text = ' '.join((Path(__file__).parents[1] / 'app/agents/prompts/modules/leader.md').read_text().split())
+    goal = '/'.join(str(CRITERIA_LIMITS[s]['goal']) for s in ('small', 'medium', 'large'))
+    task = '/'.join(str(CRITERIA_LIMITS[s]['task']) for s in ('small', 'medium', 'large'))
+    assert f'at most {goal} goal criteria and {task} per task' in text
+
+
+def test_a_service_has_one_delivering_task_per_goal(tmp_path):
+    async def run():
+        store, s, p, conv = await setup(tmp_path)
+        goal = await s.create_goal(p, 'leader', conv, 'Hello world', ['page shows API message'], 'g', scale='small')
+        task = dict(conversation=conv, goal_id=goal['id'], acceptance_criteria=['works'])
+        backend = await s.create_request(p, 'leader', 'backend', 'API and page', 'web', services=['web'], **task)
+        assert await s.create_request(p, 'leader', 'backend', 'API and page', 'web', services=['web'], **task) == backend
+        with pytest.raises(ValueError, match=r"already delivered by task leader:web.*needs=\[\{service: 'web'\}\]"):
+            await s.create_request(p, 'leader', 'testing', 'Verify', 'verify', services=['web'], **task)
+        await s.create_request(p, 'leader', 'testing', 'Verify', 'verify', needs=[{'service': 'web'}], **task)
+        # Another goal may deliver its own service under the same name.
+        other = await s.create_goal(p, 'leader', conv, 'Rework', ['page still works'], 'g2', scale='small')
+        await s.create_request(p, 'leader', 'frontend', 'Page', 'page', services=['web'], conversation=conv,
+                               goal_id=other['id'], acceptance_criteria=['works'])
         await store.close()
     asyncio.run(run())

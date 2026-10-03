@@ -3,6 +3,7 @@ import asyncio
 from pathlib import Path
 import platform
 import re
+import shutil
 from typing import Annotated, Literal
 from pydantic import Field
 
@@ -10,7 +11,7 @@ from app.agents.tools.validation import tool, ToolFailure, failure_result, comma
 from app.agents.tools._workspace import resolve_allowed
 from app.execution.processes import processes, port_open
 from app.execution.permissions import connection_texts, network_targets, argv_ports, LOG_PORT_PATTERN
-from app.execution.sandbox import capability
+from app.execution.sandbox import capability, host_path
 from app.execution.environment import inspect_environment
 
 
@@ -66,6 +67,29 @@ async def served_ports(job, declared, ready_port):
     return ports
 
 
+async def registry_service(name, port):
+    """The registry service a start command targets: by name, else by port."""
+    from app.collaboration.tools import active
+    ctx = active.get()
+    if not ctx:
+        return None
+    try:
+        services = (await ctx.service.environment(ctx.project, discover_manifests=False))['services']
+    except Exception:
+        return None
+    return (next((s for s in services if s['name'] == name), None)
+            or next((s for s in services if port and s.get('port') == port), None))
+
+
+def tag_job(job, service):
+    from app.collaboration.tools import active
+    ctx = active.get()
+    if service:
+        job.service = service['name']
+    if ctx:
+        job.started_by, job.request, job.conversation = ctx.member, ctx.request, ctx.conversation or None
+
+
 async def register_observed(job, ports):
     """Record verified project services in the environment registry."""
     from app.collaboration.tools import active
@@ -95,23 +119,49 @@ async def execute_command(command: str, arguments: list[str], cwd: str = '.',
                           background: bool = False, name: str = 'command',
                           network: bool | None = None, reason: str = '',
                           ok_exit_codes: Annotated[list[int] | None, Field(max_length=10)] = None,
-                          ready_port: Annotated[int | None, Field(ge=1, le=65535)] = None) -> dict:
+                          ready_port: Annotated[int | None, Field(ge=1, le=65535)] = None,
+                          keep_running: bool = False) -> dict:
     """Run an executable with arguments (string array) in cwd; no shell. Foreground
     returns exit code and output (timeout default 120 s, max 600). background=true
     starts a service (lifetime up to 1800 s) and returns a process ID; ready_port
-    waits for its port. network: omitted = automatic for services and loopback-only
-    URLs. ok_exit_codes lists expected non-zero exits. Reviewed and sandboxed.
+    waits for its port. keep_running=true keeps it running after delivery and replaces
+    a running copy. network: omitted = automatic for services and loopback-only URLs.
+    ok_exit_codes lists expected non-zero exits. Reviewed and sandboxed.
     """
     if not background and timeout is not None and timeout > 600:
         raise ValueError('Foreground timeout cannot exceed 600 seconds; use background=true for longer commands')
     if ready_port is not None and not background:
         raise ValueError('ready_port applies to background=true services')
+    if keep_running and not background:
+        raise ValueError('keep_running applies to background=true services')
     argv = [command, *arguments]
     if network is None:
         network = automatic_network(argv, background)
     timeout = timeout or (1800 if background else 120)
-    expected = tuple(ok_exit_codes) if ok_exit_codes else (0,)
+    # Expected non-zero exits are added to success, never replace it: a probe that
+    # may exit 7 (closed port) also succeeds when the port answers.
+    expected = (0, *(code for code in ok_exit_codes or () if code != 0))
     if background:
+        target = await registry_service(name, ready_port)
+        current = processes.service_job(None, name=target and target['name'], port=ready_port)
+        replaced = None
+        if current is not None and keep_running:
+            # Restarting a service (e.g. after changing its code) replaces the running one.
+            await processes.stop(current)
+            replaced = current.id
+            for _ in range(20):
+                if ready_port is None or not await port_open(ready_port, timeout=.2):
+                    break
+                await asyncio.sleep(.25)
+        elif current is not None:
+            label = current.service or current.name
+            raise ToolFailure(f'Service {label} is already running (process {current.id}, started by '
+                              f'{current.started_by or "another task"}'
+                              + (', kept after its task' if current.keep else '') + ').',
+                              'service_unavailable', 'service_already_running',
+                              f'Use the running service as it is. If you changed its code, restart it with '
+                              f'keep_running=true (that replaces it), or stop it with manage_process(action="stop", '
+                              f'process_id="{label}") first.', 'after_state_change')
         if ready_port is not None and await port_open(ready_port):
             raise ToolFailure(f'Port {ready_port} already accepts connections before this command started; '
                               'another program (or an earlier process of yours) holds it.',
@@ -120,7 +170,8 @@ async def execute_command(command: str, arguments: list[str], cwd: str = '.',
                               'and tell dependent tasks the new endpoint. Do not terminate unowned services.',
                               'after_state_change')
         declared = {port for port in argv_ports(argv) if not await port_open(port, timeout=.2)}
-        job = await processes.start(argv, cwd, timeout, name, network, reason)
+        job = await processes.start(argv, cwd, timeout, name, network, reason, keep=keep_running)
+        tag_job(job, target)
         if ready_port is not None:
             ready = await processes.wait_ready(job, ready_port, min(60, timeout))
         else:
@@ -139,6 +190,14 @@ async def execute_command(command: str, arguments: list[str], cwd: str = '.',
             registered = await register_observed(job, served)
             if registered:
                 result['registered_services'] = registered
+                job.service = job.service or registered[0]['name']
+        if replaced:
+            result['replaced_process'] = replaced
+        if keep_running and job.process.returncode is None:
+            result['kept'] = True
+            if not job.service:
+                result['warning'] = ('Kept, but it serves no registered service yet; register its port with '
+                                     'collaboration_register_service so colleagues can find it.')
         if ready is not None:
             result['ready'] = ready
             if not ready:
@@ -161,36 +220,88 @@ async def execute_command(command: str, arguments: list[str], cwd: str = '.',
 async def manage_process(action: Literal['list', 'status', 'logs', 'stop'], process_id: str = '',
                          offset: Annotated[int, Field(ge=0)] = 0,
                          limit: Annotated[int, Field(ge=1, le=30000)] = 10000) -> dict:
-    """Manage only this task workspace's processes. process_id accepts the process ID
-    or the name given at start (the newest such process). Log offsets count bytes and
-    are returned as next_offset. truncated=true means older log bytes were evicted.
+    """Manage this task's processes and the project's running services. process_id
+    accepts the process ID, start name or service name (newest first). Log offsets count
+    bytes (next_offset); truncated=true means older bytes were evicted.
     """
     if action == 'list':
-        return {'processes': [{**job.snapshot(), 'ports': sorted(job.ports)} for job in processes.owned_jobs()]}
-    job = processes.owned(process_id)
+        # Finished one-off commands (ls, curl, ...) are only counted: their output was
+        # already returned, and listing them all buries the services.
+        listed, finished = [], 0
+        owned = processes.owned_jobs()
+        for job in owned:
+            snapshot = job.snapshot()
+            if snapshot['state'] == 'running' or job.name != 'command':
+                listed.append({**snapshot, 'ports': sorted(job.ports), **({'service': job.service} if job.service else {})})
+            else:
+                finished += 1
+        shared = [{**job.snapshot(), 'ports': sorted(job.ports), 'service': job.service, 'started_by': job.started_by}
+                  for job in processes.project_services() if job not in owned]
+        return {'processes': listed, 'finished_commands': finished, **({'project_services': shared} if shared else {})}
+    job = project_process(process_id)
     if action == 'stop':
         return await processes.stop(job)
     return {**job.snapshot(), **(processes.logs(job, offset, limit) if action == 'logs' else {})}
 
 
+def project_process(identifier):
+    """An owned process, else a running project service by ID, service or process name."""
+    try:
+        return processes.owned(identifier)
+    except ValueError:
+        job = next((job for job in processes.project_services()
+                    if identifier in {job.id, job.service, job.name}), None)
+        if job is None:
+            raise
+        return job
+
+
+HOST_EXECUTABLES = ('python3', 'node', 'npm', 'uv')
 HOST_NOTES = {
     'Darwin': {'os': 'macOS', 'userland': 'BSD', 'notes': [
         'lsof -nP -iTCP:<port> -sTCP:LISTEN lists listeners; exit code 1 means none',
         'ls -lT shows full timestamps; GNU options such as --time-style are unsupported',
         'sed -i needs a suffix argument: sed -i "" ...',
-        'localhost may resolve to ::1 before 127.0.0.1']},
+        'localhost may resolve to ::1 before 127.0.0.1',
+        '/usr/bin/python3 is an Xcode shim the sandbox blocks; run python3 from PATH (host.executables)',
+        '/tmp is not writable; $TMPDIR is private to one command and deleted when it ends, '
+        'so files a later call needs belong in the workspace']},
     'Linux': {'os': 'Linux', 'userland': 'GNU', 'notes': [
-        'ss -ltnp lists listening TCP sockets', 'lsof may not be installed']},
+        'ss -ltnp lists listening TCP sockets', 'lsof may not be installed',
+        '/tmp and $TMPDIR are private to one command and discarded when it ends, '
+        'so files a later call needs belong in the workspace']},
 }
 
 
 @tool
-def detect_environment(cwd: str = '.') -> dict:
-    """Manifests, package manager, scripts, virtual environment, sandbox and host
-    command conventions (BSD/GNU) for a directory."""
+async def detect_environment(cwd: str = '.') -> dict:
+    """Manifests, package manager, scripts, virtual environment, sandbox, host command
+    conventions (BSD/GNU) and project services with their live runtime state."""
     system = platform.system()
-    return {**inspect_environment(resolve_allowed(cwd, ('.',))), 'sandbox': capability(),
-            'host': HOST_NOTES.get(system, {'os': system, 'notes': []})}
+    # An empty project has no manifests; name the interpreters commands will actually run
+    # so the model does not probe for them one call at a time.
+    executables = {name: shutil.which(name, path=host_path()) for name in HOST_EXECUTABLES}
+    result = {**inspect_environment(resolve_allowed(cwd, ('.',))), 'sandbox': capability(),
+              'host': {**HOST_NOTES.get(system, {'os': system, 'notes': []}),
+                       'executables': {name: path for name, path in executables.items() if path}}}
+    services = await project_services_view()
+    return {**result, 'services': services} if services else result
+
+
+async def project_services_view() -> list[dict]:
+    from app.collaboration.tools import active
+    from app.collaboration.environment import service_url
+    ctx = active.get()
+    if not ctx:
+        return []
+    try:
+        services = (await ctx.service.environment(ctx.project, discover_manifests=False))['services']
+    except Exception:
+        return []
+    return [{key: value for key, value in {
+        'name': s['name'], 'url': service_url(s), 'status': s.get('status'), 'runtime': s['runtime'],
+        'start': ' '.join(s['command']['argv']) if s.get('command') else None,
+        'cwd': (s.get('command') or {}).get('cwd')}.items() if value} for s in services[:20]]
 
 
 development_tools = (execute_command, manage_process, detect_environment)

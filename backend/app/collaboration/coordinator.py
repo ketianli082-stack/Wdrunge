@@ -1,5 +1,6 @@
 """Event-driven Leader turns and context-free, three-minute progress checks."""
 import asyncio
+from contextlib import aclosing
 import json
 import logging
 import time
@@ -64,22 +65,26 @@ class LeaderCoordinator:
         reply_id, reply = uuid4().hex, ''
         try:
             history = [HumanMessage(content=m['content']) if m['role']=='user' else AIMessage(content=m['content']) for m in await store.model_history(conversation)]
-            async for event, data in self.team.stream(history, conversation_id=conversation, workspace_path=Path(workspace), wake_only=True):
-                if event == 'activity':
-                    await store.upsert_activity(conversation, data)
-                elif event == 'chat_message':
-                    await store.add_chat_message(conversation, data)
-                elif event == 'read_receipt':
-                    await store.add_receipt(conversation, data)
-                elif event == 'message_reaction':
-                    await store.add_reaction(conversation, data)
-                elif event == 'delta':
-                    if not reply:
-                        await store.start_assistant_message(conversation, reply_id, data['content'])
-                    reply += data.get('content', '')
-                    await store.update_assistant_message(reply_id, reply, 'completed')
-                    await self.team.acknowledge_leader(conversation)
-                    await store.add_event(conversation, 'assistant_completed', {'id': reply_id, 'content_length': len(reply)})
+            # aclosing: a cancelled wake closes the Leader stream in this task and context;
+            # otherwise its cleanup would run later from the garbage collector.
+            async with aclosing(self.team.stream(history, conversation_id=conversation, workspace_path=Path(workspace),
+                                                 wake_only=True)) as events:
+                async for event, data in events:
+                    if event == 'activity':
+                        await store.upsert_activity(conversation, data)
+                    elif event == 'chat_message':
+                        await store.add_chat_message(conversation, data)
+                    elif event == 'read_receipt':
+                        await store.add_receipt(conversation, data)
+                    elif event == 'message_reaction':
+                        await store.add_reaction(conversation, data)
+                    elif event == 'delta':
+                        if not reply:
+                            await store.start_assistant_message(conversation, reply_id, data['content'])
+                        reply += data.get('content', '')
+                        await store.update_assistant_message(reply_id, reply, 'completed')
+                        await self.team.acknowledge_leader(conversation)
+                        await store.add_event(conversation, 'assistant_completed', {'id': reply_id, 'content_length': len(reply)})
             if reply:
                 await self.service.leader_session(project, conversation, failures=0, retry_after=0)
         except asyncio.CancelledError:

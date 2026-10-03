@@ -15,6 +15,6 @@ semantically independent sections; only Leader recovers an interrupted publicati
 Each document has one job. Interface contract: base URL by service name and resolved
 address, paths, fields, one example per case, errors, auth, compatibility. README:
 what the project is, how to install, start (registry commands) and use it. Test or
-verification report: checks, expected, actual, verdict, evidence paths. No test
-transcripts, team process or platform notes in contracts or READMEs. Keep length
-proportional to the goal scale.
+verification report: checks, expected, actual, verdict, evidence paths. No team
+process or platform notes in any deliverable; no test transcripts in contracts or
+READMEs. Keep length proportional to the goal scale.

@@ -504,6 +504,11 @@ async def _stop_conversation(conversation_id, service, project):
     if _collaboration_scheduler:
         pending.append(_collaboration_scheduler.cancel_conversation(project, conversation_id))
     await asyncio.gather(*pending)
+    # Stopping a conversation also ends the services its tasks kept running.
+    from app.execution.processes import processes
+    async with service.reading() as c:
+        root = (await service._project(c, project))['workspace_path']
+    await processes.close_services(root, conversation_id)
     await service.finish_conversation_stop(project, conversation_id, generation)
     return await service.conversation_execution(project, conversation_id)
 

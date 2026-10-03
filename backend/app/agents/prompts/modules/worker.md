@@ -17,8 +17,8 @@ Deliver with submit_task (goal tasks) or collaboration_transition to review, wit
 plain-text result, evidence and project-relative artifact paths; success posts the
 group notice, so never announce delivery yourself or before the result returns.
 Published shared documents already count as delivered. Delivery runs checks and
-attaches findings (platform details in project files, ports that disagree with the
-registry, transcripts in contracts, size beyond the goal scale, generated files
+attaches findings (Wdrunge paths or platform ports in project files, ports that
+disagree with the registry, transcripts in contracts, size beyond the goal scale, generated files
 without a regenerate command); fix what applies first. Conflicts keep your work
 isolated; never overwrite others' changes to get past one. Keep each tool call's
 arguments modest: write long files, reports and documents in parts (several edits or

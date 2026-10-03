@@ -20,8 +20,8 @@ from sqlalchemy import text
 from app.collaboration.documents import digest, outline, section, edit_document, page
 from app.collaboration.schema import DDL
 from app.collaboration.payloads import TransitionPayload
-from app.collaboration.workspaces import merge_text, IsolatedWorkspace
-from app.storage import ChatStore, StorageConflictError, StorageNotFoundError
+from app.collaboration.workspaces import merge_text, IsolatedWorkspace, unreferenced_screenshots
+from app.storage import ChatStore, StorageConflictError, StorageNotFoundError, write_transaction
 
 ROLES = {'leader', 'product', 'backend', 'frontend', 'designer', 'testing'}
 TERMINAL = {'completed', 'cancelled', 'rejected', 'failed'}
@@ -65,14 +65,9 @@ class Collaboration(GoalMixin, ConversationRuns, EnvironmentMixin, JournalMixin,
     async def transaction(self):
         await self.initialize()
         async with self._lock:
-            async with self.store.engine.connect() as c:
-                await c.exec_driver_sql('BEGIN IMMEDIATE')
-                try:
-                    yield c
-                    await c.commit()
-                except BaseException:
-                    await c.rollback()
-                    raise
+            # Cancel-safe: a stopped task never leaves the write lock held (storage.complete).
+            async with write_transaction(self.store.engine, 'BEGIN IMMEDIATE') as c:
+                yield c
 
     @asynccontextmanager
     async def reading(self):
@@ -164,7 +159,8 @@ class Collaboration(GoalMixin, ConversationRuns, EnvironmentMixin, JournalMixin,
             for change in changes:
                 identifier = change.get('document_id') or uuid4().hex
                 if identifier in seen:
-                    raise ValueError('Only one change per document in a batch')
+                    raise ValueError(f'Several changes target document {identifier}; put all its edits in one change '
+                                     '(edits apply in order) with a single base_version')
                 seen.add(identifier)
                 current = await self._get(c, 'document', project, identifier, False)
                 version = current['version'] if current else 0
@@ -489,6 +485,14 @@ class Collaboration(GoalMixin, ConversationRuns, EnvironmentMixin, JournalMixin,
                         r.get('goal_id') == goal_id and r.get('verification') == 'end_to_end' and r['state'] not in {'cancelled', 'rejected'}
                         and r['id'] != f'{sender}:{key}' for r in await self._list(c, 'request', project)):
                     raise ValueError('This goal already has an end-to-end verification task; give each check one owner')
+                # A service has one delivering task; others depend on it through needs.
+                for other in await self._list(c, 'request', project):
+                    shared = set(spec.get('services', [])) & set(other.get('services') or [])
+                    if (shared and other.get('goal_id') == goal_id and other['id'] != identifier
+                            and other['state'] not in {'cancelled', 'rejected'}):
+                        name = sorted(shared)[0]
+                        raise ValueError(f"Service {name} is already delivered by task {other['id']}; declare services only on "
+                                         f"the delivering task and use needs=[{{service: '{name}'}}] in tasks that use it")
                 for dep in spec['dependencies']:
                     if (await self._get(c, 'request', project, dep)).get('goal_id') != goal_id:
                         raise ValueError('Task dependencies must belong to the same goal')
@@ -633,12 +637,20 @@ class Collaboration(GoalMixin, ConversationRuns, EnvironmentMixin, JournalMixin,
         if unfilled:
             raise ValueError(f'Declared documents are still the platform drafts: {unfilled}. Fill their sections with '
                              'collaboration_publish edits before delivering.')
+        from app.execution.processes import processes
+        root = (await self._project(c, project))['workspace_path'] if r.get('services') else None
         for name in r.get('services', []):
             record = await self._get(c, 'service', project, name, False)
             if not record or record.get('status') != 'verified':
                 raise ValueError(f'Declared service {name!r} is not verified. Register it with collaboration_register_service '
                                  'and start it with execute_command(background=true, ready_port=<its port>) so the platform '
                                  'observes it serving before delivering.')
+            # Declared services are delivered running (and kept after the task); a past
+            # verification of a process that has since stopped does not count.
+            if not processes.service_job(root, name=name, port=record.get('port')):
+                raise ValueError(f'Declared service {name!r} is not running. Start it with execute_command(background=true, '
+                                 f'ready_port={record.get("port")}) and deliver while it serves; it stays running after '
+                                 'your task for colleagues and the user.')
 
     async def set_findings(self, project, identifier, findings):
         async with self.transaction() as c:
@@ -964,7 +976,9 @@ class Collaboration(GoalMixin, ConversationRuns, EnvironmentMixin, JournalMixin,
             await asyncio.to_thread(workspace.refresh)
             return workspace
 
-    async def publish_artifacts(self, project, identifier, instance_id):
+    async def publish_artifacts(self, project, identifier, instance_id, references=''):
+        """Merge the task snapshot into the project. `references` is the delivery text
+        (result, evidence, artifact paths) used to keep only screenshots it cites."""
         async with self.transaction() as c:
             r = await self._get(c, 'request', project, identifier)
             if r.get('instance_id') != instance_id or r['state'] not in {'running', 'review'} or r.get('lease_until',0) <= time.time():
@@ -986,10 +1000,22 @@ class Collaboration(GoalMixin, ConversationRuns, EnvironmentMixin, JournalMixin,
             await asyncio.to_thread(workspace.recover_merge)
             # Finish an interrupted merge before considering a new plan.
             changes = await asyncio.to_thread(workspace.plan, managed)
+            documents = [Path(p['workspace_path'], path).read_text(errors='replace') for path in managed
+                         if Path(p['workspace_path'], path).is_file()]
+            skipped = unreferenced_screenshots(changes, workspace.source, '\n'.join(
+                [references, r.get('result') or '', json.dumps(r.get('evidence') or [], ensure_ascii=False), *r['artifacts'], *documents]))
+            changes = [item for item in changes if item['path'] not in skipped]
             await asyncio.to_thread(workspace.publish, changes)
             r['workspace_published'] = True
             r['merged_paths'] = [item['path'] for item in changes]
+            if skipped:
+                r['unmerged_screenshots'] = skipped
             await self._put(c, 'request', project, identifier, r)
+        if r['merged_paths']:
+            # Kept services serving the project restart to load the merged files; those
+            # still running in another task's snapshot are flagged stale.
+            from app.execution.processes import processes
+            processes.refresh_after_publish(p['workspace_path'], workspace.work.resolve(), r['merged_paths'])
 
     async def sync_published(self, project, identifier, paths):
         """Make documents this request just published visible in its snapshot."""

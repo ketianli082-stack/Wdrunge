@@ -2,17 +2,26 @@ import { useEffect, useState } from 'react';
 
 type Service = {
   name: string; kind: string; port?: number; host?: string; base_url?: string; status?: string; source?: string;
-  claimed?: boolean; owner?: string; note?: string; command?: { argv: string[]; cwd: string };
+  claimed?: boolean; owner?: string; note?: string; command?: { argv: string[]; cwd: string }; runtime?: Runtime;
 };
+type Runtime = { state: 'running' | 'listening' | 'stopped'; process_id?: string; kept?: boolean; started_by?: string; stale?: string[]; note?: string };
 type ProjectCommand = { name: string; argv: string[]; cwd: string; status: string; purpose?: string };
 type Environment = { host: { os: string; userland: string }; reserved_ports: number[]; services: Service[]; commands: ProjectCommand[] };
 
 const statusLabel: Record<string, string> = { verified: '已验证', declared: '已登记' };
 const sourceLabel: Record<string, string> = { user: '用户', agent: '成员', manifest: '项目配置', observed: '运行观察' };
 
-export default function EnvironmentPanel({ busy, command, act }: {
+function runtimeLabel(runtime?: Runtime) {
+  if (!runtime || runtime.state === 'stopped') return '未运行';
+  if (runtime.state === 'listening') return '端口有响应（非团队启动）';
+  return `运行中${runtime.started_by ? `（${runtime.started_by} 启动${runtime.kept ? '，任务结束后保留' : ''}）` : ''}`
+    + (runtime.stale?.length ? ` · 代码已更新，需重启：${runtime.stale.slice(0, 3).join('、')}` : '');
+}
+
+export default function EnvironmentPanel({ busy, command, stopService, act }: {
   busy: boolean;
   command: (action: string, payload: object) => Promise<any>;
+  stopService: (name: string) => Promise<any>;
   act: (fn: () => Promise<void>) => Promise<void>;
 }) {
   const [data, setData] = useState<Environment | null>(null);
@@ -40,14 +49,18 @@ export default function EnvironmentPanel({ busy, command, act }: {
       <p className="collaboration-empty">主机：{data.host.os}（{data.host.userland}）· 平台保留端口：{data.reserved_ports.join(', ') || '尚未检测'}</p>
       {!data.services.length && <p className="collaboration-empty">尚未登记服务。</p>}
       {data.services.map(s => <article className="collaboration-request" key={s.name}>
-        <div><strong>{s.name}</strong><span>{statusLabel[s.status || ''] || s.status}{s.claimed ? '' : ' · 端口未确认归属'}</span></div>
+        <div><strong>{s.name}</strong><span>{runtimeLabel(s.runtime)} · {statusLabel[s.status || ''] || s.status}{s.claimed ? '' : ' · 端口未确认归属'}</span></div>
         <p>{s.base_url || (s.port ? `${s.kind === 'http' ? 'http://' : ''}${s.host || '127.0.0.1'}:${s.port}` : '未分配端口')}
           <small> · 来源：{sourceLabel[s.source || ''] || s.source}{s.owner ? ` · ${s.owner}` : ''}</small></p>
         {s.command && <p><code>{s.command.argv.join(' ')}</code><small> （目录 {s.command.cwd}）</small></p>}
         {s.note && <small>{s.note}</small>}
-        <div className="collaboration-controls"><button disabled={busy} onClick={() => void act(async () => {
-          await command('register_service', { name: s.name, remove: true }); await load();
-        })}>移除</button></div>
+        <div className="collaboration-controls">
+          {s.runtime?.state === 'running' && <button disabled={busy} onClick={() => void act(async () => {
+            await stopService(s.name); await load();
+          })}>停止</button>}
+          <button disabled={busy} onClick={() => void act(async () => {
+            await command('register_service', { name: s.name, remove: true }); await load();
+          })}>移除</button></div>
       </article>)}
       {data.commands.length > 0 && <><h3>项目命令</h3>{data.commands.map(c => <p key={c.name}>
         <strong>{c.name}</strong> <code>{c.argv.join(' ')}</code><small> （目录 {c.cwd} · {statusLabel[c.status] || c.status}）</small></p>)}</>}

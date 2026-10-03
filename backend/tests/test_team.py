@@ -266,8 +266,8 @@ def test_worker_reports_model_usage_after_loop(monkeypatch):
 
     class FakeGraph:
         async def astream_events(self, _state, *, config, version):
-            yield {"event": "on_chat_model_end", "name": "model", "metadata": {"langgraph_node": "agent"},
-                   "data": {"output": AIMessage(content="done", usage_metadata={"input_tokens": 40, "output_tokens": 5, "total_tokens": 45})}}
+            yield {"event": "on_chain_end", "name": "agent", "metadata": {"langgraph_node": "agent"},
+                   "data": {"output": {"messages": [AIMessage(content="done", usage_metadata={"input_tokens": 40, "output_tokens": 5, "total_tokens": 45})]}}}
 
     monkeypatch.setattr(worker, "build_graph", lambda: FakeGraph())
 
@@ -279,6 +279,43 @@ def test_worker_reports_model_usage_after_loop(monkeypatch):
     assert worker.context_tokens == 40
 
 
+def test_worker_records_latency_annotated_after_the_model_call(monkeypatch):
+    worker = WorkerAgent(AgentSpec(id="backend", name="后端", prompt_file="backend.md"))
+    records = []
+
+    class Store:
+        async def record_agent_usage(self, agent, tokens, context, cached, **details):
+            records.append((agent, tokens, details.get("latency_ms"), details.get("retries")))
+
+        async def save_agent_session(self, *args):
+            pass
+
+        async def delete_agent_session(self, *args):
+            pass
+
+    worker._store = Store()
+    response = AIMessage(content="done", usage_metadata={"input_tokens": 40, "output_tokens": 5, "total_tokens": 45})
+
+    class FakeGraph:
+        async def astream_events(self, _state, *, config, version):
+            # The model's own end event fires before the retry wrapper annotates latency.
+            yield {"event": "on_chat_model_end", "name": "model", "metadata": {"langgraph_node": "agent"},
+                   "data": {"output": response}}
+            response.response_metadata.update(wdrunge_latency_ms=850, wdrunge_retries=1)
+            yield {"event": "on_chain_end", "name": "agent", "metadata": {"langgraph_node": "agent"},
+                   "data": {"output": {"messages": [response]}}}
+            yield {"event": "on_chain_end", "name": "agent", "metadata": {"langgraph_node": "agent"},
+                   "data": {"output": {"needs_clean": True}}}
+
+    monkeypatch.setattr(worker, "build_graph", lambda: FakeGraph())
+
+    async def collect():
+        return [event async for event in worker.stream("task", conversation_id="chat-1", context_mode="fresh", handoff="Goal")]
+
+    asyncio.run(collect())
+    assert records == [("backend", 45, 850, 1)]
+
+
 def test_worker_context_modes_keep_sessions_isolated(monkeypatch):
     worker = WorkerAgent(AgentSpec(id="product", name="产品", prompt_file="product.md"))
     calls = []
@@ -286,8 +323,8 @@ def test_worker_context_modes_keep_sessions_isolated(monkeypatch):
     class FakeGraph:
         async def astream_events(self, state, *, config, version):
             calls.append((state["messages"], config["configurable"]["thread_id"]))
-            yield {"event": "on_chat_model_end", "name": "model", "metadata": {"langgraph_node": "agent"},
-                   "data": {"output": AIMessage(content="done", usage_metadata={"input_tokens": 100, "output_tokens": 5, "total_tokens": 105})}}
+            yield {"event": "on_chain_end", "name": "agent", "metadata": {"langgraph_node": "agent"},
+                   "data": {"output": {"messages": [AIMessage(content="done", usage_metadata={"input_tokens": 100, "output_tokens": 5, "total_tokens": 105})]}}}
 
     monkeypatch.setattr(worker, "build_graph", lambda: FakeGraph())
 

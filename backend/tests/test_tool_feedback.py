@@ -11,6 +11,7 @@ from app.agents.base import AgentSpec
 from app.agents.worker import WorkerAgent
 from app.agents.tools._workspace import active_workspace
 from app.agents.tools.validation import command_failure, exception_result, tool_error
+from app.storage import StorageConflictError
 from app.agents.tools.write_project_file import make_write_project_file
 
 
@@ -88,6 +89,7 @@ def test_nested_missing_field_reports_its_structure_without_input_contents(tmp_p
     (TimeoutError('Service timed out'), 'service_unavailable', 'after_service_ready'),
     (PermissionError('User denied access'), 'permission_denied', 'after_permission'),
     (TypeError("object ServerWebSocketRoute can't be used in await expression"), 'internal_error', 'do_not_retry_unchanged'),
+    (StorageConflictError('Dependency changed: doc is v3'), 'operation_rejected', 'after_state_change'),
 ])
 def test_runtime_errors_do_not_tell_model_to_fix_valid_argument_types(error, category, policy):
     result = exception_result(error)

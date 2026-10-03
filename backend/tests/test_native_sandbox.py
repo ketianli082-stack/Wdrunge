@@ -135,7 +135,8 @@ def test_command_tool_graph_foreground_and_background(tmp_path, monkeypatch):
                 jobs.append(await call('execute_command',{'command':sys.executable,'arguments':['-u','-c','import time;print("ready");time.sleep(30)'],'background':True,'name':name,'timeout':40}))
                 assert jobs[-1]['name'] == name
             assert len({job['id'] for job in jobs})==2
-            assert len((await call('manage_process',{'action':'list'}))['processes'])==3
+            listed=await call('manage_process',{'action':'list'})
+            assert len(listed['processes'])==2 and listed['finished_commands']==1
             for job in jobs:
                 assert (await call('manage_process',{'action':'status','process_id':job['id']}))['state']=='running'
                 assert (await call('manage_process',{'action':'stop','process_id':job['id']}))['state']=='exited'
@@ -226,3 +227,79 @@ def test_native_browser_forwards_allowed_websocket_and_blocks_other_origins(tmp_
         server.shutdown()
         server.server_close()
         thread.join()
+
+
+SERVER_THAT_CRASHES = '''
+import asyncio, os, sys
+from types import SimpleNamespace
+from pathlib import Path
+from app.execution import permissions
+from app.execution.processes import processes
+from app.agents.tools._workspace import active_workspace, source_workspace
+
+class Approve:
+    store = SimpleNamespace(sqlite_path=None)
+    async def authorize(self, *args, **kwargs):
+        pass
+
+async def main():
+    permissions.current = Approve()
+    root = Path(sys.argv[1])
+    active_workspace.set(root); source_workspace.set(root)
+    job = await processes.start([sys.executable, '-c', 'import os, time; print(os.getpid(), flush=True); time.sleep(60)'],
+                                '.', 120, 'svc', keep=True)
+    while not b''.join(job.logs).strip():
+        await asyncio.sleep(.05)
+    print(b''.join(job.logs).decode().strip(), flush=True)
+    os._exit(1)  # crash: no shutdown hook, no cleanup
+
+asyncio.run(main())
+'''
+
+
+def test_commands_die_with_a_crashed_backend(tmp_path):
+    """A kept service must not outlive the backend that started it, even after SIGKILL-like exits."""
+    import subprocess, time
+    if not sandbox.capability()['available']:
+        pytest.skip('Native sandbox backend not installed')
+    root = tmp_path / 'project'
+    root.mkdir()
+    backend = Path(__file__).resolve().parents[1]
+    crashed = subprocess.run([sys.executable, '-c', SERVER_THAT_CRASHES, str(root)], cwd=backend, capture_output=True,
+                             text=True, timeout=60, env={**os.environ, 'PYTHONPATH': str(backend)})
+    pid = int(crashed.stdout.split()[-1])
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            break
+        time.sleep(.05)
+    else:
+        os.kill(pid, 9)
+        pytest.fail(f'command {pid} kept running after its backend exited')
+
+
+def test_supervised_commands_report_their_own_exit_status(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from app.execution import permissions
+    from app.execution.processes import processes
+    from app.agents.tools._workspace import active_workspace, source_workspace
+    if not sandbox.capability()['available']:
+        pytest.skip('Native sandbox backend not installed')
+    class Approve:
+        store = SimpleNamespace(sqlite_path=None)
+        async def authorize(self, *args, **kwargs):
+            pass
+    monkeypatch.setattr(permissions, 'current', Approve())
+    monkeypatch.setattr(processes, 'jobs', {})
+    async def run():
+        tokens = active_workspace.set(tmp_path), source_workspace.set(tmp_path)
+        try:
+            exited = await processes.run([sys.executable, '-c', 'raise SystemExit(3)'], '.', 30)
+            killed = await processes.run([sys.executable, '-c', 'import os, signal; os.kill(os.getpid(), signal.SIGTERM)'], '.', 30)
+            return exited['exit_code'], killed['exit_code']
+        finally:
+            await processes.close()
+            source_workspace.reset(tokens[1]); active_workspace.reset(tokens[0])
+    assert asyncio.run(run()) == (3, -15)

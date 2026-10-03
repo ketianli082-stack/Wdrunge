@@ -345,3 +345,20 @@ def test_leader_tool_calls_are_persisted_once_with_arguments_and_errors(tmp_path
         assert json.loads(rows[0]['arguments'])['goal_id'] == 'missing' and 'error' in rows[0]['result']
         await store.close()
     asyncio.run(scenario())
+
+
+def test_using_a_core_tool_keeps_the_tool_list_stable():
+    """A changed tool list invalidates the prompt cache from the start, so using a tool
+    the role always sees must not load the rest of its group."""
+    from types import SimpleNamespace
+    from app.agents.tool_profiles import GROUPS, select_tools
+    tools = [SimpleNamespace(name=name) for name in sorted({n for g in GROUPS.values() for n in g} | {'enable_tools'})]
+    call = lambda name: AIMessage(content='', tool_calls=[{'id': name, 'name': name, 'args': {}}])
+    names = lambda role, *used: [t.name for t in select_tools(role, tools, [call(n) for n in used], {'goal_id': 'g'})]
+    assert names('leader', 'create_task') == names('leader', 'create_task', 'collaboration_inspect_request')
+    for role in ('backend', 'frontend'):
+        before = names(role)
+        assert 'manage_file' in before and 'list_project_files' not in before
+        assert names(role, 'manage_file') == before
+    # A hidden tool that was used still loads its group.
+    assert 'collaboration_catalog' in names('backend', 'collaboration_search')

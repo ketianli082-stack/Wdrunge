@@ -1,4 +1,5 @@
 """Agent tools obtain identity/project from trusted runtime context."""
+import json
 import logging
 from contextvars import ContextVar
 from dataclasses import dataclass, field
@@ -108,6 +109,47 @@ async def with_parallel_advice(s, project, created):
     return {**created, 'advice': ' '.join(advice)} if advice else created
 
 
+# The caller just wrote the task text, criteria, result and evidence; echoing the whole
+# record back costs several thousand tokens per delivery. collaboration_inspect_request
+# still returns everything.
+TRANSITION_RECEIPT = ('id', 'state', 'sender', 'recipient', 'goal_id', 'attempts', 'artifacts', 'delivered', 'based_on',
+                      'workspace_published', 'merged_paths', 'needs_review', 'findings')
+
+
+# Scheduler bookkeeping and the creation spec (a copy of goal/criteria kept for
+# idempotency) carry nothing a model can act on.
+INSPECT_HIDDEN = {'spec', 'lease_owner', 'lease_until', 'instance_id', 'workspace_id', 'origin_message', 'conversation'}
+
+
+# Default inspect view: the state and what was delivered, not the task text the caller
+# usually wrote itself. Long text is cut to a preview; detail='full' returns it all.
+INSPECT_PREVIEW = {'goal': 400, 'result': 1500}
+
+
+def preview(value, limit):
+    return value if not isinstance(value, str) or len(value) <= limit else value[:limit] + f'… [{len(value) - limit} more characters]'
+
+
+def inspect_view(request: dict, journal: dict, detail: str) -> dict:
+    view = {key: value for key, value in request.items() if key not in INSPECT_HIDDEN}
+    if detail == 'full':
+        return {**view, 'journal': Collaboration.journal_summary(journal)}
+    truncated = [key for key, limit in INSPECT_PREVIEW.items() if isinstance(view.get(key), str) and len(view[key]) > limit]
+    view.update({key: preview(view[key], limit) for key, limit in INSPECT_PREVIEW.items() if key in view})
+    if isinstance(view.get('evidence'), list):
+        view['evidence'] = [{k: preview(v, 300) for k, v in e.items()} if isinstance(e, dict) else preview(e, 300)
+                            for e in view['evidence']]
+        truncated += ['evidence'] if view['evidence'] != request['evidence'] else []
+    view['journal'] = Collaboration.journal_summary(journal, notes=4)
+    if truncated:
+        view['truncated'] = {'fields': truncated, 'hint': "Pass detail='full' only when you need the complete text."}
+    return view
+
+
+def transition_receipt(request: dict) -> dict:
+    return {key: request[key] for key in TRANSITION_RECEIPT if key in request}
+
+
 async def execute_collaboration(action: Literal['catalog', 'read', 'publish', 'subscribe', 'send', 'request', 'inspect_request', 'wait', 'transition', 'snapshot', 'search', 'diff', 'schedule', 'dependencies', 'decision', 'maintenance', 'handoff', 'recover', 'inspect_message', 'history', 'create_goal', 'get_goal', 'update_goal', 'complete_goal', 'create_task', 'submit_task', 'complete_task', 'environment', 'register_service', 'register_command', 'journal', 'check_delivery'], payload: dict) -> dict:
     """Project collaboration. Identity is supplied by the runtime.
 
@@ -119,7 +161,7 @@ async def execute_collaboration(action: Literal['catalog', 'read', 'publish', 's
     diff: {document_id,from_version,to_version,section_id,offset?,limit?}.
     read supports force=true to bypass confirmed context-read deduplication. send: {recipient,content,summary,key,reply_to?,request_id?}. Only the short public summary appears as @recipient in team chat; content stays in the detailed record. Replies also require their own short summary.
     request: {recipient,goal,summary,key,based_on?,dependencies?,artifacts?,priority?:0..3,deadline?:Unix timestamp}; include
-    acceptance criteria in goal. inspect_request: {identifier}. inspect_message: {identifier,offset?,limit?} reads full message previews.
+    acceptance criteria in goal. inspect_request: {identifier,detail?}. inspect_message: {identifier,offset?,limit?} reads full message previews.
     wait: {dependencies:[request_id]} suspends your current task until accepted
     completion. transition: {identifier,state,result?,summary?,artifacts?,based_on?}; summary is a short public progress/reply, result must be a plain text string containing full evidence, never an object/list;
     recipient delivers to review, sender accepts completed or requests queued
@@ -146,7 +188,12 @@ async def execute_collaboration(action: Literal['catalog', 'read', 'publish', 's
         if action == 'create_goal' and ctx.context != 'user' and not payload.get('scale'):
             raise ValueError('Choose the goal scale (small, medium or large) from the size of the user request; it bounds criteria and tells assignees how much to build.')
         if action in {'create_goal', 'update_goal', 'complete_goal'}:
-            return await getattr(s, action)(p, actor=ctx.member, conversation=ctx.conversation, **payload)
+            result = await getattr(s, action)(p, actor=ctx.member, conversation=ctx.conversation, **payload)
+            if action == 'create_goal' and result.get('scale'):
+                # State the per-task budget where the next create_task calls are written.
+                from app.collaboration.planning import CRITERIA_LIMITS
+                result = {**result, 'task_criteria_limit': CRITERIA_LIMITS[result['scale']]['task']}
+            return result
         if action == 'get_goal':
             return await s.get_goal(p, conversation=ctx.conversation, **payload)
         if action == 'create_task':
@@ -245,8 +292,8 @@ async def execute_collaboration(action: Literal['catalog', 'read', 'publish', 's
         if action == 'inspect_message':
             return await s.inspect_message(p, **payload)
         if action == 'inspect_request':
-            request = await s.get_request(p, **payload)
-            return {**request, 'journal': s.journal_summary(await s.journal(p, request['id']))}
+            request = await s.get_request(p, payload['identifier'])
+            return inspect_view(request, await s.journal(p, request['id']), payload.get('detail', 'summary'))
         if action == 'wait':
             if not ctx.request:
                 raise ValueError('No active durable request to suspend')
@@ -264,9 +311,11 @@ async def execute_collaboration(action: Literal['catalog', 'read', 'publish', 's
                         await s._dependencies(c, p, payload['based_on'])
                         r['based_on'] = payload['based_on']
                         await s._put(c, 'request', p, ctx.request, r)
-                await s.publish_artifacts(p, ctx.request, ctx.instance_id)
+                await s.publish_artifacts(p, ctx.request, ctx.instance_id, references='\n'.join([
+                    payload.get('result') or '', json.dumps(payload.get('evidence') or [], ensure_ascii=False), *(payload.get('artifacts') or [])]))
             result = await s.transition(p, actor=ctx.member, expected_instance=ctx.instance_id if ctx.request == payload.get('identifier') else None, **payload)
-            return {**result, 'findings': findings} if findings else result
+            receipt = transition_receipt(result)
+            return {**receipt, 'findings': findings} if findings else receipt
         if action == 'snapshot':
             snapshot = await s.snapshot(p)
             return {'requests': [{k: r[k] for k in ('id', 'state', 'sender', 'recipient', 'goal')} for r in snapshot['request'][-50:]], 'goals': [{k: g[k] for k in ('id', 'state', 'objective')} for g in snapshot['goal'] if g['conversation'] == ctx.conversation]}
@@ -288,10 +337,10 @@ collaborate = tool('collaborate')(execute_collaboration)
 
 ACTION_DESCRIPTIONS = {
     'create_goal': 'Leader: create a goal with measurable criteria, a stable key and a scale (small/medium/large).',
-    'get_goal': 'Read a goal, full goal criteria/evidence, task counts and a page of task previews (offset/limit). Follow next_offset. Use collaboration_inspect_request for complete task results/artifacts/evidence; reminders and previews are bounded.',
+    'get_goal': "Read a goal, full goal criteria/evidence, task counts and a page of task previews (offset/limit). Follow next_offset. Use collaboration_inspect_request for complete task results/artifacts/evidence; reminders and previews are bounded.",
     'update_goal': 'Leader: pause, resume (active), block or cancel a goal with a reason. Pausing/blocking stops task executions and preserves work; resuming requeues them. Terminal goals cannot reopen.',
     'complete_goal': 'Leader: accept a goal only after all its tasks are completed. evidence maps each exact goal criterion to concrete verification evidence. Never complete merely to stop reminders.',
-    'create_task': 'Leader: queue a goal task for a specialist with criteria, a stable key, typed deliverables and dependencies or needs.',
+    'create_task': 'Leader: queue a goal task for a specialist with criteria, a stable key, typed deliverables and dependencies or needs. Criteria per task: small goal at most 3, medium 5, large 8 (see task_criteria_limit from create_goal); put further checks in the task text.',
     'submit_task': 'Submit a running goal task for review with plain text evidence and artifact paths. This publishes the current workspace; the task remains incomplete until accepted.',
     'complete_task': 'Sender or Leader: accept a reviewed goal task. evidence must map every exact task criterion to verification evidence. Use result for the acceptance summary. Inspect artifacts and tests before accepting.',
     'catalog': 'List managed documents with IDs, current versions and external-change flags. Use this before publishing changes to an existing path.',
@@ -300,7 +349,7 @@ ACTION_DESCRIPTIONS = {
     'subscribe': 'Subscribe to changes of a document or a unique heading from its current outline; enabled=false unsubscribes.',
     'send': 'Send a coordination message with a short public summary and full content; key is stable across retries. Not a scheduled job.',
     'request': 'Schedule a colleague task within your scope. Include acceptance criteria in goal, expected artifact paths, based_on document versions and prerequisite request IDs in dependencies. key is required and stable across retries; summary is the short public notice.',
-    'inspect_request': 'Inspect a task: state, result, dependencies, artifacts, findings and its work journal.',
+    'inspect_request': "Inspect a task: state, result, dependencies, artifacts, findings and its work journal.",
     'wait': 'Suspend the current durable worker request until its prerequisite request IDs are ready for review. Accept their deliveries before publishing dependent artifacts. Do not poll.',
     'transition': 'Move a task: deliver to review, accept completed, or queue rework. result is plain-text evidence; summary is a short public reply.',
     'snapshot': 'List the most recent team requests and their states.',

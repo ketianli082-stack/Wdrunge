@@ -212,3 +212,23 @@ def test_a_provider_stall_resumes_the_same_context_instead_of_redoing_work(tmp_p
         assert [(a['mode'], a['outcome']) for a in journal['attempts']] == [('fresh', 'interrupted'), ('continue', 'delivered')]
         await store.close()
     asyncio.run(scenario())
+
+
+def test_inspect_request_previews_long_text_unless_full_detail_is_asked(tmp_path):
+    async def run():
+        store, s, p, _ = await setup(tmp_path)
+        goal = 'Build the greeting API. ' * 100
+        r = await s.create_request(p, 'leader', 'backend', goal, 'api')
+        token = active.set(Context(s, p, 'leader', '', 'leader-ctx'))
+        try:
+            summary = await execute_collaboration('inspect_request', {'identifier': r['id']})
+            assert summary['state'] == 'queued' and len(summary['goal']) < 500 and 'more characters' in summary['goal']
+            assert summary['truncated']['fields'] == ['goal'] and 'spec' not in summary
+            full = await execute_collaboration('inspect_request', {'identifier': r['id'], 'detail': 'full'})
+            assert full['goal'] == goal and 'truncated' not in full
+            short = await s.create_request(p, 'leader', 'backend', 'Ping', 'ping')
+            assert 'truncated' not in await execute_collaboration('inspect_request', {'identifier': short['id']})
+        finally:
+            active.reset(token)
+        await store.close()
+    asyncio.run(run())

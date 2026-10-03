@@ -77,6 +77,20 @@ def _replace_body(content, start, end, body):
     return updated
 
 
+def _unique_body(content, target, old):
+    """Direct body (start, end) under `target` that holds `old`, when exactly one does once."""
+    entries = outline(content)
+    inside = [e for e in entries if target['start'] <= e['start'] and e['end'] <= target['end']]
+    hits = [(e['body_start'], e['body_end']) for e in inside
+            if content[e['body_start']:e['body_end']].count(old) == 1]
+    if len(hits) == 1 and content[target['start']:target['end']].count(old) == 1:
+        return hits[0]
+    if content[target['start']:target['end']].count(old) == 1:
+        raise ValueError('old_text spans a heading line; headings are not part of a section body. Replace the body '
+                         'with replace_section_body, or change structure with insert_section/delete_section')
+    raise ValueError('old_text must match exactly once in the direct section body')
+
+
 def edit_document(content: str, edits: list[dict]) -> str:
     for index, edit in enumerate(edits):
         try:
@@ -94,6 +108,10 @@ def _edit_document(content: str, edit: dict) -> str:
     op = edit['operation']
     if op == 'replace_text':
         old = edit.get('old_text', '')
+        if old and content[start:end].count(old) != 1:
+            # Models often address the parent (e.g. root) of the section holding the text.
+            # A unique match in one descendant's direct body is just as unambiguous.
+            start, end = _unique_body(content, s, old)
         body = content[start:end]
         if not old or body.count(old) != 1:
             raise ValueError('old_text must match exactly once in the direct section body')

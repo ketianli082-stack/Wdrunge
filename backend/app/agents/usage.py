@@ -5,6 +5,9 @@ scheduled task execution); model calls made under it, including memory summaries
 and the command reviewer, inherit it without extra plumbing.
 """
 from contextvars import ContextVar
+import logging
+
+logger = logging.getLogger(__name__)
 
 usage_scope: ContextVar[dict | None] = ContextVar('usage_scope', default=None)
 
@@ -49,9 +52,12 @@ def response_usage(response) -> dict:
 async def record_call(store, agent_id: str, response, purpose: str) -> None:
     """Record a model call made outside an Agent (reviewer, title model)."""
     if store is None:
+        logger.warning('No store to record %s %s usage', agent_id, purpose)
         return
     usage = response_usage(response)
     if not isinstance(usage['total_tokens'], int):
+        logger.warning('%s %s call reported no token usage (%s); not recorded', agent_id, purpose,
+                       sorted((getattr(response, 'response_metadata', None) or {}).keys()))
         return
     cached = usage['cached_tokens'] if isinstance(usage['cached_tokens'], int) else None
     await store.record_agent_usage(agent_id, usage['total_tokens'], usage['input_tokens'] or 0, cached,

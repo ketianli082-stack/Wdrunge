@@ -317,3 +317,19 @@ def test_failed_duplicate_start_restores_the_live_backend_token(tmp_path, monkey
     path.write_text('newer-backend-token')
     api.restore_control_token()
     assert path.read_text() == 'newer-backend-token'
+
+
+def test_commands_do_not_run_with_the_platform_virtualenv(tmp_path, monkeypatch):
+    """The backend runs inside its own venv; project commands must resolve python3 from
+    the host, not from Wdrunge's dependencies."""
+    import sys
+    platform_bin = tmp_path / 'wdrunge-venv' / 'bin'
+    host_bin = tmp_path / 'host' / 'bin'
+    monkeypatch.setattr(sys, 'prefix', str(platform_bin.parent))
+    monkeypatch.setenv('VIRTUAL_ENV', str(platform_bin.parent))
+    monkeypatch.setenv('PATH', f'{platform_bin}:{host_bin}:/usr/bin')
+    assert sandbox.clean_environment(tmp_path, tmp_path)['PATH'] == f'{host_bin}:/usr/bin'
+    project_venv = tmp_path / '.venv'
+    (project_venv / 'bin').mkdir(parents=True)
+    # A project's own .venv still comes first.
+    assert sandbox.clean_environment(tmp_path, tmp_path)['PATH'] == f'{project_venv / "bin"}:{host_bin}:/usr/bin'

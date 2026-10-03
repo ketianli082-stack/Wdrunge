@@ -8,6 +8,7 @@ import difflib
 import hashlib
 import json
 import os
+import re
 import shutil
 import tempfile
 from pathlib import Path
@@ -35,6 +36,26 @@ def save_json(path, value):
 
 def hash_bytes(data):
     return hashlib.sha256(data).hexdigest() if data is not None else None
+
+
+# browser_verify evidence: named by content hash, so identical screenshots share a path.
+SCREENSHOT = re.compile(r'^docs/testing/browser-[0-9a-f]{16,32}\.png$')
+
+
+def unreferenced_screenshots(changes, source: Path, references: str) -> list[str]:
+    """New browser screenshots that no delivered text, result or evidence names: failed
+    attempts and retakes stay in the task snapshot instead of the project."""
+    corpus = [references]
+    for item in changes:
+        if item['content'] is not None and not SCREENSHOT.match(item['path']):
+            try:
+                corpus.append(item['content'].decode('utf-8'))
+            except UnicodeDecodeError:
+                pass
+    text = '\n'.join(corpus)
+    return [item['path'] for item in changes
+            if item['content'] is not None and SCREENSHOT.match(item['path']) and not (source / item['path']).exists()
+            and Path(item['path']).name not in text]
 
 
 def merge_text(base: str, current: str, proposed: str) -> str:
@@ -71,7 +92,9 @@ def files(root):
         dirs[:] = [name for name in dirs if name not in EXCLUDED and not (Path(directory)/name).is_symlink()]
         for name in names:
             path = Path(directory)/name
-            if name in EXCLUDED or name.startswith('.env.') or path.is_symlink():
+            # Secret .env files never sync; non-secret templates are ordinary project files.
+            if (name in EXCLUDED or name.startswith('.env.') and name not in {'.env.example', '.env.sample'}
+                    or path.is_symlink()):
                 continue
             if not path.is_file():
                 continue

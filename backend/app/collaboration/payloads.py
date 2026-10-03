@@ -82,6 +82,68 @@ class DocumentChange(StrictPayload):
         return self
 
 
+class Publish(StrictPayload):
+    changes: Annotated[list[DocumentChange], Field(min_length=1, max_length=20)]
+    summary: Annotated[str, Field(min_length=1, max_length=2000)] | None = Field(
+        None, description='Default summary for changes that omit one')
+    base_version: Offset | None = Field(None, description='Default base_version when there is exactly one change')
+
+    @model_validator(mode='before')
+    @classmethod
+    def change_defaults(cls, data):
+        """Models often put summary/base_version beside changes instead of inside each
+        change; apply them where unambiguous rather than failing the whole call."""
+        if not isinstance(data, dict) or not isinstance(data.get('changes'), list):
+            return data
+        summary, version = data.get('summary'), data.get('base_version')
+        if isinstance(version, str) and version.isdigit():
+            version = int(version)
+        if summary is None and version is None:
+            return {**data, 'changes': fold_edits(data['changes'])}
+        changes = data['changes']
+        if version is not None and len(changes) != 1:
+            raise ValueError('Top-level base_version is ambiguous with several changes; put base_version in each change')
+        folded = []
+        for change in changes:
+            if isinstance(change, dict):
+                change = dict(change)
+                if summary is not None:
+                    change.setdefault('summary', summary)
+                if version is not None:
+                    if 'base_version' in change and change['base_version'] != version:
+                        raise ValueError('Top-level base_version differs from the change base_version')
+                    change.setdefault('base_version', version)
+            folded.append(change)
+        return {**data, 'changes': fold_edits(folded), 'summary': None, 'base_version': None}
+
+
+def fold_edits(changes):
+    """Models often split edits to one document into several changes. Edits apply in
+    order, so changes made from the same version fold into one; anything else is left
+    for publish to reject with guidance."""
+    folded, by_document = [], {}
+    for change in changes:
+        key = change.get('document_id') if isinstance(change, dict) else None
+        first = by_document.get(key)
+        if (first is not None and change.get('content') is None and first.get('content') is None
+                and not change.get('external') and not first.get('external')
+                and change.get('base_version') == first.get('base_version')
+                and bool(change.get('allow_merge')) == bool(first.get('allow_merge'))
+                and isinstance(change.get('edits', []), list) and isinstance(first.get('edits', []), list)):
+            first['edits'] = [*first.get('edits', []), *change.get('edits', [])]
+            summaries = [text for text in (first.get('summary'), change.get('summary')) if text]
+            if summaries:
+                first['summary'] = '; '.join(dict.fromkeys(summaries))[:2000]
+            based_on = [*first.get('based_on', []), *change.get('based_on', [])]
+            if based_on:
+                first['based_on'] = [r for i, r in enumerate(based_on) if r not in based_on[:i]]
+            continue
+        if isinstance(change, dict) and key:
+            change = by_document[key] = dict(change)
+        folded.append(change)
+    return folded
+
+
 def schema(model_name, /, **fields):
     return create_model(model_name, __base__=StrictPayload, **fields)
 
@@ -101,14 +163,14 @@ Identifier = schema('Identifier', identifier=(Text, ...))
 ACTION_PAYLOADS = {
     **{name: Empty for name in ('catalog', 'snapshot', 'dependencies', 'recover')},
     'read': Read,
-    'publish': schema('Publish', changes=(Annotated[list[DocumentChange], Field(min_length=1, max_length=20)], ...)),
+    'publish': Publish,
     'subscribe': schema('Subscribe', document_id=(Text, ...), enabled=(bool, True), section_id=(Text | None, None)),
     'send': schema('Send', recipient=(Role, ...), content=(Text, ...), key=(Text, ...), summary=(str | None, None), reply_to=(Text | None, None), request_id=(Text | None, None)),
     'request': schema('Request', recipient=(Role, ...), goal=(Text, ...), key=(Text, ...), summary=(str | None, None),
                       based_on=(list[RevisionReference], []), dependencies=(list[Text], []), artifacts=(list[Text], []),
                       priority=(Annotated[int, Field(ge=0, le=3)], 1), deadline=(float | None, None),
                       documents=(Paths, []), services=(Services, []), needs=(Needs, []), serial_reason=(SerialReason | None, None)),
-    'inspect_request': Identifier,
+    'inspect_request': schema('InspectRequest', identifier=(Text, ...), detail=(Literal['summary', 'full'], 'summary')),
     'inspect_message': schema('InspectMessage', identifier=(Text, ...), offset=(Offset, 0), limit=(Annotated[int, Field(ge=1, le=8000)], 4000)),
     'wait': schema('Wait', dependencies=(list[Text], ...)),
     'transition': TransitionPayload,

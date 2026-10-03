@@ -3,8 +3,9 @@
 Run when a task submits (and on demand before submitting) over the delivered files
 and published documents. Each finding names a file and line so Leader or the user
 can accept it or send the task back:
-- platform_leak: Wdrunge paths, tool names, team member names, sandbox wording or the
-  platform's own ports inside project deliverables;
+- platform_leak: Wdrunge workspace paths or the platform's own ports inside project
+  deliverables (they break outside the platform). Wording about the platform or the
+  team is prevented by the prompts, not checked: phrase lists either miss or misfire;
 - port_mismatch: a loopback address in a document whose port is not a registered
   project service (documents must match the environment registry);
 - evidence_in_contract: raw test transcripts inside interface documents (evidence
@@ -23,26 +24,13 @@ SKIP_DIRS = {'node_modules', '.venv', 'vendor', 'dist', 'build', '.git', '__pyca
 TEXT_SUFFIXES = {'.py', '.js', '.ts', '.tsx', '.jsx', '.vue', '.html', '.css', '.md', '.txt', '.json', '.yaml', '.yml',
                  '.toml', '.sh', '.go', '.rs', '.java', '.kt', '.rb', '.php', '.cfg', '.ini', '.env', '.example', ''}
 SIZE_LINES = {'small': 400, 'medium': 2500, 'large': None}
+# Package-manager output: neither authored text nor a place for platform wording.
+LOCKFILES = {'package-lock.json', 'npm-shrinkwrap.json', 'pnpm-lock.yaml', 'yarn.lock', 'bun.lock'}
 LOOPBACK_URL = re.compile(r'(?:https?|wss?)://(?:localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1\]):(\d{2,5})')
 EVIDENCE_HEADING = re.compile(r'^#{1,6}\s*.*(验证证据|实测|证据|evidence|test results?|verification)', re.I)
 HTTP_TRANSCRIPT = re.compile(r'^\s*(HTTP/1\.[01] \d{3}|< HTTP/|> (GET|POST|OPTIONS|PUT|DELETE) )')
 GENERATED = re.compile(r'(^|/)(openapi|swagger)\.(json|ya?ml)$|\.gen\.(ts|js|py)$|(^|/)generated/', re.I)
 CONTRACT_NAME = re.compile(r'(contract|契约|api|interface|openapi|schema)', re.I)
-SANDBOX_WORDS = re.compile(r'(沙箱|sandbox-exec|seatbelt|bubblewrap|network\s*=\s*true|network=true)', re.I)
-PLATFORM_WORDS = re.compile(r'(wdrunge|协作平台|开发平台|collaboration platform)', re.I)
-
-
-def platform_terms() -> dict:
-    """Names that identify the Wdrunge platform rather than the user's project."""
-    from app.agents.identity import TEAM_IDENTITIES
-    from app.collaboration.tools import COLLABORATION_TOOLS
-    tools = set(COLLABORATION_TOOLS) | {
-        'execute_command', 'manage_process', 'detect_environment', 'browse_directory', 'search_code', 'read_external_file',
-        'manage_file', 'browser_verify', 'checkpoint_context', 'recall_context', 'read_project_file', 'write_project_file',
-        'list_project_files', 'refresh_api_contract', 'refresh_frontend_client', 'run_project_check', 'run_service_check',
-        'enable_tools', 'delegate_task', 'delegate_tasks'}
-    members = {m['name'] for m in TEAM_IDENTITIES.values() if len(m.get('name', '')) >= 2}
-    return {'tools': tools, 'members': members}
 
 
 def delivered_files(root: Path, paths) -> list[Path]:
@@ -61,7 +49,8 @@ def delivered_files(root: Path, paths) -> list[Path]:
     for file in files:
         if file.is_symlink() or any(part in SKIP_DIRS for part in file.relative_to(root.resolve()).parts[:-1]):
             continue
-        if file.suffix.lower() not in TEXT_SUFFIXES or file.name.endswith(('.min.js', '.lock')) or file.stat().st_size > 512 * 1024:
+        if (file.suffix.lower() not in TEXT_SUFFIXES or file.name.endswith(('.min.js', '.lock')) or file.name in LOCKFILES
+                or file.stat().st_size > 512 * 1024):
             continue
         result.append(file)
     return result
@@ -78,16 +67,9 @@ def scan_file(relative: str, text: str, context: dict) -> list[dict]:
     is_doc = relative.lower().endswith(('.md', '.txt', '.rst'))
     contract = is_doc and bool(CONTRACT_NAME.search(relative))
     transcript_lines = 0
-    tool_pattern = context['tool_pattern']
     for number, line in enumerate(text.splitlines(), 1):
         if '.wdrunge-runs' in line or any(prefix in line for prefix in context['private_paths']):
             add('platform_leak', number, line, 'Contains a Wdrunge workspace or application path; deliverables should use project-relative paths.', 'high')
-        elif tool_pattern and tool_pattern.search(line):
-            add('platform_leak', number, line, f"Mentions platform tool {tool_pattern.search(line).group(0)}; deliverables should describe the project, not the team's tools.", 'high')
-        elif any(name in line for name in context['members']):
-            add('platform_leak', number, line, 'Mentions a team member; deliverables address the project users, not the agent team.')
-        elif PLATFORM_WORDS.search(line) or SANDBOX_WORDS.search(line):
-            add('platform_leak', number, line, 'Describes the Wdrunge platform or its sandbox; move environment-specific notes out of the deliverable.', 'low')
         for match in LOOPBACK_URL.finditer(line):
             port = int(match.group(1))
             if port in context['reserved_ports']:
@@ -111,15 +93,13 @@ async def delivery_findings(service, project, request, root, artifacts=None) -> 
         project_root = Path((await service._project(c, project))['workspace_path'])
     from app.agents.tools._workspace import WORKSPACE_ROOT
     if project_root.resolve() == WORKSPACE_ROOT.resolve():
-        return []  # Wdrunge developing itself legitimately names its own tools and paths.
+        return []  # Wdrunge developing itself legitimately names its own paths and ports.
     async with service.reading() as c:
         documents = await service._list(c, 'document', project)
         goal = await service._get(c, 'goal', project, request['goal_id'], False) if request.get('goal_id') else None
     environment = await service.environment(project, discover_manifests=False)
-    terms = platform_terms()
     context = {
-        'tool_pattern': re.compile(r'\b(' + '|'.join(sorted(map(re.escape, terms['tools']), key=len, reverse=True)) + r')\b'),
-        'members': terms['members'], 'reserved_ports': set(environment['reserved_ports']),
+        'reserved_ports': set(environment['reserved_ports']),
         'registry_ports': {s['port'] for s in environment['services'] if s.get('port')},
         'private_paths': [str(project_root.resolve() / '.wdrunge-runs')],
     }

@@ -403,6 +403,22 @@ class WorkerAgent(Agent):
             except Exception:
                 logger.warning('Could not record the stall in the task journal', exc_info=True)
 
+    async def _record_tool_call(self, conversation_id, tool_name, data):
+        # Raw arguments and result as the model saw them, before context folding
+        # shortens the result; the same log the Leader keeps.
+        output = data.get("output")
+        if not self._store or not isinstance(output, ToolMessage) or not output.tool_call_id:
+            return
+        import json
+        try:
+            await self._store.record_tool_calls(conversation_id, self.spec.id, [{
+                'id': output.tool_call_id, 'tool': tool_name,
+                'status': 'error' if output.status == 'error' or tool_result_failed(output) else 'success',
+                'arguments': json.dumps(data.get("input") or {}, ensure_ascii=False, default=str),
+                'result': output.content if isinstance(output.content, str) else json.dumps(output.content, ensure_ascii=False, default=str)}])
+        except Exception:
+            logger.warning('Could not record %s tool call', self.spec.id, exc_info=True)
+
     async def _events(self, messages, conversation_id, ctx, tool_names, active_tools, trace):
         async for event in self.build_graph().astream_events(
             {"messages": messages},
@@ -436,6 +452,7 @@ class WorkerAgent(Agent):
                 }
             elif kind in {"on_tool_end", "on_tool_error"} and run_id in active_tools:
                 tool_name, description = active_tools.pop(run_id)
+                await self._record_tool_call((ctx.conversation if ctx else '') or conversation_id, tool_name, event.get("data", {}))
                 yield "activity", {
                     "id": run_id,
                     "tool": tool_name,
@@ -446,8 +463,12 @@ class WorkerAgent(Agent):
                 chunk = event.get("data", {}).get("chunk")
                 if isinstance(chunk, AIMessageChunk) and isinstance(chunk.content, str) and chunk.content:
                     yield "content", {"content": chunk.content}
-            elif kind == "on_chat_model_end" and event.get("metadata", {}).get("langgraph_node") == "agent":
-                if await self.record_usage_durable(event.get("data", {}).get("output")):
+            elif kind == "on_chain_end" and name == "agent" and event.get("metadata", {}).get("langgraph_node") == "agent":
+                # Recorded when the node returns, not at on_chat_model_end: the retry wrapper
+                # annotates latency and retries only after the model call has finished.
+                output = event.get("data", {}).get("output")
+                messages = output.get("messages") if isinstance(output, dict) else None
+                if messages and await self.record_usage_durable(messages[-1]):
                     self._context_by_session[conversation_id] = self.context_tokens
                     if self._store:
                         await self._store.save_agent_session(

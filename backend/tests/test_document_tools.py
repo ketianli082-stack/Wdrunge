@@ -37,12 +37,71 @@ def test_repair_that_changes_body_boundaries_identifies_the_dependent_edit():
     # moved to its own section using the old containing section's ID.
     original = '# Guide\n## First\nbody### Second\nmarker\n'
     first = ids(original)['First']
+    # Text that moved into a child section is still unique under the old ID.
+    repaired = edit_document(original, [
+        dict(operation='replace_text', section_id=first, old_text='body### Second', new_text='body\n\n### Second'),
+        dict(operation='replace_text', section_id=first, old_text='marker', new_text='new'),
+    ])
+    assert repaired.endswith('### Second\nnew\n')
     with pytest.raises(DocumentEditError, match=r'edits\[1\].*match exactly once') as error:
         edit_document(original, [
             dict(operation='replace_text', section_id=first, old_text='body### Second', new_text='body\n\n### Second'),
-            dict(operation='replace_text', section_id=first, old_text='marker', new_text='new'),
+            dict(operation='replace_text', section_id=first, old_text='absent', new_text='new'),
         ])
     assert error.value.details == {'edit_index': 1, 'section_id': first, 'operation': 'replace_text'}
+
+
+def test_replace_text_on_a_parent_finds_the_unique_descendant_body():
+    # The platform draft keeps its note under the H1; models address root.
+    draft = '# test report\n\n> 草稿：许明镜（测试） 正在编写。\n\n## 验证范围\n\n（待填写）\n\n## 证据\n\n（待填写）\n'
+    result = edit_document(draft, [dict(operation='replace_text', section_id='root',
+                                        old_text='> 草稿：许明镜（测试） 正在编写。', new_text='结论：通过。')])
+    assert '结论：通过。' in result and ids(result) == ids(draft)
+    # Ambiguous text (one per section) still fails rather than guessing.
+    with pytest.raises(DocumentEditError, match='match exactly once'):
+        edit_document(draft, [dict(operation='replace_text', section_id='root', old_text='（待填写）', new_text='x')])
+    # Text spanning a heading gets a specific explanation.
+    with pytest.raises(DocumentEditError, match='spans a heading'):
+        edit_document(draft, [dict(operation='replace_text', section_id='root',
+                                   old_text='## 证据\n\n（待填写）', new_text='## 证据\n\nshots')])
+
+
+def test_publish_accepts_summary_and_base_version_beside_changes():
+    from app.collaboration.payloads import ACTION_PAYLOADS
+    edit = {'operation': 'replace_section_body', 'section_id': 'root', 'new_text': 'x'}
+    single = ACTION_PAYLOADS['publish'].model_validate(
+        {'summary': 'Fill', 'base_version': '2', 'changes': [{'document_id': 'd', 'edits': [edit]}]})
+    assert single.changes[0].summary == 'Fill' and single.changes[0].base_version == 2
+    assert single.model_dump(exclude_none=True).keys() == {'changes'}
+    several = [{'document_id': d, 'base_version': 1, 'edits': [edit]} for d in ('a', 'b')]
+    assert [c.summary for c in ACTION_PAYLOADS['publish'].model_validate({'summary': 'Both', 'changes': several}).changes] == ['Both'] * 2
+    with pytest.raises(ValueError, match='ambiguous'):
+        ACTION_PAYLOADS['publish'].model_validate({'summary': 'S', 'base_version': 1, 'changes': several})
+
+
+def test_publish_folds_several_edit_changes_to_one_document(tmp_path):
+    async def scenario():
+        store = ChatStore(f'sqlite+aiosqlite:///{tmp_path / "docs.db"}')
+        project = await store.create_project('P', str(tmp_path))
+        service = Collaboration(store)
+        token = active.set(Context(service, project['id'], 'testing', '', 'ctx'))
+        publish = COLLABORATION_TOOLS['collaboration_publish']
+        try:
+            original = '# Report\n## Summary\nold\n## Results\npending\n'
+            doc = (await publish.ainvoke({'changes': [{'path': 'docs/testing/report.md', 'base_version': 0,
+                                                       'summary': 'Create', 'content': original}]}))['revisions'][0]['document_id']
+            sections = ids(original)
+            change = lambda title, text, version=1: {'document_id': doc, 'base_version': version, 'summary': f'Fill {title}', 'edits': [
+                {'operation': 'replace_section_body', 'section_id': sections[title], 'new_text': text}]}
+            result = await publish.ainvoke({'changes': [change('Summary', 'passed\n'), change('Results', '3/3\n')]})
+            assert result['revisions'][0]['version'] == 2 and len(result['revisions']) == 1
+            assert (tmp_path / 'docs/testing/report.md').read_text() == '# Report\n## Summary\npassed\n## Results\n3/3\n'
+            mixed = await publish.ainvoke({'changes': [change('Summary', 'a\n', 2), change('Results', 'b\n', 1)]})
+            assert 'put all its edits in one change' in str(mixed)
+        finally:
+            active.reset(token)
+            await store.engine.dispose()
+    asyncio.run(scenario())
 
 
 def test_typed_publish_read_and_failed_batch_are_atomic(tmp_path):
@@ -121,12 +180,20 @@ def test_worker_executes_typed_tools_with_one_activity_per_call(tmp_path, monkey
         service = Collaboration(store)
         worker = WorkerAgent(AgentSpec(id='frontend', name='Frontend', prompt_file='frontend.md'))
         monkeypatch.setattr(worker, 'model', lambda: Model())
+        from langgraph.checkpoint.memory import InMemorySaver
+        await worker.configure_persistence(store, InMemorySaver())
         token = active.set(Context(service, project['id'], 'frontend', '', 'ctx'))
         try:
             events = [e async for e in worker.stream('Publish', conversation_id='worker', context_mode='fresh', handoff='')]
             activities = [e[1] for e in events if e[0] == 'activity']
             assert [a['phase'] for a in activities] == ['running', 'completed']
             assert all(a['description'] == '发布文档修订' and a['tool'] == 'collaboration_publish' for a in activities)
+            # Worker calls are logged like the Leader's: raw arguments and result.
+            import json
+            [logged] = await store.load_tool_calls('worker')
+            assert (logged['agent_id'], logged['tool'], logged['status']) == ('frontend', 'collaboration_publish', 'success')
+            assert json.loads(logged['arguments'])['changes'][0]['path'] == 'docs/frontend/spec.md'
+            assert json.loads(logged['result'])['revisions'][0]['version'] == 1
         finally:
             active.reset(token)
             await store.close()

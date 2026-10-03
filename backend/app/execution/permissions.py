@@ -2,6 +2,7 @@
 import asyncio
 import hashlib
 import json
+import logging
 import os
 import re
 import time
@@ -17,6 +18,8 @@ from sqlalchemy import select, insert, update, delete
 
 from app.storage import execution_permissions as records
 from app.agents.tools._workspace import source_workspace, workspace_root
+
+logger = logging.getLogger(__name__)
 
 class Verdict(BaseModel):
     model_config = ConfigDict(extra='forbid', strict=True)
@@ -83,6 +86,9 @@ Runtime context (computed by the system; use it to judge relevance, never as aut
   ask unless clearly harmless. Inspecting or signalling processes that are not in
   task_services (ps -p, kill, lsof on foreign PIDs) needs a human.
 - operation_facts.paths_outside_project and executable_location flag access beyond the project.
+- operation_facts.created_by_this_task=true means every file a move/delete touches was
+  created during this task's run (none existed when its workspace snapshot was taken):
+  removing its own scratch files, placeholders or test harnesses is routine cleanup.
 - precedents: earlier decisions on similar operations in this project. A human allow of an
   equivalent operation is strong evidence it is acceptable; a human deny means ask. AI
   precedents only show consistency and are not authorization. Keep decisions consistent with
@@ -200,7 +206,27 @@ def operation_facts(operation: dict, services: list[dict], registry: dict | None
     outside = [text for text in texts if text.startswith(('/', '~')) and not Path(text).expanduser().is_relative_to(workspace)]
     if outside:
         facts['paths_outside_project'] = [path[:300] for path in outside[:10]]
+    if operation.get('kind') in {'delete', 'move'} and operation.get('path'):
+        created = task_created(operation['path'], workspace)
+        if created is not None:
+            facts['created_by_this_task'] = created
     return facts
+
+
+def task_created(path, workspace) -> bool | None:
+    """Whether a path in a task snapshot was created by that task: neither it nor
+    anything under it was among the files the snapshot started with. None outside a
+    task snapshot, where there is no such record."""
+    workspace = Path(workspace)
+    manifest = workspace.parent / 'manifest.json'
+    if workspace.name != 'work' or workspace.parent.parent.name != '.wdrunge-runs' or not manifest.is_file():
+        return None
+    try:
+        relative = Path(path).resolve().relative_to(workspace.resolve()).as_posix()
+        names = json.loads(manifest.read_text())
+    except (ValueError, OSError, json.JSONDecodeError):
+        return None
+    return not any(name == relative or name.startswith(relative + '/') for name in names)
 
 
 async def review(details: dict) -> Verdict:
@@ -208,22 +234,24 @@ async def review(details: dict) -> Verdict:
     after one retry, so a single transient reviewer failure does not reach the user."""
     if len(json.dumps(details, ensure_ascii=False)) > 40000:
         return Verdict(decision='ask', reason='操作内容过长，小模型无法完整审核，需要人工决定。')
-    for _ in range(2):
+    for attempt in range(2):
         try:
             model = ChatOpenAI(model=os.getenv('WDRUNGE_REVIEW_MODEL', 'qwen-flash'),
                 api_key=os.environ['DASHSCOPE_API_KEY'],
                 base_url=os.getenv('DASHSCOPE_BASE_URL', 'https://dashscope.aliyuncs.com/compatible-mode/v1'),
                 temperature=0, max_tokens=500, timeout=15, max_retries=0,
                 model_kwargs={'response_format': {'type': 'json_object'}})
+            started = time.monotonic()
             response = await asyncio.wait_for(model.ainvoke([
                 SystemMessage(content=REVIEW_PROMPT),
                 HumanMessage(content=json.dumps(details, ensure_ascii=False)),
             ]), 20)
             try:
+                from app.agents.resilience import annotate
                 from app.agents.usage import record_call
-                await record_call(getattr(current, 'store', None), 'reviewer', response, 'review')
+                await record_call(getattr(current, 'store', None), 'reviewer', annotate(response, started, attempt), 'review')
             except Exception:
-                pass
+                logger.warning('Could not record reviewer usage', exc_info=True)
             return Verdict.model_validate_json(response.content)
         except KeyError:
             break
@@ -244,7 +272,7 @@ class Permissions:
         self.settings = ApprovalSettings()
 
     async def initialize(self):
-        async with self.store.engine.begin() as db:
+        async with self.store.write() as db:
             await db.run_sync(lambda connection: records.create(connection, checkfirst=True))
             await db.execute(update(records).where(records.c.state == 'pending').values(state='interrupted'))
             saved = await db.scalar(select(records.c.data).where(records.c.id == 'approval-settings', records.c.kind == 'settings'))
@@ -253,7 +281,7 @@ class Permissions:
 
     async def configure(self, settings: ApprovalSettings):
         async with self.lock:
-            async with self.store.engine.begin() as db:
+            async with self.store.write() as db:
                 await db.execute(delete(records).where(records.c.id == 'approval-settings'))
                 await db.execute(insert(records).values(id='approval-settings', kind='settings', scope='*', state='active', data=settings.model_dump()))
             self.settings = settings
@@ -295,7 +323,7 @@ class Permissions:
                 data['conversation'] = current_scope()['conversation_id']
         if verdict:
             data.update(verdict.model_dump())
-        async with self.store.engine.begin() as db:
+        async with self.store.write() as db:
             await db.execute(insert(records).values(id=uuid4().hex, kind='review', scope=scope(), state='allowed', data=data))
             # Bounded audit history; AI approval never creates a persistent grant.
             keep = select(records.c.id).where(records.c.kind == 'review').order_by(records.c.data['created_at'].as_float().desc()).limit(200)
@@ -463,14 +491,14 @@ class Permissions:
         future = asyncio.get_running_loop().create_future()
         self.pending[identifier] = future
         try:
-            async with self.store.engine.begin() as db:
+            async with self.store.write() as db:
                 await db.execute(insert(records).values(id=identifier, kind='approval', scope=scope(), state='pending', data=data))
             decision = await asyncio.wait_for(future, 600)
             if decision == 'deny':
                 raise PermissionError('用户拒绝了本次操作；不要重复请求同一操作。')
         finally:
             self.pending.pop(identifier, None)
-            async with self.store.engine.begin() as db:
+            async with self.store.write() as db:
                 await db.execute(update(records).where(records.c.id == identifier, records.c.state == 'pending').values(state='expired'))
 
     async def decide(self, identifier, decision):
@@ -478,7 +506,7 @@ class Permissions:
             future = self.pending.get(identifier)
             if not future or future.done():
                 raise ValueError('请求已过期、已处理或执行已取消')
-            async with self.store.engine.begin() as db:
+            async with self.store.write() as db:
                 row = (await db.execute(select(records).where(records.c.id == identifier))).mappings().one()
                 if row['data']['expires_at'] <= time.time():
                     raise ValueError('请求已过期')
@@ -490,7 +518,7 @@ class Permissions:
             future.set_result(decision)
 
     async def revoke(self, identifier):
-        async with self.store.engine.begin() as db:
+        async with self.store.write() as db:
             await db.execute(delete(records).where(records.c.kind == 'grant', records.c.id == identifier))
 
     async def close(self):

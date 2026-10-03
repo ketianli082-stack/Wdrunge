@@ -51,8 +51,11 @@ ROLE_GROUPS: dict[str, set[str]] = {
     'frontend': {'files', 'commands', 'browser', 'documents', 'team', 'delivery', 'environment', 'memory'},
     'testing': {'files', 'commands', 'browser', 'documents', 'team', 'delivery', 'environment', 'memory'},
 }
-# Leader core beyond its groups: inspecting and moving tasks, messaging, decisions.
-ROLE_EXTRA = {'leader': {'collaboration_inspect_request', 'collaboration_transition', 'collaboration_send', 'collaboration_decision'}}
+# Core tools beyond a role's groups. Leader: inspecting and moving tasks, messaging,
+# decisions. Developers: removing the placeholders and harnesses they create, which
+# otherwise costs an enable_tools call that rewrites the tool list.
+ROLE_EXTRA = {'leader': {'collaboration_inspect_request', 'collaboration_transition', 'collaboration_send', 'collaboration_decision'},
+              'backend': {'manage_file'}, 'frontend': {'manage_file'}}
 ROLE_HIDDEN = {'leader': {'collaboration_publish', 'delegate_task'}}
 
 GROUP_OF = {name: group for group, names in GROUPS.items() for name in names}
@@ -72,8 +75,10 @@ def task_groups(task: dict | None, role: str) -> set[str]:
     return groups
 
 
-def enabled_groups(messages) -> set[str]:
-    """Groups enabled earlier in this context (and tools already used)."""
+def enabled_groups(messages, core=()) -> set[str]:
+    """Groups enabled earlier in this context (and tools already used). Using a core
+    tool (always visible) does not load its group: that would change the tool list,
+    and with it the provider's prompt cache, for nothing the model asked for."""
     groups, used = set(), set()
     for message in messages:
         for call in getattr(message, 'tool_calls', None) or ():
@@ -84,12 +89,12 @@ def enabled_groups(messages) -> set[str]:
                 groups.update(GROUP_OF[n] for n in args.get('names') or () if isinstance(n, str) and n in GROUP_OF)
             else:
                 used.add(call.get('name'))
-    return groups | {GROUP_OF[name] for name in used if name in GROUP_OF}
+    return groups | {GROUP_OF[name] for name in used - set(core) if name in GROUP_OF}
 
 
 def select_tools(role: str, available, messages=(), task: dict | None = None):
     """The tools offered to the model, in a stable order."""
-    shown_groups = ROLE_GROUPS.get(role, set(GROUPS)) | task_groups(task, role) | enabled_groups(messages)
+    shown_groups = ROLE_GROUPS.get(role, set(GROUPS)) | task_groups(task, role) | enabled_groups(messages, ROLE_EXTRA.get(role, ()))
     hidden = set(ROLE_HIDDEN.get(role, ()))
     used = {call.get('name') for m in messages for call in getattr(m, 'tool_calls', None) or ()}
     if role != 'leader':

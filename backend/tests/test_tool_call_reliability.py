@@ -5,6 +5,7 @@ surprises, services killed or unready, expected outcomes reported as failures, a
 recoverable model slips (process IDs, BSD vs GNU utilities)."""
 import asyncio
 from collections import deque
+import shutil
 import socket
 import sys
 from types import SimpleNamespace
@@ -153,7 +154,7 @@ def test_network_is_automatic_for_services_and_loopback_checks():
 
 def test_background_defaults_and_explicit_network_choice(monkeypatch):
     calls = []
-    async def start(argv, cwd, timeout, name, network, reason):
+    async def start(argv, cwd, timeout, name, network, reason, keep=False):
         calls.append((timeout, network))
         return SimpleNamespace(snapshot=lambda: {'id': 'svc'}, watcher=asyncio.get_running_loop().create_future(),
                                process=SimpleNamespace(returncode=None), timed_out=False, ports=set())
@@ -208,6 +209,10 @@ def test_expected_exit_codes_are_not_failures(tmp_path, real_processes):
         assert tool_result_failed(failed) and failed['exit_code'] == 7
         expected = await development.execute_command.ainvoke({**probe, 'ok_exit_codes': [7]})
         assert not tool_result_failed(expected) and expected['exit_code'] == 7
+        # A probe expecting a closed port (7) still succeeds when the port answers (0).
+        answered = await development.execute_command.ainvoke(
+            {'command': sys.executable, 'arguments': ['-c', 'pass'], 'ok_exit_codes': [7]})
+        assert not tool_result_failed(answered) and answered['exit_code'] == 0
     in_workspace(tmp_path, real_processes, body)
 
 
@@ -229,8 +234,10 @@ def test_ready_port_waits_for_service_and_rejects_taken_ports(tmp_path, real_pro
             'arguments': ['-m', 'http.server', '--bind', '127.0.0.1', str(port)], 'ready_port': port})
         assert started['ready'] is True and started['state'] == 'running' and 'error' not in started
         assert real_processes.jobs[started['id']].ports == {port}
+        await development.execute_command.ainvoke({'command': sys.executable, 'arguments': ['-c', 'pass']})
         listed = await development.manage_process.ainvoke({'action': 'list'})
         assert listed['processes'][0]['ports'] == [port]
+        assert [p['name'] for p in listed['processes']] == ['web'] and listed['finished_commands'] == 1
         quiet = await development.execute_command.ainvoke({'command': sys.executable, 'background': True,
             'arguments': ['-c', 'pass'], 'ready_port': free_port()})
         assert tool_result_failed(quiet) and quiet['error_details']['code'] == 'service_not_ready'
@@ -257,10 +264,12 @@ def test_environment_reports_host_command_conventions(tmp_path, monkeypatch):
     monkeypatch.setattr(development.platform, 'system', lambda: 'Darwin')
     token = active_workspace.set(tmp_path)
     try:
-        host = development.detect_environment.invoke({})['host']
+        host = asyncio.run(development.detect_environment.ainvoke({}))['host']
     finally:
         active_workspace.reset(token)
     assert host['userland'] == 'BSD' and any('lsof' in note for note in host['notes'])
+    # An empty project still names the interpreter commands will run.
+    assert host['executables']['python3'] == shutil.which('python3')
 
 
 def test_browser_check_accepts_expected_error_paths():
@@ -268,3 +277,20 @@ def test_browser_check_accepts_expected_error_paths():
     check = BrowserCheck.model_validate({'url': 'http://localhost:5173/', 'expect_errors': True,
                                          'actions': [{'action': 'wait_visible', 'selector': '.state.error'}]})
     assert check.expect_errors is True
+
+
+def test_review_facts_mark_files_a_task_created_itself(tmp_path):
+    """Deleting placeholders the task wrote is routine; deleting files the snapshot
+    started with is not. The reviewer gets the fact, and still decides."""
+    import json
+    from app.execution.permissions import operation_facts
+    work = tmp_path / '.wdrunge-runs' / 'abc' / 'work'
+    (work / 'frontend' / 'assets').mkdir(parents=True)
+    (work / 'docs').mkdir()
+    (work.parent / 'manifest.json').write_text(json.dumps({'docs/api.md': 'h', 'frontend/index.html': 'h'}))
+    facts = lambda path, **extra: operation_facts({'workspace': str(work), 'kind': 'delete', 'path': str(work / path), **extra}, [])
+    assert facts('frontend/assets', recursive=True)['created_by_this_task'] is True
+    assert facts('frontend/index.html')['created_by_this_task'] is False
+    assert facts('frontend', recursive=True)['created_by_this_task'] is False
+    # Outside a task snapshot there is no record, so nothing is claimed.
+    assert 'created_by_this_task' not in operation_facts({'workspace': str(tmp_path), 'kind': 'delete', 'path': str(tmp_path / 'x')}, [])
