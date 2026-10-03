@@ -351,6 +351,24 @@ def test_missing_delivery_does_not_publish_partial_edits(tmp_path):
     run(scenario())
 
 
+def test_directory_artifact_needs_a_file_inside(tmp_path):
+    async def scenario():
+        store, s, p, workspace = await setup(tmp_path)
+        r = await s.create_request(p, 'leader', 'backend', 'Build API', 'api', artifacts=['backend/'])
+        job = (await s.claim())[2]
+        w = await s.prepare_workspace(p, r['id'])
+        (w.work/'backend').mkdir()
+        with pytest.raises(ValueError, match='backend/'):
+            await s.publish_artifacts(p, r['id'], job['instance_id'])
+        (w.work/'backend'/'main.py').write_text('app = None\n')
+        await s.publish_artifacts(p, r['id'], job['instance_id'])
+        assert (workspace/'backend'/'main.py').read_text() == 'app = None\n'
+        await s.transition(p, r['id'], 'backend', 'review', 'API delivered', artifacts=['backend/'])
+        assert (await s.get_request(p, r['id']))['state'] == 'review'
+        await store.close()
+    run(scenario())
+
+
 def test_command_api_and_revision_trace(tmp_path):
     from fastapi import FastAPI
     from fastapi.testclient import TestClient
@@ -399,7 +417,7 @@ def test_persisted_leader_dispatches_then_wakes_to_accept(tmp_path, monkeypatch)
     from app.agents.team import Team
     from app.agents.worker import WorkerAgent
     from app.collaboration.runtime import Scheduler
-    from app.tools._workspace import workspace_root
+    from app.agents.tools._workspace import workspace_root
     from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
     from langgraph.checkpoint.memory import InMemorySaver
     async def fake_worker(self, task, **kwargs):
@@ -486,6 +504,11 @@ def test_group_mentions_show_only_summaries_with_durable_details_and_replies(tmp
         with pytest.raises(ValueError):
             await s.send(p, 'frontend', 'backend', 'Details', 'too-long', c, summary='x'*161)
         assert len((await store.get_conversation_detail(c))['messages']) == 2
+        from app.agents.identity import member_name
+        await s.send(p, 'leader', 'backend', 'Details', 'self-mention', c, summary=f'@{member_name("backend")} 端口改为 8010')
+        latest = (await store.get_conversation_detail(c))['messages'][-1]
+        assert latest['content'] == f'@{member_name("backend")} 端口改为 8010'
+        assert latest['mentions'][0]['summary'] == '端口改为 8010'
         await store.close()
     run(scenario())
 
@@ -636,5 +659,89 @@ def test_live_usage_counts_concurrent_instances_before_completion(tmp_path, monk
         await tasks[1]
         assert usage()[0]['total_tokens'] == 320
         assert not scheduler.active_workers
+        await store.close()
+    run(scenario())
+
+
+def test_frontend_waiting_for_backend_implementation_needs_a_reason(tmp_path):
+    from app.collaboration.tools import with_parallel_advice
+    async def scenario():
+        store, s, p, workspace = await setup(tmp_path)
+        contract = await s.create_request(p, 'leader', 'backend', 'Publish API contract', 'contract', artifacts=['docs/backend/api-contract.md'])
+        implementation = await s.create_request(p, 'leader', 'backend', 'Implement API', 'impl', artifacts=['backend/', 'docs/backend/api-contract.md'])
+        with pytest.raises(ValueError, match=rf"{implementation['id']}.*needs=\[\{{document"):
+            await s.create_request(p, 'leader', 'frontend', 'Page', 'page-serial', dependencies=[implementation['id']])
+        serial = await s.create_request(p, 'leader', 'frontend', 'Page', 'page-serial', dependencies=[implementation['id']],
+                                        serial_reason='Visual regression needs the running backend')
+        assert serial['serial_reason'] == 'Visual regression needs the running backend'
+        parallel = await with_parallel_advice(s, p, await s.create_request(p, 'leader', 'frontend', 'Page', 'page-parallel', dependencies=[contract['id']]))
+        assert 'advice' not in parallel
+        testing = await with_parallel_advice(s, p, await s.create_request(p, 'leader', 'testing', 'E2E', 'e2e', dependencies=[implementation['id']]))
+        assert 'advice' not in testing
+        readme = await with_parallel_advice(s, p, await s.create_request(p, 'leader', 'frontend', 'Docs', 'docs', artifacts=['backend/README.md'], dependencies=[contract['id']]))
+        assert 'Artifacts overlap' in readme['advice'] and implementation['id'] in readme['advice']
+        ordered = await with_parallel_advice(s, p, await s.create_request(p, 'leader', 'testing', 'Notes', 'notes', artifacts=['backend/notes.md'], dependencies=[implementation['id']]))
+        assert 'advice' not in ordered
+        await store.close()
+    run(scenario())
+
+
+def test_task_can_deliver_a_shared_document_it_published_mid_task(tmp_path):
+    from app.collaboration.tools import Context, active, execute_collaboration
+    async def scenario():
+        store, s, p, workspace = await setup(tmp_path)
+        r = await s.create_request(p, 'leader', 'backend', 'Contract and API', 'api', artifacts=['backend/', 'docs/api-contract.md'])
+        job = (await s.claim())[2]
+        w = await s.prepare_workspace(p, r['id'])
+        (w.work/'backend').mkdir()
+        (w.work/'backend'/'app.py').write_text('app = None\n')
+        token = active.set(Context(s, p, 'backend', '', 'ctx', request=r['id'], instance_id=job['instance_id']))
+        try:
+            result = await execute_collaboration('publish', {'changes': [
+                {'path': 'docs/api-contract.md', 'base_version': 0, 'summary': 'Contract', 'content': '# API\nGET /api/hello\n'}]})
+            assert result['revisions'][0]['version'] == 1, result
+        finally:
+            active.reset(token)
+        # The published document is visible to file tools in the task snapshot...
+        assert (w.work/'docs'/'api-contract.md').read_text() == '# API\nGET /api/hello\n'
+        # ...and both the implementation and the shared document count as delivered.
+        await s.publish_artifacts(p, r['id'], job['instance_id'])
+        assert (workspace/'backend'/'app.py').is_file()
+        assert (await s.get_request(p, r['id']))['merged_paths'] == ['backend/app.py']
+        # A deliverable document published outside this task (no snapshot sync) also counts.
+        other = await s.create_request(p, 'leader', 'backend', 'Notes', 'notes', artifacts=['docs/notes.md'])
+        job = (await s.claim())[2]
+        await s.prepare_workspace(p, other['id'])
+        await s.publish(p, 'leader', [{'path': 'docs/notes.md', 'base_version': 0, 'summary': 'Notes', 'content': '# Notes\n'}])
+        await s.publish_artifacts(p, other['id'], job['instance_id'])
+        await store.close()
+    run(scenario())
+
+
+def test_file_tools_point_to_published_documents_missing_from_snapshot(tmp_path):
+    from app.collaboration.tools import Context, active
+    from app.agents.tools._workspace import active_workspace
+    from app.agents.tools.read_project_file import make_read_project_file
+    from app.agents.tools.write_project_file import make_write_project_file
+    from app.agents.tools.file_management import make_file_management
+    async def scenario():
+        store, s, p, workspace = await setup(tmp_path)
+        document = (await s.publish(p, 'backend', [{'path': 'docs/api-contract.md', 'base_version': 0, 'summary': 'Contract', 'content': '# API\n'}]))[0]
+        snapshot = tmp_path / 'snapshot'
+        snapshot.mkdir()
+        read = make_read_project_file(('.',))
+        write = make_write_project_file(('.',))
+        browse = next(t for t in make_file_management(('.',), ('.',)) if t.name == 'browse_directory')
+        tokens = active.set(Context(s, p, 'backend', '', 'ctx')), active_workspace.set(snapshot)
+        try:
+            with pytest.raises(FileNotFoundError, match=document['document_id']):
+                read.func(path='docs/api-contract.md')
+            with pytest.raises(FileNotFoundError, match='Directory does not exist.*collaboration_read'):
+                browse.func(path='docs')
+            with pytest.raises(ValueError, match='already counts as delivered'):
+                write.func(path='docs/api-contract.md', content='# API v2\n')
+        finally:
+            active_workspace.reset(tokens[1])
+            active.reset(tokens[0])
         await store.close()
     run(scenario())

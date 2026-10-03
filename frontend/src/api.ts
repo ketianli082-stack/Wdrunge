@@ -1,4 +1,4 @@
-import type { TeamMemberResponse, TeamStatusResponse, TeamUsageResponse } from "./generated";
+import type { ConversationUsageResponse, TeamMemberResponse, TeamStatusResponse, TeamUsageResponse } from "./generated";
 
 export type TeamMember = TeamMemberResponse;
 export type TeamUsage = TeamUsageResponse;
@@ -81,7 +81,7 @@ export type ConversationDetail = ConversationSummary & {
 };
 
 const API_BASE_URL = (
-  import.meta.env.VITE_API_BASE_URL || "http://127.0.0.1:8000"
+  import.meta.env.VITE_API_BASE_URL || "http://127.0.0.1:17420"
 ).replace(/\/$/, "");
 
 async function requestJson<T>(path: string, init?: RequestInit): Promise<T> {
@@ -95,6 +95,12 @@ export type ConversationEvent = { sequence: number; type: string; payload: Recor
 export async function getConversationEvents(id: string, after: number, signal?: AbortSignal) {
   return requestJson<{events: ConversationEvent[]; cursor: number; has_more: boolean}>(
     `/api/conversations/${encodeURIComponent(id)}/events?after=${after}`, { signal });
+}
+
+export type SessionUsage = ConversationUsageResponse;
+
+export function getConversationUsage(id: string, signal?: AbortSignal): Promise<SessionUsage> {
+  return requestJson<SessionUsage>(`/api/conversations/${encodeURIComponent(id)}/usage`, { signal });
 }
 
 export async function getTeamStatus(signal?: AbortSignal): Promise<TeamStatusResponse> {
@@ -196,6 +202,9 @@ export async function streamConversationMessage(
       description?: string;
       phase?: Activity["phase"];
       total_tokens?: number;
+      cache_input_tokens?: number;
+      cached_tokens?: number;
+      cache_percent?: number | null;
       agents?: TeamUsage["agents"];
       title?: string;
     };
@@ -216,7 +225,8 @@ export async function streamConversationMessage(
       callbacks.onActivity?.({ id: payload.id, agent: payload.agent, tool: payload.tool, description: payload.description, phase: payload.phase });
     }
     if (event === "usage" && typeof payload.total_tokens === "number" && Array.isArray(payload.agents)) {
-      callbacks.onUsage?.({ total_tokens: payload.total_tokens, agents: payload.agents });
+      callbacks.onUsage?.({ total_tokens: payload.total_tokens, cache_input_tokens: payload.cache_input_tokens,
+        cached_tokens: payload.cached_tokens, cache_percent: payload.cache_percent, agents: payload.agents });
     }
     if (event === "title" && payload.title) callbacks.onTitle?.(payload.title);
     if (event === "error") throw new Error(payload.message || "Agent request failed");
@@ -248,4 +258,25 @@ export function clearAllRecords(): Promise<{ cleared: boolean; workspace_files_p
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ confirmation: "CLEAR_ALL_RECORDS" }),
   });
+}
+
+export type ConversationExecution = {
+  running: boolean;
+  stopping: boolean;
+  paused: boolean;
+  pending_tasks: number;
+  active_goals: number;
+};
+export function getConversationExecution(id: string, signal?: AbortSignal): Promise<ConversationExecution> {
+  return requestJson(`/api/conversations/${encodeURIComponent(id)}/execution`, { signal });
+}
+export function stopConversationExecution(id: string): Promise<ConversationExecution> {
+  return requestJson(`/api/conversations/${encodeURIComponent(id)}/execution/stop`, { method: 'POST' });
+}
+export function resumeConversationExecution(id: string): Promise<ConversationExecution> {
+  return requestJson(`/api/conversations/${encodeURIComponent(id)}/execution/resume`, { method: 'POST' });
+}
+
+export function pausePreviousExecution(keepalive = false): Promise<{ paused_conversations: number }> {
+  return requestJson('/api/execution/pause', { method: 'POST', keepalive });
 }

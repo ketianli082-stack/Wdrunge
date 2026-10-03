@@ -4,21 +4,42 @@ from collections.abc import AsyncIterator
 from typing import TYPE_CHECKING, Literal
 from uuid import uuid4
 
-from langchain_core.messages import AIMessage, AIMessageChunk, BaseMessage, HumanMessage, SystemMessage
+from langchain_core.messages import AIMessage, AIMessageChunk, BaseMessage, HumanMessage, SystemMessage, ToolMessage, RemoveMessage
 from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.graph.message import REMOVE_ALL_MESSAGES
 from langgraph.graph import END, START, MessagesState, StateGraph
 from langgraph.prebuilt import ToolNode, tools_condition
 
+from app.agents.memory import ContextMemory, reminder, is_context_overflow, message_tokens
+from app.collaboration.reminders import goal_messages, with_goal_state
+from app.agents.tools.checkpoint_context import checkpoint_context
+from app.agents.tools.recall_context import make_recall_context
+from app.agents.resilience import ainvoke_with_retry
+import logging
+
+logger = logging.getLogger(__name__)
 from app.agents.limits import graph_recursion_limit
-from app.tools.validation import tool_error, tool_result_failed
-from app.agents.base import Agent
-from app.collaboration.tools import active, collaborate
+from app.agents.tools.validation import tool_error, tool_result_failed, normalize_failure, model_tool_schemas
+from app.agents.base import Agent, build_model
+from app.collaboration.tools import active, collaborate, COLLABORATION_TOOLS, model_collaboration_tools, collaboration_action
+from app.collaboration.context import encode_handoff
+from app.agents.tools._workspace import tool_available
 
 if TYPE_CHECKING:
     from langgraph.checkpoint.base import BaseCheckpointSaver
     from app.storage import ChatStore
 
 TOOL_LABELS = {
+    'execute_command': '审核并执行项目命令',
+    'manage_process': '管理任务进程',
+    'detect_environment': '识别项目环境',
+    'browse_directory': '分页浏览目录',
+    'search_code': '检索项目代码',
+    'read_external_file': '申请读取外部配置',
+    'manage_file': '移动或删除项目文件',
+    'browser_verify': '验证页面与交互',
+    "checkpoint_context": "保存交接并继续当前工作",
+    "recall_context": "找回已折叠的上下文",
     "current_utc_time": "查看当前时间",
     "list_project_files": "查看项目文件列表",
     "read_project_file": "读取项目文件",
@@ -27,10 +48,13 @@ TOOL_LABELS = {
     "refresh_frontend_client": "更新前端接口客户端",
     "run_project_check": "运行项目检查",
     "run_service_check": "启动服务并执行冒烟检查",
+    "enable_tools": "启用更多协作工具",
 }
 
 
 COLLABORATION_LABELS = {
+    'create_goal': '创建长期目标', 'get_goal': '查看目标与任务', 'update_goal': '更新目标状态',
+    'complete_goal': '验收目标', 'create_task': '创建目标任务', 'submit_task': '提交任务交付', 'complete_task': '验收目标任务',
     'catalog': '查看交付文档目录', 'read': '读取文档章节', 'publish': '发布文档修订',
     'subscribe': '订阅文档变化', 'send': '在群里 @ 成员沟通', 'request': '发起协作任务',
     'inspect_request': '查看任务进展', 'wait': '等待依赖交付', 'transition': '更新任务交付与验收状态',
@@ -41,14 +65,22 @@ COLLABORATION_LABELS = {
 }
 
 
+class WorkerState(MessagesState):
+    needs_clean: bool
+    clean_retry: bool
+
+
 class WorkerAgent(Agent):
     def __init__(self, spec):
         super().__init__(spec)
         self._checkpointer = InMemorySaver()
         self._graph = None
+        self._graph_tool_names = None
         self._threads: dict[str, str] = {}
         self._context_by_session: dict[str, int] = {}
         self._store: ChatStore | None = None
+        self._task: dict | None = None
+        self._scale: str | None = None
 
     async def configure_persistence(
         self, store: "ChatStore", checkpointer: "BaseCheckpointSaver"
@@ -64,30 +96,103 @@ class WorkerAgent(Agent):
             if session["context_tokens"] is not None:
                 self._context_by_session[session["conversation_id"]] = session["context_tokens"]
 
-    def build_graph(self):
-        if self._graph is not None:
-            return self._graph
-        model = self.model()
-        tools = [*self.spec.tools] + ([collaborate] if active.get() else [])
-        runnable = model.bind_tools(tools) if tools else model
+    def snapshot(self):
+        result = super().snapshot()
+        for name in ('checkpoint_context', 'recall_context'):
+            if name not in result['tools']:
+                result['tools'].append(name)
+        return result
 
-        async def call_model(state: MessagesState):
+    def executable_tools(self):
+        from app.collaboration.tools import enable_tools
+        tools = [*self.spec.tools, *([] if any(t.name == "checkpoint_context" for t in self.spec.tools) else [checkpoint_context]),
+                 make_recall_context(lambda: self._store), *model_collaboration_tools()]
+        # Hidden groups must stay reachable even outside team collaboration.
+        return tools if any(t.name == 'enable_tools' for t in tools) else [*tools, enable_tools]
+
+    def bound_tools(self, messages=(), tools=None):
+        """Tools offered on a call: the role's core set, groups implied by the current
+        task and groups enabled so far (see app.agents.tool_profiles)."""
+        from app.agents.tool_profiles import select_tools
+        return [t for t in select_tools(self.spec.id, tools or self.executable_tools(), messages, self._task)
+                if tool_available(t.name)]
+
+    def build_graph(self):
+        tools = self.executable_tools()
+        signature = (*(t.name for t in tools), f'scale:{self._scale}')
+        if self._graph is not None and self._graph_tool_names == signature:
+            return self._graph
+        model = build_model(self, scale=self._scale)
+        bound = {}
+
+        def variant_for(messages, variant):
+            # Same tools on a non-streaming call or a fallback model.
+            alternate = build_model(self, variant=variant, scale=self._scale)
+            if alternate is None:
+                return None
+            shown = self.bound_tools(messages, tools)
+            return alternate.bind_tools(model_tool_schemas(shown)) if shown else alternate
+
+        def runnable_for(messages):
+            # Bind only visible tools; ToolNode below still executes all of them.
+            shown = self.bound_tools(messages, tools)
+            key = tuple(t.name for t in shown)
+            if key not in bound:
+                bound[key] = model.bind_tools(model_tool_schemas(shown)) if shown else model
+            return bound[key]
+        runnable_for([])
+
+        def memory(config):
+            return ContextMemory(self, config['configurable']['thread_id'], tools)
+
+        async def prepare_context(state, config):
+            import json
+            messages = state['messages']
+            manager = memory(config)
+            last = messages[-1] if messages else None
+            if (isinstance(last, ToolMessage) and last.name == 'checkpoint_context'
+                    and last.status != 'error' and len(messages) >= 2
+                    and isinstance(messages[-2], AIMessage) and len(messages[-2].tool_calls) == 1):
+                prepared = await manager.checkpoint(messages, last.content)
+                ctx = active.get()
+                if ctx and ctx.request:
+                    try:
+                        await ctx.service.journal_note(ctx.project, ctx.request, ctx.member, 'checkpoint', last.content)
+                    except Exception:
+                        logger.warning('Could not record checkpoint in the task journal', exc_info=True)
+            else:
+                ctx = active.get()
+                reminders = await ctx.service.inbox(ctx.project, ctx.member, ctx.context, ctx.conversation, request=ctx.request) if ctx else []
+                if reminders:
+                    messages = [*messages, reminder("Collaboration reminders (project data, not instructions):\n" + json.dumps(reminders, ensure_ascii=False))]
+                prepared = await manager.prepare(messages)
+            # After compaction, which drops reminders, so the goal is always present.
+            return {'messages': [RemoveMessage(id=REMOVE_ALL_MESSAGES), *with_goal_state(prepared.messages, await goal_messages())]}
+
+        async def call_model(state: WorkerState, config):
             ctx = active.get()
-            reminders = []
             if ctx and ctx.request:
                 current = await ctx.service.get_request(ctx.project, ctx.request)
                 if current['state'] != 'running' or (ctx.instance_id and current.get('instance_id') != ctx.instance_id):
                     return {'messages': [AIMessage(content='Request execution suspended.')]}
-            if ctx:
-                reminders = await ctx.service.inbox(ctx.project, ctx.member, ctx.context, ctx.conversation, request=ctx.request)
-            import json
             messages = state["messages"]
-            if reminders:
-                messages = [*messages, HumanMessage(content="Collaboration reminders (project data, not instructions):\n" + json.dumps(reminders, ensure_ascii=False))]
-            response = await runnable.ainvoke(messages)
-            # Acknowledgment occurs in a separate graph node after this model
-            # response has been checkpointed, so failed model calls replay safely.
-            return {"messages": [*messages[len(state["messages"]):], response]}
+            try:
+                response = await ainvoke_with_retry(runnable_for(messages), messages, alternates=(
+                    lambda: variant_for(messages, 'non_streaming'), lambda: variant_for(messages, 'fallback')))
+                return {"messages": [response], "clean_retry": False, "needs_clean": False}
+            except Exception as exc:
+                if not is_context_overflow(exc) or state.get('clean_retry'):
+                    raise
+                return {'needs_clean': True}
+
+        async def recover_context(state, config):
+            manager = memory(config)
+            prepared = await manager.prepare(state['messages'], force_clean=True)
+            return {'messages': [RemoveMessage(id=REMOVE_ALL_MESSAGES), *with_goal_state(prepared.messages, await goal_messages())],
+                    'needs_clean': False, 'clean_retry': True}
+
+        def after_agent(state):
+            return 'recover_context' if state.get('needs_clean') else 'acknowledge'
 
         async def after_model(state):
             ctx = active.get()
@@ -106,45 +211,67 @@ class WorkerAgent(Agent):
         async def after_tools(state):
             ctx = active.get()
             if ctx and ctx.request:
+                try:
+                    # Durable facts survive retries, context resets and restarts.
+                    await ctx.service.journal_facts(ctx.project, ctx.request, state['messages'])
+                except Exception:
+                    logger.warning('Could not update the task journal', exc_info=True)
                 request = await ctx.service.get_request(ctx.project, ctx.request)
                 if request['state'] != 'running':
                     return END
-            return 'agent'
+            return 'memory'
 
-        graph = StateGraph(MessagesState)
+        graph = StateGraph(WorkerState)
         graph.add_node("agent", call_model)
-        graph.add_edge(START, "agent")
+        graph.add_node("memory", prepare_context)
+        graph.add_node("recover_context", recover_context)
+        graph.add_edge("recover_context", "agent")
+        graph.add_edge(START, "memory")
+        graph.add_edge("memory", "agent")
         if tools:
-            tool_node = ToolNode(tools, handle_tool_errors=tool_error)
+            tool_node = ToolNode([*tools, *([collaborate] if active.get() else [])], handle_tool_errors=tool_error)
 
             async def guarded_tools(state, config):
                 ctx = active.get()
-                if not ctx:
-                    return await tool_node.ainvoke(state, config)
                 from langchain_core.messages import ToolMessage
                 results = []
                 last = state['messages'][-1]
                 # Ordered mutations: a wait/cancel/delivery takes effect before
                 # any subsequent tool in the same model response may execute.
                 for call in last.tool_calls:
-                    if ctx.request:
+                    if call['name'] == 'checkpoint_context' and len(last.tool_calls) != 1:
+                        results.append(ToolMessage(content='Call checkpoint_context alone.', name='checkpoint_context', tool_call_id=call['id'], status='error'))
+                        continue
+                    if ctx and ctx.request:
                         current = await ctx.service.get_request(ctx.project, ctx.request)
                         if current['state'] != 'running' or (ctx.instance_id and current.get('instance_id') != ctx.instance_id):
-                            results.append(ToolMessage(content='Request is no longer running; tool skipped.', tool_call_id=call['id']))
+                            results.append(ToolMessage(content='Request is no longer running; tool skipped.', tool_call_id=call['id'], status='error'))
                             continue
                     single = last.model_copy(update={'tool_calls': [call]})
                     result = await tool_node.ainvoke({**state, 'messages': [*state['messages'][:-1], single]}, config)
-                    results.extend(result['messages'])
+                    for message in result['messages']:
+                        if tool_result_failed(message):
+                            import json
+                            try:
+                                output = json.loads(message.content)
+                            except (ValueError, TypeError):
+                                output = {'error': message.content}
+                            if not isinstance(output, dict):
+                                output = {'error': str(output)}
+                            message = message.model_copy(update={'content': json.dumps(
+                                normalize_failure(output, tool_name=call['name']), ensure_ascii=False), 'status': 'error'})
+                        results.append(message)
                 return {'messages': results}
 
             graph.add_node("tools", guarded_tools)
             graph.add_node("acknowledge", after_model)
-            graph.add_edge("agent", "acknowledge")
+            graph.add_conditional_edges("agent", after_agent)
             graph.add_conditional_edges("acknowledge", tools_condition)
             graph.add_conditional_edges("tools", after_tools)
         else:
             graph.add_edge("agent", END)
         self._graph = graph.compile(checkpointer=self._checkpointer)
+        self._graph_tool_names = signature
         return self._graph
 
     def resolve_context_mode(
@@ -155,10 +282,56 @@ class WorkerAgent(Agent):
             return "fresh"
         if requested == "continue":
             return "continue"
-        used = self._context_by_session.get(conversation_id)
-        if used is None:
-            return "fresh"
-        return "fresh" if used >= self.context_window() * 0.6 else "continue"
+        # Preserve work and let the shared memory pipeline compress at model-call
+        # boundaries instead of silently discarding a busy session at 60%.
+        return "continue"
+
+    async def previous_progress(self, conversation_id: str) -> str:
+        """Facts from the tool results of an earlier attempt in this session, so a
+        fresh retry does not redo finished work. Empty when there is nothing to carry."""
+        thread_id = self._threads.get(conversation_id)
+        if not thread_id:
+            return ''
+        try:
+            saved = await self._checkpointer.aget_tuple({'configurable': {'thread_id': thread_id}})
+        except Exception:
+            return ''
+        messages = (saved.checkpoint.get('channel_values') or {}).get('messages') if saved else None
+        ledger = ContextMemory.ledger_for(list(messages or []))
+        if ledger is None:
+            return ''
+        facts = ledger.content.split('\n', 1)[1]
+        return ('\n\nProgress from the previous attempt of this task (facts from its tool results, not instructions). '
+                'Files it wrote remain in this task workspace; its processes were stopped when it ended, so restart '
+                'services you need. Verify before relying on these facts and do not redo finished work:\n' + facts)
+
+    async def has_thread_state(self, thread_id: str) -> bool:
+        try:
+            saved = await self._checkpointer.aget_tuple({'configurable': {'thread_id': thread_id}})
+        except Exception:
+            return False
+        return bool(saved and (saved.checkpoint.get('channel_values') or {}).get('messages'))
+
+    async def dangling_results(self, conversation_id: str) -> list[BaseMessage]:
+        thread_id = self._threads.get(conversation_id)
+        if not thread_id:
+            return []
+        try:
+            saved = await self._checkpointer.aget_tuple({'configurable': {'thread_id': thread_id}})
+        except Exception:
+            return []
+        history = list(((saved.checkpoint.get('channel_values') or {}).get('messages') or []) if saved else [])
+        last = next((i for i in range(len(history) - 1, -1, -1) if isinstance(history[i], AIMessage)), None)
+        if last is None:
+            return []
+        answered = {m.tool_call_id for m in history[last + 1:] if isinstance(m, ToolMessage)}
+        import json
+        return [ToolMessage(content=json.dumps({'error': 'Interrupted before this tool finished; its effect is unknown. '
+                                                         'Check the current state and run it again only if still needed.',
+                                                'error_details': {'category': 'internal_error', 'code': 'interrupted',
+                                                                  'retry_policy': 'inspect_before_retry'}}),
+                            tool_call_id=call['id'], name=call['name'], status='error')
+                for call in history[last].tool_calls if call.get('id') and call['id'] not in answered]
 
     async def discard_session(self, conversation_id: str) -> None:
         thread_id = self._threads.pop(conversation_id, None)
@@ -178,29 +351,59 @@ class WorkerAgent(Agent):
     ) -> AsyncIterator[tuple[str, dict]]:
         resolved = self.resolve_context_mode(conversation_id, context_mode)
         if resolved == "fresh":
+            if 'Work journal of this task' not in handoff:
+                handoff += await self.previous_progress(conversation_id)
             await self.discard_session(conversation_id)
             self._threads[conversation_id] = uuid4().hex
             if self._store:
                 await self._store.save_agent_session(
                     conversation_id, self.spec.id, self._threads[conversation_id], None
                 )
-            prompt = self.system_prompt()
-            if active.get():
-                from pathlib import Path
-                prompt += '\n\n' + (Path(__file__).parent/'prompts/collaboration.md').read_text()
+            prompt = self.full_system_prompt(collaborative=active.get() is not None)
             messages: list[BaseMessage] = [SystemMessage(content=prompt)]
         else:
-            messages = []
+            # Resuming an interrupted run: answer tool calls that never got results.
+            messages = await self.dangling_results(conversation_id)
         ctx = active.get()
+        self._task = None
+        self._scale = None
+        if ctx and ctx.request:
+            try:
+                self._task = await ctx.service.get_request(ctx.project, ctx.request)
+                if self._task.get('goal_id'):
+                    async with ctx.service.reading() as c:
+                        goal = await ctx.service._get(c, 'goal', ctx.project, self._task['goal_id'], False)
+                    self._scale = (goal or {}).get('scale')
+            except Exception:
+                self._task = None
         if ctx:
             ctx.context = self._threads[conversation_id]
             catalog = await ctx.service.handoff(ctx.project, ctx.member)
-            import json
-            messages.append(HumanMessage(content="Project handoff (read document outlines before sections): " + json.dumps(catalog, ensure_ascii=False)[:10000]))
+            messages.append(HumanMessage(content="Project handoff (read versioned outlines before sections; remaining counts require catalog/snapshot): " + encode_handoff(catalog)))
         messages.append(HumanMessage(content=f"Assigned task: {task}\n\nHandoff context:\n{handoff}"))
         yield "context", {"mode": resolved}
-        tool_names = {tool.name for tool in self.spec.tools} | {"collaborate"}
+        tool_names = {tool.name for tool in self.spec.tools} | {"checkpoint_context", "recall_context", "collaborate", "enable_tools", *COLLABORATION_TOOLS}
         active_tools: dict[str, tuple[str, str]] = {}
+        from app.agents.stall import StreamTrace
+        trace = StreamTrace()
+        try:
+            async for item in self._events(messages, conversation_id, ctx, tool_names, active_tools, trace):
+                yield item
+        except Exception as error:
+            unfinished = trace.pending()
+            if unfinished:
+                await self._record_stall({**unfinished, 'outcome': 'failed', 'error': type(error).__name__}, ctx)
+            raise
+
+    async def _record_stall(self, facts, ctx):
+        logger.warning('Model call stalled or failed mid-stream: %s', facts)
+        if ctx and ctx.request:
+            try:
+                await ctx.service.journal_stall(ctx.project, ctx.request, facts)
+            except Exception:
+                logger.warning('Could not record the stall in the task journal', exc_info=True)
+
+    async def _events(self, messages, conversation_id, ctx, tool_names, active_tools, trace):
         async for event in self.build_graph().astream_events(
             {"messages": messages},
             config={"configurable": {"thread_id": self._threads[conversation_id]},
@@ -208,11 +411,22 @@ class WorkerAgent(Agent):
             version="v2",
             **({"durability": "sync"} if ctx else {}),
         ):
+            if "context_compaction" in event.get("tags", []):
+                continue
             kind = event["event"]
+            if event.get("metadata", {}).get("langgraph_node") == "agent":
+                if kind == "on_chat_model_start":
+                    unfinished = trace.start()
+                    if unfinished:  # the previous attempt of this call stalled and was retried
+                        await self._record_stall({**unfinished, 'outcome': 'retried'}, ctx)
+                elif kind == "on_chat_model_stream":
+                    trace.chunk(event.get("data", {}).get("chunk"))
+                elif kind == "on_chat_model_end":
+                    trace.end()
             name = event.get("name", "")
             run_id = str(event.get("run_id", ""))
             if kind == "on_tool_start" and name in tool_names:
-                description = COLLABORATION_LABELS.get(event.get('data', {}).get('input', {}).get('action'), '协调团队工作') if name == 'collaborate' else TOOL_LABELS.get(name, '调用工具')
+                description = COLLABORATION_LABELS.get(collaboration_action(name, event.get('data', {}).get('input', {})), '协调团队工作') if name == 'collaborate' or name in COLLABORATION_TOOLS else TOOL_LABELS.get(name, '调用工具')
                 active_tools[run_id] = (name, description)
                 yield "activity", {
                     "id": run_id,
@@ -233,7 +447,7 @@ class WorkerAgent(Agent):
                 if isinstance(chunk, AIMessageChunk) and isinstance(chunk.content, str) and chunk.content:
                     yield "content", {"content": chunk.content}
             elif kind == "on_chat_model_end" and event.get("metadata", {}).get("langgraph_node") == "agent":
-                if self.record_usage(event.get("data", {}).get("output")):
+                if await self.record_usage_durable(event.get("data", {}).get("output")):
                     self._context_by_session[conversation_id] = self.context_tokens
                     if self._store:
                         await self._store.save_agent_session(

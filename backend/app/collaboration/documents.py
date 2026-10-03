@@ -53,32 +53,61 @@ def page(content: str, offset: int, limit: int) -> tuple[str, int | None, bool]:
 
 
 def section(content: str, section_id: str) -> dict:
-    return next((s for s in outline(content) if s['id'] == section_id), None) or (_ for _ in ()).throw(ValueError("Section not found; reload outline"))
+    return next((s for s in outline(content) if s['id'] == section_id), None) or (_ for _ in ()).throw(ValueError(f"Section not found: {section_id}; reload the versioned outline, then use its exact section IDs"))
+
+
+class DocumentEditError(ValueError):
+    def __init__(self, index, edit, reason):
+        self.details = {'edit_index': index, 'section_id': edit.get('section_id'),
+                        'operation': edit.get('operation')}
+        super().__init__(f"edits[{index}] ({edit.get('operation')}, section {edit.get('section_id')}): {reason}. "
+                         'The batch was not applied. Edits run in order; reload the outline/body and reconcile structural changes before retrying.')
+
+
+def _replace_body(content, start, end, body):
+    # The following heading (or closing fence) must start on its own line.
+    # Model-generated replacement strings commonly omit the trailing newline.
+    if body and content[end:] and not body.endswith('\n'):
+        body += '\n\n'
+    updated = content[:start] + body + content[end:]
+    before = {s['id'] for s in outline(content)}
+    after = {s['id'] for s in outline(updated)}
+    if before - after:
+        raise ValueError('Replacement would remove or reparent existing headings; check Markdown fences and heading levels, or use explicit structural edits')
+    return updated
 
 
 def edit_document(content: str, edits: list[dict]) -> str:
-    for edit in edits:
-        s = section(content, edit['section_id'])
-        start, end = s['body_start'], s['body_end']
-        op = edit['operation']
-        if op == 'replace_text':
-            old = edit.get('old_text', '')
-            body = content[start:end]
-            if not old or body.count(old) != 1:
-                raise ValueError('old_text must match exactly once in the direct section body')
-            content = content[:start] + body.replace(old, edit.get('new_text', ''), 1) + content[end:]
-        elif op == 'replace_section_body':
-            content = content[:start] + edit.get('new_text', '') + content[end:]
-        elif op == 'insert_section':
-            content = content[:s['end']] + '\n' + edit['new_text'] + '\n' + content[s['end']:]
-        elif op == 'delete_section':
-            if s['id'] == 'root':
-                raise ValueError('Cannot delete document root')
-            if s['body_end'] != s['end'] and not edit.get('include_children'):
-                raise ValueError('Explicit include_children required')
-            content = content[:s['start']] + content[s['end']:]
-        else:
-            raise ValueError('Unsupported edit operation')
+    for index, edit in enumerate(edits):
+        try:
+            content = _edit_document(content, edit)
+        except (ValueError, KeyError) as exc:
+            raise DocumentEditError(index, edit, str(exc)) from exc
     if len(content) > 500_000:
         raise ValueError('Document exceeds 500,000 characters')
+    return content
+
+
+def _edit_document(content: str, edit: dict) -> str:
+    s = section(content, edit['section_id'])
+    start, end = s['body_start'], s['body_end']
+    op = edit['operation']
+    if op == 'replace_text':
+        old = edit.get('old_text', '')
+        body = content[start:end]
+        if not old or body.count(old) != 1:
+            raise ValueError('old_text must match exactly once in the direct section body')
+        content = _replace_body(content, start, end, body.replace(old, edit['new_text'], 1))
+    elif op == 'replace_section_body':
+        content = _replace_body(content, start, end, edit['new_text'])
+    elif op == 'insert_section':
+        content = content[:s['end']] + '\n' + edit['new_text'] + '\n' + content[s['end']:]
+    elif op == 'delete_section':
+        if s['id'] == 'root':
+            raise ValueError('Cannot delete document root')
+        if s['body_end'] != s['end'] and not edit.get('include_children'):
+            raise ValueError('Explicit include_children required')
+        content = content[:s['start']] + content[s['end']:]
+    else:
+        raise ValueError('Unsupported edit operation')
     return content

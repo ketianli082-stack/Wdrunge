@@ -1,6 +1,8 @@
 """Team registry and leader-coordinated parallel specialist handoffs."""
+from contextlib import aclosing
 
 import asyncio
+import json
 import logging
 import time
 from collections.abc import AsyncIterator
@@ -10,26 +12,33 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 from uuid import uuid4
 
-from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage, ToolMessage
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage, messages_to_dict, messages_from_dict
 from pydantic import ValidationError
 
+from app.agents.memory import ContextMemory, reminder, is_context_overflow
 from app.agents.base import AgentSpec, AgentStatus
-from app.collaboration.tools import Context, active, collaborate
+from app.collaboration.tools import Context, active, collaborate, COLLABORATION_TOOLS, collaboration_action, model_collaboration_tools
+from app.collaboration.context import encode_handoff, coordination_update
 from app.agents.leader import LeaderAgent
 from app.agents.identity import member_name
 from app.agents.worker import WorkerAgent
-from app.tools.current_utc_time import current_utc_time
-from app.tools.checkpoint_context import ContextCheckpoint, checkpoint_context
-from app.tools.delegate_task import Delegation, delegate_task
-from app.tools.delegate_tasks import DelegationBatch, delegate_tasks
-from app.tools.list_project_files import make_list_project_files
-from app.tools.read_project_file import make_read_project_file
-from app.tools.refresh_api_contract import refresh_api_contract
-from app.tools.refresh_frontend_client import refresh_frontend_client
-from app.tools.run_project_check import run_project_check
-from app.tools.run_service_check import run_service_check
-from app.tools.write_project_file import make_write_project_file
-from app.tools._workspace import active_workspace, workspace_root
+from app.agents.tools.current_utc_time import current_utc_time
+from app.agents.tools.checkpoint_context import ContextCheckpoint, checkpoint_context
+from app.agents.tools.recall_context import recall, recall_context
+from app.agents.tools.delegate_task import Delegation, delegate_task
+from app.agents.tools.delegate_tasks import DelegationBatch, delegate_tasks
+from app.agents.tools.list_project_files import make_list_project_files
+from app.agents.tools.read_project_file import make_read_project_file
+from app.agents.tools.refresh_api_contract import refresh_api_contract
+from app.agents.tools.refresh_frontend_client import refresh_frontend_client
+from app.agents.tools.run_project_check import run_project_check
+from app.agents.tools.run_service_check import run_service_check
+from app.agents.tools.write_project_file import make_write_project_file
+from app.agents.tools._workspace import active_workspace, workspace_root
+from app.agents.tools.development import development_tools
+from app.agents.tools.file_management import make_file_management
+from app.agents.tools.browser_verify import browser_verify
+from app.agents.tools.validation import exception_result, validation_failure, failure_result, normalize_failure
 
 if TYPE_CHECKING:
     from langgraph.checkpoint.base import BaseCheckpointSaver
@@ -116,6 +125,11 @@ class Team:
                 make_read_project_file(read_roots),
                 make_write_project_file(write_roots),
             )
+            tools += make_file_management(read_roots, write_roots)
+            if role in {'backend', 'frontend', 'testing'}:
+                tools += development_tools
+            if role in {'frontend', 'testing'}:
+                tools += (browser_verify,)
             if role == "testing":
                 tools += (run_project_check, run_service_check,)
             if role == "backend":
@@ -141,13 +155,21 @@ class Team:
         self._store: ChatStore | None = None
         self.collaboration = None
         self._pending_leader_receipts = {}
+        self._context_memories = {}
 
     async def configure_persistence(
         self, store: "ChatStore", checkpointer: "BaseCheckpointSaver"
     ) -> None:
         self._store = store
         self._checkpointer = checkpointer
+        self.leader._store = store
+        totals = await store.load_agent_usage()
+        cache = await store.load_agent_cache_usage()
+        for agent in (self.leader, *self.workers.values()):
+            agent.total_tokens = totals.get(agent.spec.id, 0)
+            agent.cache_input_tokens, agent.cached_tokens = cache.get(agent.spec.id, (0, 0))
         self._leader_checkpoints.clear()
+        self._context_memories.clear()
         for row in await store.load_leader_checkpoints():
             self._leader_checkpoints[row["conversation_id"]] = LeaderCheckpoint(
                 handoff=ContextCheckpoint.model_validate(row["handoff_json"]),
@@ -159,10 +181,12 @@ class Team:
     def clear_runtime_memory(self):
         """Called only after all coordinator and scheduler tasks have stopped."""
         self._leader_checkpoints.clear()
+        self._context_memories.clear()
         self._pending_leader_receipts.clear()
         for agent in (self.leader, *self.workers.values()):
             agent.total_tokens = 0
             agent.context_tokens = 0
+            agent.cache_input_tokens = agent.cached_tokens = 0
             agent.status = AgentStatus.IDLE
         for worker in self.workers.values():
             worker._threads.clear()
@@ -186,15 +210,56 @@ class Team:
                 live = [worker for worker in scheduler.active_workers.values() if worker.spec.id == member['id']]
                 if live:
                     member['total_tokens'] += sum(worker.total_tokens for worker in live)
+                    member['cache_input_tokens'] += sum(worker.cache_input_tokens for worker in live)
+                    member['cached_tokens'] += sum(worker.cached_tokens for worker in live)
                     # Each instance has its own context window; adding contexts
                     # would invent an occupancy that no model actually sees.
                     member['context_tokens'] = max(worker.context_tokens for worker in live)
                     member['context_percent'] = round(member['context_tokens'] / member['context_window'] * 100, 1)
-        return {"total_tokens": sum(member["total_tokens"] for member in members), "agents": members}
+        cache_input = sum(member["cache_input_tokens"] for member in members)
+        cached = sum(member["cached_tokens"] for member in members)
+        return {"total_tokens": sum(member["total_tokens"] for member in members),
+                "cache_input_tokens": cache_input, "cached_tokens": cached,
+                "cache_percent": round(cached * 100 / cache_input, 1) if cache_input else None,
+                "agents": members}
 
-    async def stream(
+    async def cancel_conversation(self, conversation_id):
+        tasks = list(getattr(self, '_conversation_tasks', {}).get(conversation_id, set()))
+        for task in tasks:
+            if not task.cancelling():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def stream(self, history, *, conversation_id=None, workspace_path=None, wake_only=False, generation=None):
+        session_id = conversation_id or uuid4().hex
+        from app.agents.usage import usage_scope
+        # Every model call of this turn (Leader, delegated workers, summaries, reviews)
+        # is attributed to this session.
+        usage_scope.set({**(usage_scope.get() or {}), 'conversation_id': session_id})
+        if not hasattr(self, '_conversation_tasks'):
+            self._conversation_tasks = {}
+        task = asyncio.current_task()
+        self._conversation_tasks.setdefault(session_id, set()).add(task)
+        try:
+            if self.collaboration:
+                project = await self.collaboration.project_for_conversation(session_id)
+                if project and await self.collaboration.conversation_stopped(project, session_id, generation):
+                    return
+                if project and generation is None:
+                    async with self.collaboration.reading() as c:
+                        control = await self.collaboration._get(c, 'conversation_run', project, session_id, False)
+                        generation = control['generation'] if control else None
+            async with aclosing(self._stream(history, conversation_id=session_id, workspace_path=workspace_path, wake_only=wake_only, generation=generation)) as events:
+                async for event in events:
+                    yield event
+        finally:
+            self._conversation_tasks[session_id].discard(task)
+            if not self._conversation_tasks[session_id]:
+                del self._conversation_tasks[session_id]
+
+    async def _stream(
         self, history: list[BaseMessage], *, conversation_id: str | None = None,
-        workspace_path: Path | None = None, wake_only: bool = False,
+        workspace_path: Path | None = None, wake_only: bool = False, generation: str | None = None,
     ) -> AsyncIterator[tuple[str, dict]]:
         """Let the Leader reply or function-call specialists as needed."""
         session_id = conversation_id or uuid4().hex
@@ -205,6 +270,8 @@ class Team:
                 if self.collaboration:
                     project = await self.collaboration.project_for_conversation(session_id)
                     if project:
+                        if await self.collaboration.conversation_stopped(project, session_id, generation):
+                            return
                         if wake_only and not await self.collaboration.inbox(project, 'leader', f'leader:{session_id}', session_id):
                             return
                         await self.collaboration.leader_session(project, session_id, state='running', last_wake=time.time(), retry_after=0, **({'failures': 0} if not wake_only else {}))
@@ -221,6 +288,8 @@ class Team:
                         await self.collaboration.leader_session(ctx.project, session_id, state=state)
                         self.leader.status = AgentStatus(state)
                 finally:
+                    from app.execution.processes import processes
+                    await processes.close(workspace=workspace_root().resolve())
                     if collaboration_token is not None:
                         active.reset(collaboration_token)
                     active_workspace.reset(token)
@@ -232,22 +301,84 @@ class Team:
         self._pending_leader_receipts.pop(conversation_id, None)
         self.leader.status = AgentStatus.RUNNING
         yield "status", {"id": "leader", "status": AgentStatus.RUNNING}
-        system = SystemMessage(content=f"{self.leader.system_prompt()}\n\nCurrent project workspace: {workspace_root().resolve()}. Assignments and project files must stay in this workspace.")
-        if active.get():
-            system.content += '\n\n' + (Path(__file__).parent/'prompts/collaboration.md').read_text()
+        system = SystemMessage(content=f"{self.leader.full_system_prompt(collaborative=active.get() is not None)}\n\nCurrent project workspace: {workspace_root().resolve()}. Assignments and project files must stay in this workspace.")
+        scope = f"leader:{conversation_id}"
+        memory = ContextMemory(self.leader, scope, [delegate_task, delegate_tasks, checkpoint_context, recall_context, *model_collaboration_tools()])
+        saved_memory = self._context_memories.get(scope)
+        if saved_memory is None and self._store:
+            saved_memory = await self._store.load_context_memory(scope)
         checkpoint = self._leader_checkpoints.get(conversation_id)
-        if checkpoint and checkpoint.history_cutoff < len(history):
+        if saved_memory and saved_memory['history_cutoff'] <= len(history):
+            # Continue the Leader's own session: its earlier tool calls, results and
+            # reasoning stay, and the prefix stays cacheable. Its last reply is already in
+            # the saved view, so skip the stored copy in the chat history.
+            tail = history[saved_memory['history_cutoff']:]
+            if tail and isinstance(tail[0], AIMessage) and saved_memory.get('reply') and message_text(tail[0]) == saved_memory['reply']:
+                tail = tail[1:]
+            messages = [system, *messages_from_dict(saved_memory['messages']), *tail]
+        elif checkpoint and checkpoint.history_cutoff <= len(history):
             messages: list[BaseMessage] = [
                 system,
-                SystemMessage(content=checkpoint.handoff.as_prompt()),
+                memory.summary_message(checkpoint.handoff.as_prompt()),
                 *history[checkpoint.history_cutoff:],
             ]
         else:
             messages = [system, *history]
+        snapshot = None
         if active.get():
-            import json
             ctx = active.get()
-            messages.append(HumanMessage(content='Current coordination state (project data): ' + json.dumps(await ctx.service.handoff(ctx.project, 'leader'), ensure_ascii=False)))
+            previous = (saved_memory or {}).get('snapshot') if saved_memory and saved_memory['history_cutoff'] <= len(history) else None
+            text, snapshot = coordination_update(await ctx.service.handoff(ctx.project, 'leader'), previous)
+            messages.append(HumanMessage(content=text, additional_kwargs={'coordination_state': True}))
+        async def save_memory(current, reply=None):
+            state = {'history_cutoff': len(history), 'messages': messages_to_dict(current[1:]), 'snapshot': snapshot}
+            if reply is not None:
+                state['reply'] = reply
+            elif (self._context_memories.get(scope) or {}).get('reply'):
+                state['reply'] = self._context_memories[scope]['reply']
+            self._context_memories[scope] = state
+            if self._store:
+                await self._store.save_context_memory(scope, state)
+
+        async def prepare(current, *, force_clean=False):
+            result = await memory.prepare(current, force_clean=force_clean)
+            if result.changed:
+                await save_memory(result.messages)
+            return result.messages
+
+        from app.collaboration.reminders import goal_messages, with_goal_state
+
+        async def record_tool_results(current):
+            # Raw results, before context folding may shorten them.
+            if not self._store:
+                return
+            calls = {call['id']: call for m in current if isinstance(m, AIMessage) for call in m.tool_calls if call.get('id')}
+            rows = []
+            for m in current:
+                if isinstance(m, ToolMessage) and m.tool_call_id in calls:
+                    call = calls[m.tool_call_id]
+                    rows.append({'id': m.tool_call_id, 'tool': call['name'], 'status': 'error' if m.status == 'error' else 'success',
+                                 'arguments': json.dumps(call.get('args', {}), ensure_ascii=False, default=str),
+                                 'result': m.content if isinstance(m.content, str) else json.dumps(m.content, ensure_ascii=False, default=str)})
+            try:
+                await self._store.record_tool_calls(conversation_id, 'leader', rows)
+            except Exception:
+                logger.warning('Could not record Leader tool calls', exc_info=True)
+
+        async def invoke(current, *, allow_delegation):
+            await record_tool_results(current)
+            # The goal reminder is stored once per change (after compaction, which drops
+            # reminders) instead of being appended to every call.
+            current = with_goal_state(await prepare(current), await goal_messages())
+            try:
+                response = await self.leader.next_message(current, allow_delegation=allow_delegation)
+            except Exception as exc:
+                if not is_context_overflow(exc):
+                    raise
+                current = with_goal_state(await prepare(current, force_clean=True), await goal_messages())
+                response = await self.leader.next_message(current, allow_delegation=allow_delegation)
+            return current, response
+
         count = 0
 
         for _ in range(MAX_DELEGATIONS + 6):
@@ -257,11 +388,11 @@ class Team:
                 if ctx:
                     reminders = [r for r in reminders if not set(r.get('event_ids', [r.get('event_id')])).issubset(ctx.seen_events)]
                 if reminders:
-                    import json
-                    messages.append(HumanMessage(content='Collaboration reminders (project data): ' + json.dumps(reminders, ensure_ascii=False)))
-                response = await self.leader.next_message(
-                    messages, allow_delegation=count < MAX_DELEGATIONS
-                )
+                    messages.append(reminder('Collaboration reminders (project data): ' + json.dumps(reminders, ensure_ascii=False)))
+                messages, response = await invoke(messages, allow_delegation=count < MAX_DELEGATIONS)
+                # Removed reminders must remain eligible for redelivery.
+                if not any(m.additional_kwargs.get('reissuable_reminder') for m in messages):
+                    reminders = []
             except Exception:
                 self.leader.status = AgentStatus.FAILED
                 yield "status", {"id": "leader", "status": AgentStatus.FAILED}
@@ -274,29 +405,35 @@ class Team:
                 event_ids = [i for r in reminders for i in r.get('event_ids', [r.get('event_id')])]
                 ctx.seen_events.update(event_ids)
                 await ctx.service.mark_leader_read(ctx.project, event_ids)
-            if self.leader.record_usage(response):
+            if await self.leader.record_usage_durable(response):
                 yield "usage", self.usage_snapshot()
 
             if not response.tool_calls:
                 content = message_text(response)
                 if not content:
                     try:
-                        retry = await self.leader.next_message(
-                            [*messages, HumanMessage(content="请直接回复用户，不要调用工具。")],
+                        messages, retry = await invoke(
+                            [*messages, reminder("请直接回复用户，不要调用工具。")],
                             allow_delegation=False,
                         )
+                        messages.append(retry)
                     except Exception:
                         self.leader.status = AgentStatus.FAILED
                         yield "status", {"id": "leader", "status": AgentStatus.FAILED}
                         raise
-                    if self.leader.record_usage(retry):
+                    if await self.leader.record_usage_durable(retry):
                         yield "usage", self.usage_snapshot()
                     content = message_text(retry)
                 if ctx:
                     self._pending_leader_receipts[conversation_id] = (ctx.project, ctx.context, list(ctx.seen_events))
+                final = content or "我收到了你的消息，但模型没有返回可显示的内容。请重试。"
+                try:
+                    await save_memory(messages, reply=final)
+                except Exception:
+                    logger.warning('Could not save the Leader session', exc_info=True)
                 yield "delta", {
                     "role": "leader",
-                    "content": content or "我收到了你的消息，但模型没有返回可显示的内容。请重试。",
+                    "content": final,
                 }
                 self.leader.status = AgentStatus.IDLE
                 yield "status", {"id": "leader", "status": AgentStatus.IDLE}
@@ -307,28 +444,33 @@ class Team:
             for call in response.tool_calls:
                 call_id = call.get("id") or f"delegation-{count + 1}"
                 tool_name = call.get("name")
-                if tool_name == 'collaborate' and active.get():
+                if (tool_name == 'collaborate' or tool_name in COLLABORATION_TOOLS) and active.get():
                     from app.agents.worker import COLLABORATION_LABELS
-                    action = call.get('args', {}).get('action', '')
-                    activity = {'id': uuid4().hex, 'agent': 'leader', 'tool': 'collaborate',
+                    action = collaboration_action(tool_name, call.get('args', {}))
+                    activity = {'id': uuid4().hex, 'agent': 'leader', 'tool': tool_name,
                                 'description': COLLABORATION_LABELS.get(action, '协调团队工作')}
                     yield 'activity', {**activity, 'phase': 'running'}
                     try:
-                        result = await collaborate.ainvoke(call.get('args', {}))
+                        candidate = collaborate if tool_name == 'collaborate' else COLLABORATION_TOOLS[tool_name]
+                        result = await candidate.ainvoke(call.get('args', {}))
                     except Exception as exc:
-                        from app.tools.validation import tool_error
-                        result = {'error': tool_error(exc)}
+                        result = exception_result(exc, tool_name=tool_name)
+                    result = normalize_failure(result, tool_name=tool_name)
                     yield 'activity', {**activity, 'phase': 'failed' if isinstance(result, dict) and result.get('error') else 'completed'}
-                    messages.append(ToolMessage(content=str(result), tool_call_id=call_id))
+                    messages.append(ToolMessage(content=json.dumps(result, ensure_ascii=False), tool_call_id=call_id,
+                                                status='error' if result.get('error') else 'success'))
                     continue
                 if tool_name == "checkpoint_context":
                     if len(response.tool_calls) != 1:
-                        messages.append(ToolMessage(content="Call checkpoint_context alone, then delegate work", tool_call_id=call_id))
+                        messages.append(ToolMessage(content=json.dumps(failure_result('Call checkpoint_context alone, then delegate work',
+                            'invalid_arguments', 'checkpoint_must_be_alone', 'Call checkpoint_context in a separate tool round.',
+                            'correct_arguments')), tool_call_id=call_id, status='error'))
                         continue
                     try:
                         reset_handoff = ContextCheckpoint.model_validate(call.get("args", {}))
                     except ValidationError as error:
-                        messages.append(ToolMessage(content=f"Invalid checkpoint: {error}", tool_call_id=call_id))
+                        messages.append(ToolMessage(content=json.dumps(validation_failure(error,
+                            tool_name=tool_name, schema=ContextCheckpoint), ensure_ascii=False), tool_call_id=call_id, status='error'))
                         continue
                     self._leader_checkpoints[conversation_id] = LeaderCheckpoint(
                         handoff=reset_handoff,
@@ -344,13 +486,14 @@ class Team:
                             reset_handoff.model_dump(mode="json"),
                         )
                     tool_result = ToolMessage(content="Coordination checkpoint saved. Continue from the handoff.", tool_call_id=call_id)
-                    messages = [
-                        system,
-                        SystemMessage(content=reset_handoff.as_prompt()),
-                        history[-1],
-                        response,
-                        tool_result,
-                    ]
+                    prepared = await memory.checkpoint([*messages, tool_result], reset_handoff.as_prompt())
+                    messages = prepared.messages
+                    await save_memory(messages)
+                    if active.get():
+                        # Tool bodies just left the model history; old read
+                        # receipts must not suppress reads in the new context.
+                        active.get().read_context = uuid4().hex
+                        active.get().pending_reads.clear()
                     yield "activity", {
                         "id": uuid4().hex,
                         "agent": "leader",
@@ -358,6 +501,25 @@ class Team:
                         "description": "保存阶段交接并开启干净的协调上下文",
                         "phase": "completed",
                     }
+                    continue
+                if tool_name == "enable_tools":
+                    from app.collaboration.tools import enable_tools
+                    try:
+                        content, status = json.dumps(await enable_tools.ainvoke(call.get('args', {})), ensure_ascii=False), 'success'
+                    except Exception as exc:
+                        content, status = json.dumps(exception_result(exc, tool_name=tool_name), ensure_ascii=False), 'error'
+                    messages.append(ToolMessage(content=content, tool_call_id=call_id, status=status))
+                    continue
+                if tool_name == "recall_context":
+                    activity = {'id': uuid4().hex, 'agent': 'leader', 'tool': tool_name, 'description': '找回已折叠的上下文'}
+                    yield 'activity', {**activity, 'phase': 'running'}
+                    try:
+                        args = recall_context.args_schema.model_validate(call.get('args', {}))
+                        content, status = await recall(self._store, scope, args.message_id, args.offset, args.limit), 'success'
+                    except Exception as exc:
+                        content, status = json.dumps(exception_result(exc, tool_name=tool_name), ensure_ascii=False), 'error'
+                    yield 'activity', {**activity, 'phase': 'failed' if status == 'error' else 'completed'}
+                    messages.append(ToolMessage(content=content, tool_call_id=call_id, status=status))
                     continue
                 if tool_name not in {"delegate_task", "delegate_tasks"}:
                     messages.append(ToolMessage(content="Unknown tool call", tool_call_id=call_id))
@@ -371,7 +533,9 @@ class Team:
                     )
                 except ValidationError as error:
                     messages.append(
-                        ToolMessage(content=f"Invalid delegation: {error}", tool_call_id=call_id)
+                        ToolMessage(content=json.dumps(validation_failure(error, tool_name=tool_name,
+                            schema=Delegation if tool_name == 'delegate_task' else DelegationBatch), ensure_ascii=False),
+                            tool_call_id=call_id, status='error')
                     )
                     continue
                 if count + sum(len(group) for _, _, group in batches) + len(assignments) > MAX_DELEGATIONS:

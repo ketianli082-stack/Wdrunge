@@ -6,9 +6,9 @@ from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, Tool
 from app.agents.base import AgentSpec
 from app.agents.team import Team
 from app.agents.worker import WorkerAgent
-from app.tools import _workspace
-from app.tools.current_utc_time import current_utc_time
-from app.tools.write_project_file import make_write_project_file
+from app.agents.tools import _workspace
+from app.agents.tools.current_utc_time import current_utc_time
+from app.agents.tools.write_project_file import make_write_project_file
 
 
 def run_team(team: Team):
@@ -27,7 +27,7 @@ def test_leader_exposes_delegation_as_optional_function_call(monkeypatch):
 
         def bind_tools(self, tools, tool_choice):
             assert tool_choice == "auto"
-            self.bound_tools = [tool.name for tool in tools]
+            self.bound_tools = [tool['function']['name'] for tool in tools]
             return self
 
         async def ainvoke(self, _messages):
@@ -36,7 +36,7 @@ def test_leader_exposes_delegation_as_optional_function_call(monkeypatch):
     fake = FakeModel()
     monkeypatch.setattr(leader, "model", lambda: fake)
     result = asyncio.run(leader.next_message([HumanMessage(content="你好")]))
-    assert fake.bound_tools == ["delegate_task", "delegate_tasks", "checkpoint_context"]
+    assert fake.bound_tools == ["delegate_tasks", "checkpoint_context", "recall_context"]
     assert result.content == "你好！"
 
 
@@ -56,17 +56,17 @@ def test_leader_can_answer_greeting_without_dispatch(monkeypatch):
 
 def test_reported_token_usage_updates_total_and_context_percentage(monkeypatch):
     team = Team()
-    team.leader.spec = AgentSpec(id="leader", name="Leader", prompt_file="leader.md", context_window=1000)
+    team.leader.spec = AgentSpec(id="leader", name="Leader", prompt_file="leader.md", context_window=100000)
 
     async def answer(_messages, *, allow_delegation=True):
-        return AIMessage(content="你好！", usage_metadata={"input_tokens": 250, "output_tokens": 25, "total_tokens": 275})
+        return AIMessage(content="你好！", usage_metadata={"input_tokens": 25000, "output_tokens": 25, "total_tokens": 25025})
 
     monkeypatch.setattr(team.leader, "next_message", answer)
     events = run_team(team)
     usage = [payload for event, payload in events if event == "usage"]
     assert len(usage) == 1
-    assert usage[0]["total_tokens"] == 275
-    assert usage[0]["agents"][0]["context_tokens"] == 250
+    assert usage[0]["total_tokens"] == 25025
+    assert usage[0]["agents"][0]["context_tokens"] == 25000
     assert usage[0]["agents"][0]["context_percent"] == 25.0
 
 
@@ -312,15 +312,16 @@ def test_worker_context_modes_keep_sessions_isolated(monkeypatch):
     assert "first" not in str(calls[3][0])
 
 
-def test_auto_starts_fresh_at_sixty_percent_of_context_window():
+def test_auto_preserves_existing_session_for_layered_compaction():
     worker = WorkerAgent(AgentSpec(id="product", name="产品", prompt_file="product.md", context_window=100))
     assert worker.resolve_context_mode("chat-a", "auto") == "fresh"
     worker._threads["chat-a"] = "thread-a"
-    assert worker.resolve_context_mode("chat-a", "auto") == "fresh"
+    assert worker.resolve_context_mode("chat-a", "auto") == "continue"
     worker._context_by_session["chat-a"] = 59
     assert worker.resolve_context_mode("chat-a", "auto") == "continue"
     worker._context_by_session["chat-a"] = 60
-    assert worker.resolve_context_mode("chat-a", "auto") == "fresh"
+    assert worker.resolve_context_mode("chat-a", "auto") == "continue"
+    assert worker.resolve_context_mode("chat-a", "fresh") == "fresh"
     assert worker.resolve_context_mode("chat-a", "continue") == "continue"
 
 
@@ -329,6 +330,9 @@ def test_langgraph_checkpoint_resumes_messages_without_remote_model(monkeypatch)
     seen = []
 
     class FakeModel:
+        def bind_tools(self, tools):
+            return self
+
         async def ainvoke(self, messages):
             seen.append([message.content for message in messages])
             return AIMessage(content="local result")
@@ -424,8 +428,8 @@ def test_file_tool_stays_within_role_scope(tmp_path, monkeypatch):
 
 
 def test_selected_workspace_is_used_by_file_tools(tmp_path):
-    from app.tools.list_project_files import make_list_project_files
-    from app.tools.read_project_file import make_read_project_file
+    from app.agents.tools.list_project_files import make_list_project_files
+    from app.agents.tools.read_project_file import make_read_project_file
 
     token = _workspace.active_workspace.set(tmp_path)
     try:

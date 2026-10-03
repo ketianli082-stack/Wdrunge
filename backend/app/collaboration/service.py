@@ -27,7 +27,19 @@ ROLES = {'leader', 'product', 'backend', 'frontend', 'designer', 'testing'}
 TERMINAL = {'completed', 'cancelled', 'rejected', 'failed'}
 
 
-class Collaboration:
+from app.collaboration.goals import GoalMixin, criteria_list, check_evidence
+
+
+from app.collaboration.runs import ConversationRuns
+
+
+from app.collaboration.environment import EnvironmentMixin
+from app.collaboration.journal import JournalMixin
+from app.collaboration.planning import (PlanningMixin, check_criteria_budget, check_deliverables, goal_scale,
+                                        need_satisfied, normalize_needs, serial_dependency)
+
+
+class Collaboration(GoalMixin, ConversationRuns, EnvironmentMixin, JournalMixin, PlanningMixin):
     def __init__(self, store: ChatStore):
         self.store = store
         self._lock = asyncio.Lock()
@@ -46,6 +58,8 @@ class Collaboration:
             self._ready = True
         await self.recover()
         await self.rebuild_search()
+        async with self.transaction() as c:
+            await c.execute(text("UPDATE collaboration_records SET state='stopped', data=json_set(data,'$.state','stopped') WHERE kind='conversation_run' AND state='stopping'"))
 
     @asynccontextmanager
     async def transaction(self):
@@ -122,6 +136,11 @@ class Collaboration:
         if rel.is_absolute() or '..' in rel.parts or not result.is_relative_to(root) or any(part in {'.git', '.wdrunge-runs', '.aws', '.codex', '.agents'} for part in rel.parts):
             raise ValueError('Path must stay inside the project workspace')
         return result
+
+    @staticmethod
+    def _artifact_exists(target):
+        # Delegators often declare a directory such as "backend/".
+        return target.is_file() or target.is_dir() and any(item.is_file() for item in target.rglob('*'))
 
     async def _dependencies(self, c, project, based_on):
         for dependency in based_on:
@@ -275,15 +294,24 @@ class Collaboration:
                 d['external_change'] = not path.exists() or digest(path.read_text()) != d['hash']
             return docs
 
-    async def read(self, project, document_id, version=None, section_id=None, offset=0, limit=6000):
+    async def read(self, project, document_id, version=None, section_id=None, offset=0, limit=6000, whole=False):
         if offset < 0 or not 1 <= limit <= 12000:
             raise ValueError('Invalid read window')
         async with self.reading() as c:
             doc = await self._get(c, 'document', project, document_id)
             r = await self._get(c, 'revision', project, f"{document_id}:{version or doc['version']}")
+            if whole:
+                # The full text in one call (paged), with section IDs for later edits.
+                content, next_offset, fragment = page(r['content'], offset, limit)
+                return {'document_id': document_id, 'version': r['version'], 'path': doc.get('path'),
+                        'outline': [{'id': h['id'], 'title': h['title'], 'level': h['level']} for h in r['outline'][:100]] if offset == 0 else [],
+                        'content': content, 'next_offset': next_offset, 'fragment': fragment}
             if section_id is None:
                 return {'document_id': document_id, 'version': r['version'], 'outline': r['outline'][offset:offset+min(limit,100)], 'next_offset': offset+min(limit,100) if len(r['outline']) > offset+min(limit,100) else None}
-            s = section(r['content'], section_id)
+            try:
+                s = section(r['content'], section_id)
+            except ValueError as exc:
+                raise ValueError(f"Document {document_id} v{r['version']}: {exc}") from exc
             body = r['content'][s['body_start']:s['body_end']]
             content, next_offset, fragment = page(body, offset, limit)
             return {'document_id': document_id, 'version': r['version'], 'section': s, 'content': content, 'next_offset': next_offset, 'fragment': fragment}
@@ -323,6 +351,8 @@ class Collaboration:
             return None
         from app.agents.identity import member_name
         identifier = digest(f'{project}:{key}')
+        # Models often repeat the mention themselves; the bubble adds it once.
+        summary = summary.removeprefix(f'@{member_name(recipient)}').strip() or summary
         await self.store.add_chat_message_in_transaction(c, conversation, {
             'id': identifier, 'sender': sender,
             'content': f'@{member_name(recipient)} {summary}',
@@ -362,11 +392,19 @@ class Collaboration:
               LEFT JOIN collaboration_receipts r ON r.project=e.project AND r.context=:ctx AND r.seq=e.seq
               WHERE e.project=:p AND e.recipient=:m AND (e.conversation='' OR e.conversation=:v)
               AND (json_extract(e.data,'$.target_request') IS NULL OR json_extract(e.data,'$.target_request')=:request)
-              AND r.seq IS NULL ORDER BY e.seq LIMIT 200'''), dict(ctx=f'{member}:{context}', p=project, m=member, v=conversation, request=request))).mappings().all()
+              AND r.seq IS NULL
+              AND (COALESCE(json_extract(e.data,'$.type'),'') != 'goal_reminder' OR EXISTS (
+                SELECT 1 FROM collaboration_records g WHERE g.kind='goal' AND g.project=e.project
+                AND g.id=json_extract(e.data,'$.goal_id') AND g.state='active'
+                AND COALESCE(json_extract(g.data,'$.reminder_epoch'),0)=COALESCE(json_extract(e.data,'$.goal_epoch'),0)))
+              ORDER BY e.seq LIMIT 200'''), dict(ctx=f'{member}:{context}', p=project, m=member, v=conversation, request=request))).mappings().all()
             items = []
             size = 0
             for row in rows:
                 item = {'event_id': row['seq'], **json.loads(row['data'])}
+                if request and item.get('type') == 'request' and item.get('request_id') == request and 'goal' in item:
+                    # The executing task's goal is already the Assigned task message.
+                    item['goal'] = '(your current assigned task; see the Assigned task message)'
                 original_length = len(json.dumps(item, ensure_ascii=False))
                 if original_length > limit//2:
                     for field in ('content','summary','goal','result','detail'):
@@ -411,7 +449,8 @@ class Collaboration:
                         await self.store.add_receipt_in_transaction(c, event['conversation'], {'message_id': payload['chat_message_id'], 'reader': member})
 
 
-    async def create_request(self, project, sender, recipient, goal, key, conversation='', based_on=None, dependencies=None, artifacts=None, parent=None, priority=1, deadline=None, summary=None, origin_message=None):
+    async def create_request(self, project, sender, recipient, goal, key, conversation='', based_on=None, dependencies=None, artifacts=None, parent=None, priority=1, deadline=None, summary=None, origin_message=None, goal_id=None, acceptance_criteria=None,
+                             documents=None, services=None, needs=None, serial_reason=None, verification=None):
         summary = self._summary(summary, '请协作完成这项任务，详见任务记录。')
         if not key or len(key) > 160:
             raise ValueError('A bounded idempotency key is required')
@@ -422,23 +461,53 @@ class Collaboration:
         async with self.transaction() as c:
             await self._project(c, project)
             await self._conversation(c, project, conversation)
+            control = await self._get(c, 'conversation_run', project, conversation, False)
+            if control and control['state'] != 'active':
+                raise StorageConflictError('当前对话已停止，发送新消息后继续')
             identifier = f'{sender}:{key}'
             spec = dict(sender=sender, recipient=recipient, goal=goal, conversation=conversation, based_on=based_on or [], dependencies=dependencies or [], artifacts=artifacts or [], parent=parent, priority=priority, deadline=deadline, summary=summary)
+            # Typed deliverables and deliverable-level dependencies (only stored when used).
+            check_deliverables(spec['artifacts'], documents or [], services or [])
+            extra = {'documents': list(documents or []), 'services': list(services or []), 'needs': normalize_needs(needs),
+                     'serial_reason': (serial_reason or '').strip()[:500], 'verification': verification}
+            if verification not in (None, 'self', 'end_to_end'):
+                raise ValueError("verification must be 'self' or 'end_to_end'")
+            spec.update({k: v for k, v in extra.items() if v})
+            if parent:
+                parent_request = await self._get(c, 'request', project, parent)
+                if parent_request.get('goal_id'):
+                    if goal_id and goal_id != parent_request['goal_id']:
+                        raise ValueError('Child task must belong to the same goal')
+                    goal_id = parent_request['goal_id']
+                    acceptance_criteria = acceptance_criteria or [goal[:300]]
+            if goal_id:
+                linked_goal = await self._goal_in_conversation(c, project, goal_id, conversation)
+                criteria_list(acceptance_criteria)
+                check_criteria_budget(acceptance_criteria, goal_scale(linked_goal), 'task')
+                spec.update(goal_id=goal_id, acceptance_criteria=acceptance_criteria)
+                if verification == 'end_to_end' and any(
+                        r.get('goal_id') == goal_id and r.get('verification') == 'end_to_end' and r['state'] not in {'cancelled', 'rejected'}
+                        and r['id'] != f'{sender}:{key}' for r in await self._list(c, 'request', project)):
+                    raise ValueError('This goal already has an end-to-end verification task; give each check one owner')
+                for dep in spec['dependencies']:
+                    if (await self._get(c, 'request', project, dep)).get('goal_id') != goal_id:
+                        raise ValueError('Task dependencies must belong to the same goal')
             old = await self._get(c, 'request', project, identifier, False)
             if old:
                 if old['spec'] != spec:
                     raise StorageConflictError('Idempotency key was used for another request')
                 return old
+            if goal_id and linked_goal['state'] != 'active':
+                raise ValueError('Tasks require an active goal')
             await self._dependencies(c, project, spec['based_on'])
-            for dependency in spec['dependencies']:
-                await self._get(c, 'request', project, dependency)
+            serial_dependency(recipient, [await self._get(c, 'request', project, dependency) for dependency in spec['dependencies']], serial_reason)
             if parent:
                 await self._get(c, 'request', project, parent)
             requests = await self._list(c, 'request', project)
             if sum(r['state'] not in TERMINAL for r in requests) >= 50 or (parent and sum(r['spec']['parent'] == parent for r in requests) >= 12):
                 raise ValueError('Outstanding request budget reached')
             project_info = await self._project(c, project)
-            for path in spec['artifacts']:
+            for path in [*spec['artifacts'], *spec.get('documents', [])]:
                 self._path(project_info['workspace_path'], path)
             request = dict(id=identifier, **spec, spec=spec, state='queued', created=time.time(), attempts=0, result='', delivered=[], needs_review=False)
             if origin_message:
@@ -460,6 +529,8 @@ class Collaboration:
             for dep in dependencies:
                 if dep not in all_requests:
                     raise ValueError('Unknown dependency')
+                if request.get('goal_id') and all_requests[dep].get('goal_id') != request['goal_id']:
+                    raise ValueError('Task dependencies must belong to the same goal')
                 todo, seen = [dep], set()
                 while todo:
                     node = todo.pop()
@@ -472,12 +543,25 @@ class Collaboration:
             await self._put(c, 'request', project, identifier, request)
             return request
 
-    async def transition(self, project, identifier, actor, state, result='', artifacts=None, based_on=None, summary=None):
-        TransitionPayload.model_validate(dict(identifier=identifier, state=state, result=result, artifacts=artifacts, based_on=based_on, summary=summary))
+    async def transition(self, project, identifier, actor, state, result='', artifacts=None, based_on=None, summary=None, evidence=None, expected_instance=None):
+        TransitionPayload.model_validate(dict(identifier=identifier, state=state, result=result, artifacts=artifacts, based_on=based_on, summary=summary, evidence=evidence))
         public_summary = self._summary(summary, {'review': '已提交交付，请验收。', 'completed': '验收通过，可以继续后续工作。', 'queued': '请继续处理原任务并重新交付。', 'failed': '任务执行失败，需要处理后重试。', 'blocked': '当前任务等待依赖或问题处理。', 'cancelled': '这项任务已取消。', 'rejected': '暂不执行这项任务。'}.get(state, '任务状态已更新。'))
         async with self.transaction() as c:
             p = await self._project(c, project)
             r = await self._get(c, 'request', project, identifier)
+            if r.get('paused_on_restart') and state != 'cancelled':
+                raise StorageConflictError('任务已在重启后挂起，请先点击继续任务')
+            if expected_instance and (r['state'] != 'running' or r.get('instance_id') != expected_instance or r.get('lease_until', 0) <= time.time()):
+                raise StorageConflictError('Execution lease no longer belongs to this task instance')
+            if r.get('goal_id'):
+                linked_goal = await self._get(c, 'goal', project, r['goal_id'])
+                if state == 'completed':
+                    check_evidence(r['acceptance_criteria'], evidence)
+                    if r['state'] == 'completed' and r.get('evidence') == evidence and actor in {r['sender'], 'leader'}:
+                        return r
+                    r['evidence'] = evidence
+                if linked_goal['state'] != 'active' and state != 'cancelled':
+                    raise StorageConflictError('Resume the goal before updating its tasks')
             allowed = {'running': {'review', 'blocked', 'failed', 'cancelled'}, 'queued': {'cancelled', 'rejected'}, 'blocked': {'queued', 'cancelled'}, 'review': {'completed', 'queued', 'cancelled'}, 'failed': {'queued', 'cancelled'}}
             if state not in allowed.get(r['state'], set()):
                 raise StorageConflictError(f"Cannot move {r['state']} to {state}")
@@ -485,8 +569,14 @@ class Collaboration:
                 raise ValueError('Actor cannot make this transition')
             if r['state'] == 'failed' and actor not in {r['sender'], 'leader'}:
                 raise ValueError('Only sender or Leader may retry a failed request')
+            if r['state'] == 'review' and state == 'queued':
+                # Rework continues the assignee's own context with the feedback.
+                r.update(resume=True, rework=(result or 'Rework requested; inspect the review feedback.')[:2000])
             if r['state'] == 'failed' and state == 'queued':
                 r['attempts'] = 0
+                if r.pop('resumable', False):
+                    # The failure was the model provider, not the work: continue the saved context.
+                    r['resume'] = True
             if based_on is not None:
                 await self._dependencies(c, project, based_on)
                 r['based_on'] = based_on
@@ -494,10 +584,12 @@ class Collaboration:
                 await self._dependencies(c, project, r['based_on'])
                 if not (result or r['result']).strip():
                     raise ValueError('A delivery summary is required')
+                if state == 'review':
+                    await self._check_typed_deliverables(c, project, r)
                 delivered = artifacts if artifacts is not None else r['delivered']
                 for path in set(delivered + r['artifacts']):
-                    if not self._path(p['workspace_path'], path).is_file():
-                        raise ValueError(f'Artifact does not exist: {path}')
+                    if not self._artifact_exists(self._path(p['workspace_path'], path)):
+                        raise ValueError(f'Artifact does not exist: {path} (a directory needs at least one file)')
                 if any(d['state'] != 'completed' for d in [await self._get(c, 'request', project, dep) for dep in r['dependencies']]):
                     raise StorageConflictError('Dependencies are not completed')
                 r['delivered'] = delivered
@@ -509,10 +601,57 @@ class Collaboration:
             await self._put(c, 'request', project, identifier, r)
             recipient = r['recipient'] if actor != r['recipient'] else r['sender']
             chat_message_id = await self._group_message(c, project, r['conversation'], actor, recipient, public_summary, f'transition:{identifier}:{uuid4().hex}')
-            await self._event(c, project, r['sender'], {'type': 'request_status', 'request_id': identifier, 'state': state, 'result': r['result'][:1200], 'target_request': r.get('parent'), 'chat_message_id': chat_message_id if recipient == r['sender'] else None}, r['conversation'])
+            status_event = {'type': 'request_status', 'request_id': identifier, 'state': state, 'result': r['result'][:1200], 'target_request': r.get('parent'), 'chat_message_id': chat_message_id if recipient == r['sender'] else None}
+            if state == 'review' and r.get('findings'):
+                from app.collaboration.delivery_checks import findings_summary
+                status_event['findings'] = findings_summary(r['findings'])[:1200]
+            await self._event(c, project, r['sender'], status_event, r['conversation'])
             if state == 'completed' and r.get('origin_message') and r['conversation']:
                 await self.store.add_reaction_in_transaction(c, r['conversation'], {'message_id': r['origin_message'], 'worker': r['recipient'], 'reaction': 'done'})
             return r
+
+    async def requeue_interrupted(self, project, identifier, instance_id, reason, limit=2):
+        """Requeue an execution that a transient provider failure interrupted, to resume
+        its saved context. Returns False when the automatic resume budget is used up."""
+        async with self.transaction() as c:
+            r = await self._get(c, 'request', project, identifier)
+            if r['state'] != 'running' or r.get('instance_id') != instance_id or r.get('auto_resumes', 0) >= limit:
+                return False
+            r.update(state='queued', resume=True, auto_resumes=r.get('auto_resumes', 0) + 1, interrupted_reason=reason[:500],
+                     lease_owner=None, lease_until=0, instance_id=None)
+            await self._put(c, 'request', project, identifier, r)
+            return True
+
+    async def _check_typed_deliverables(self, c, project, r):
+        published = {d.get('path'): d for d in await self._list(c, 'document', project)}
+        missing = [path for path in r.get('documents', []) if path not in published]
+        if missing:
+            raise ValueError(f'Declared documents are not published: {missing}. Publish them with collaboration_publish '
+                             '(base_version 0 for a new document) before delivering.')
+        from app.collaboration.planning import still_draft
+        unfilled = [path for path in r.get('documents', []) if await still_draft(self, c, project, published[path])]
+        if unfilled:
+            raise ValueError(f'Declared documents are still the platform drafts: {unfilled}. Fill their sections with '
+                             'collaboration_publish edits before delivering.')
+        for name in r.get('services', []):
+            record = await self._get(c, 'service', project, name, False)
+            if not record or record.get('status') != 'verified':
+                raise ValueError(f'Declared service {name!r} is not verified. Register it with collaboration_register_service '
+                                 'and start it with execute_command(background=true, ready_port=<its port>) so the platform '
+                                 'observes it serving before delivering.')
+
+    async def set_findings(self, project, identifier, findings):
+        async with self.transaction() as c:
+            r = await self._get(c, 'request', project, identifier)
+            r['findings'] = findings
+            await self._put(c, 'request', project, identifier, r)
+
+    async def mark_resumable(self, project, identifier):
+        """A provider failure ended this run: a retry continues its saved context."""
+        async with self.transaction() as c:
+            r = await self._get(c, 'request', project, identifier)
+            r['resumable'] = True
+            await self._put(c, 'request', project, identifier, r)
 
     async def get_request(self, project, identifier):
         async with self.reading() as c:
@@ -521,7 +660,10 @@ class Collaboration:
     async def snapshot(self, project):
         async with self.reading() as c:
             await self._project(c, project)
-            return {kind: await self._list(c, kind, project) for kind in ('document', 'subscription', 'message', 'request', 'pending', 'decision', 'handoff', 'settings')}
+            result = {kind: await self._list(c, kind, project) for kind in ('document', 'subscription', 'message', 'request', 'pending', 'decision', 'handoff', 'settings', 'goal')}
+            result['journal'] = [{'request': j['request'], **self.journal_summary(j, notes=8)}
+                                 for j in await self._list(c, 'journal', project)]
+            return result
 
     async def claim(self, owner="local"):
         await self.recover_requests()
@@ -534,10 +676,15 @@ class Collaboration:
             rows = sorted(rows, key=lambda row: (-json.loads(row['data']).get('priority', 1), json.loads(row['data'])['created']))
             for row in rows:
                 project, r = row['project'], json.loads(row['data'])
+                control = await self._get(c, 'conversation_run', project, r['conversation'], False)
+                if control and control['state'] != 'active':
+                    continue
                 paused = await self._get(c, 'settings', project, 'project', False)
                 if paused and paused.get('paused'):
                     continue
-                if r.get('blocked_reason') in {'merge_conflict', 'basis_changed'}:
+                if r.get('goal_id') and (await self._get(c, 'goal', project, r['goal_id']))['state'] != 'active':
+                    continue
+                if r.get('paused_on_restart') or r.get('blocked_reason') in {'merge_conflict', 'basis_changed'}:
                     continue
                 if r['state'] == 'running' or busy[(project, r['recipient'])] >= self.role_concurrency:
                     continue
@@ -550,18 +697,23 @@ class Collaboration:
                     continue
                 if any(d['state'] not in {'completed', 'review'} for d in deps):
                     continue
+                if any([not await need_satisfied(self, c, project, need) for need in r.get('needs', [])]):
+                    continue
                 if r['attempts'] >= 12:
                     r.update(state='failed', result='Request execution budget exhausted')
                     await self._put(c, 'request', project, r['id'], r)
                     continue
                 r.pop('blocked_reason', None)
+                # An interrupted execution continues its saved context once.
+                rework = r.pop('rework', None)
+                resume = bool(r.pop('resume', False)) and (not r.get('workspace_published') or bool(rework))
                 r.update(state='running', attempts=r['attempts']+1, lease_owner=owner, lease_until=time.time()+60)
                 if not r.get('workspace_id') or r.get('workspace_published'):
                     r.update(workspace_id=uuid4().hex, workspace_published=False)
                 r['instance_id'] = uuid4().hex
                 await self._put(c, 'request', project, r['id'], r)
                 p = await self._project(c, project)
-                return project, p['workspace_path'], r
+                return project, p['workspace_path'], {**r, 'resume': resume, 'rework': rework}
         return None
 
     async def recover_requests(self):
@@ -571,7 +723,7 @@ class Collaboration:
                 r = json.loads(row['data'])
                 if r.get('lease_until', 0) > time.time():
                     continue
-                r.update(state='queued')
+                r.update(state='queued', resume=True, interrupted_reason='execution lease expired')
                 await self._put(c, 'request', row['project'], row['id'], r)
 
     async def set_paused(self, project, paused):
@@ -644,10 +796,16 @@ class Collaboration:
             rows = (await c.execute(text("SELECT project,data FROM collaboration_records WHERE kind='request' AND state NOT IN ('completed','cancelled','rejected','failed')"))).mappings().all()
             for row in rows:
                 r = json.loads(row['data'])
+                if r.get('paused_on_restart'):
+                    continue
+                if r.get('goal_id') and (await self._get(c, 'goal', row['project'], r['goal_id']))['state'] != 'active':
+                    continue
                 if r.get('deadline') and r['deadline'] <= now and not r.get('escalated_at'):
                     r.update(escalated_at=now, priority=min(3, r.get('priority', 1)+1))
                     await self._put(c, 'request', row['project'], r['id'], r)
                     await self._event(c, row['project'], 'leader', {'type': 'request_overdue', 'request_id': r['id'], 'state': r['state'], 'deadline': r['deadline']}, r['conversation'])
+
+        await self.goal_tick(now)
 
     async def schedule_request(self, project, identifier, actor, priority=None, deadline=None):
         async with self.transaction() as c:
@@ -749,21 +907,28 @@ class Collaboration:
                         facts[key] = {'decision_id': d['id'], 'value': value}
             return {'findings': findings, 'coverage': 'Exact normalized section duplicates, explicit decision facts and version/age checks. Free-text semantic contradictions require review.'}
 
+    async def accepted_decisions(self, project):
+        async with self.reading() as c:
+            decisions = [d for d in await self._list(c, 'decision', project) if d['state'] == 'accepted']
+        return sorted(decisions, key=lambda d: d.get('created', 0), reverse=True)
+
     async def handoff(self, project, member='leader', save=False, summary=''):
+        environment = await self.environment_brief(project)
         async with self.transaction() as c:
             await self._project(c, project)
             docs = await self._list(c, 'document', project)
             requests = [r for r in await self._list(c, 'request', project) if r['state'] not in TERMINAL and (member == 'leader' or member in {r['sender'], r['recipient']})]
             decisions = [d for d in await self._list(c, 'decision', project) if d['state'] == 'accepted']
             handoff = {'created': time.time(), 'member': member, 'summary': summary[:2000],
-                       'documents': [{'id': d['id'], 'version': d['version'], 'title': d['title']} for d in docs[:30]],
+                       'documents': [{'id': d['id'], 'version': d['version'], 'title': d['title'], 'path': d['path']} for d in docs[:30]],
                        'pending': [{key: r.get(key) for key in ('id','state','recipient','dependencies','needs_review')} for r in requests[:30]],
                        'decisions': [{'id': d['id'], 'version': d['version'], 'title': d['title'], 'links': d['links']} for d in decisions[:20]],
                        'remaining': {'documents': max(0,len(docs)-30), 'pending': max(0,len(requests)-30), 'decisions': max(0,len(decisions)-20)}}
             if save:
                 handoff['id'] = uuid4().hex
                 await self._put(c, 'handoff', project, handoff['id'], handoff)
-            return handoff
+            # Live environment facts are not part of the saved stage record.
+            return {**handoff, 'environment': environment}
 
 
     async def _index_sections(self, c, project, revision):
@@ -811,18 +976,28 @@ class Collaboration:
                 raise StorageConflictError('Accept dependency deliveries before publishing artifacts')
             p = await self._project(c, project)
             workspace = IsolatedWorkspace(p['workspace_path'], r['workspace_id'])
+            managed = {d['path'] for d in await self._list(c, 'document', project)}
             for path in r['artifacts']:
-                target = self._path(str(workspace.work), path)
-                if not target.is_file():
-                    raise ValueError(f'Expected artifact is missing: {path}')
+                # Shared documents are published to the project, not the request snapshot.
+                root = p['workspace_path'] if str(Path(path)) in managed else str(workspace.work)
+                if not self._artifact_exists(self._path(root, path)):
+                    raise ValueError(f'Expected artifact is missing: {path}. The request declares this path; '
+                                     'create it (a directory needs at least one file) or ask the sender to change the task.')
             await asyncio.to_thread(workspace.recover_merge)
             # Finish an interrupted merge before considering a new plan.
-            managed = {d['path'] for d in await self._list(c, 'document', project)}
             changes = await asyncio.to_thread(workspace.plan, managed)
             await asyncio.to_thread(workspace.publish, changes)
             r['workspace_published'] = True
             r['merged_paths'] = [item['path'] for item in changes]
             await self._put(c, 'request', project, identifier, r)
+
+    async def sync_published(self, project, identifier, paths):
+        """Make documents this request just published visible in its snapshot."""
+        async with self.reading() as c:
+            r = await self._get(c, 'request', project, identifier)
+            p = await self._project(c, project)
+        if r.get('workspace_id'):
+            await asyncio.to_thread(IsolatedWorkspace(p['workspace_path'], r['workspace_id']).sync, list(paths))
 
     async def mark_conflict(self, project, identifier, detail, instance_id=None):
         async with self.transaction() as c:

@@ -22,9 +22,11 @@ from pydantic import BaseModel, Field, field_serializer, model_validator
 from app.record_reset import RecordsGate, RecordsGateMiddleware
 from app import conversation_title
 from app.collaboration.service import Collaboration
+from app.collaboration.environment import PlatformPortsMiddleware
 from app.collaboration.runtime import Scheduler
 from app.collaboration import api as collaboration_api
 from app.collaboration.delivery import router as delivery_router
+from app.execution import api as execution_api
 from app.agents.team import get_team
 from app.storage import ChatStore, StorageConflictError, StorageNotFoundError, get_store
 
@@ -35,6 +37,8 @@ _checkpoint_connection: aiosqlite.Connection | None = None
 _runtime_store_identity: int | None = None
 _collaboration_scheduler = None
 _records_gate = RecordsGate()
+_conversation_stops: dict[str, asyncio.Task] = {}
+_execution_pause: asyncio.Task | None = None
 
 
 async def ensure_runtime() -> None:
@@ -58,11 +62,12 @@ async def ensure_runtime() -> None:
     collaboration = Collaboration(store)
     await collaboration.initialize()
     collaboration_api.configure(collaboration)
+    await execution_api.initialize(store)
     if hasattr(team, "configure_persistence"):
         team.collaboration = collaboration
         team._checkpointer = checkpointer
         _collaboration_scheduler = Scheduler(collaboration, team)
-        await _collaboration_scheduler.start()
+        await _collaboration_scheduler.start(pause_existing=True)
     _runtime_store_identity = id(store)
 
 @asynccontextmanager
@@ -75,9 +80,12 @@ async def lifespan(app: FastAPI):
     finally:
         if _records_gate.reset_task is not None:
             await asyncio.shield(_records_gate.reset_task)
+        await asyncio.gather(*(task for task in [*list(_conversation_stops.values()), _execution_pause] if task is not None and not task.done()), return_exceptions=True)
         if _collaboration_scheduler is not None:
             await _collaboration_scheduler.close()
             _collaboration_scheduler = None
+        await execution_api.close()
+        execution_api.restore_control_token()
         if _checkpoint_connection is not None:
             await _checkpoint_connection.close()
             _checkpoint_connection = None
@@ -93,7 +101,9 @@ app = FastAPI(
 )
 app.include_router(collaboration_api.router)
 app.include_router(delivery_router)
+app.include_router(execution_api.router)
 app.add_middleware(RecordsGateMiddleware, gate=_records_gate)
+app.add_middleware(PlatformPortsMiddleware)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -104,7 +114,7 @@ app.add_middleware(
     ],
     allow_credentials=False,
     allow_methods=["GET", "POST"],
-    allow_headers=["Content-Type"],
+    allow_headers=["Content-Type", "Authorization"],
 )
 
 
@@ -115,6 +125,51 @@ class ResetRecordsRequest(BaseModel):
 class ResetRecordsResponse(BaseModel):
     cleared: bool
     workspace_files_preserved: bool
+
+
+class UsageGroup(BaseModel):
+    key: str | None = None
+    calls: int
+    total_tokens: int
+    input_tokens: int
+    output_tokens: int
+    cached_tokens: int
+    cache_input_tokens: int
+    cache_percent: float | None = None
+    latency_ms: int | None = None
+    retries: int
+
+
+class ConversationUsageResponse(BaseModel):
+    conversation_id: str
+    totals: UsageGroup
+    by_agent: list[UsageGroup]
+    by_purpose: list[UsageGroup]
+    by_task: list[UsageGroup]
+    by_model: list[UsageGroup]
+    approvals: dict[str, int]
+    tool_calls: dict[str, int]
+
+
+@app.get('/api/conversations/{conversation_id}/usage', response_model=ConversationUsageResponse, tags=['Conversations'])
+async def conversation_usage(conversation_id: str):
+    """Tokens, cache hit rate, calls, approvals and tool failures of one session."""
+    await ensure_runtime()
+    try:
+        await store.get_conversation_summary(conversation_id)
+    except StorageNotFoundError as error:
+        raise storage_http_error(error) from error
+    usage = await store.conversation_usage(conversation_id)
+    approvals = {'human': 0, 'automatic': 0, 'allow_all': 0, 'pending': 0}
+    from app.execution import permissions as policy
+    if policy.current:
+        for row in await policy.current.rows('approval'):
+            if row.get('conversation') == conversation_id:
+                approvals['pending' if row['state'] == 'pending' else 'human'] += 1
+        for row in await policy.current.rows('review'):
+            if row.get('conversation') == conversation_id:
+                approvals['allow_all' if row.get('source') == 'allow_all' else 'automatic'] += 1
+    return {**usage, 'approvals': approvals, 'tool_calls': await store.conversation_tool_counts(conversation_id)}
 
 
 @app.post('/api/debug/records/reset', response_model=ResetRecordsResponse, tags=['Debug'])
@@ -136,6 +191,7 @@ async def _clear_all_records():
     global _checkpoint_connection, _runtime_store_identity, _collaboration_scheduler
     try:
         await _records_gate.drain()
+        await asyncio.gather(*(task for task in [*list(_conversation_stops.values()), _execution_pause] if task is not None and not task.done()), return_exceptions=True)
         if _collaboration_scheduler is not None:
             await _collaboration_scheduler.close()
             _collaboration_scheduler = None
@@ -143,6 +199,7 @@ async def _clear_all_records():
             await _checkpoint_connection.close()
             _checkpoint_connection = None
         _runtime_store_identity = None
+        await execution_api.close()
         try:
             await store.clear_records()
             team = get_team()
@@ -293,10 +350,15 @@ class AgentUsageResponse(BaseModel):
     context_tokens: int
     context_window: int
     context_percent: float
+    cache_input_tokens: int = 0
+    cached_tokens: int = 0
 
 
 class TeamUsageResponse(BaseModel):
     total_tokens: int
+    cache_input_tokens: int = 0
+    cached_tokens: int = 0
+    cache_percent: float | None = Field(default=None, description="Cached share of input tokens, over calls that reported cache data")
     agents: list[AgentUsageResponse]
 
 
@@ -372,6 +434,108 @@ async def conversation_detail(conversation_id: str):
         raise storage_http_error(error) from error
 
 
+class ExecutionStatusResponse(BaseModel):
+    running: bool
+    stopping: bool
+    paused: bool
+    pending_tasks: int
+    active_goals: int
+
+
+async def execution_context(conversation_id):
+    await ensure_runtime()
+    try:
+        summary = await store.get_conversation_summary(conversation_id)
+    except StorageNotFoundError as exc:
+        raise storage_http_error(exc) from exc
+    return collaboration_api._service, summary['project_id']
+
+
+class PauseExecutionResponse(BaseModel):
+    paused_conversations: int
+
+
+async def _pause_previous_execution():
+    service = collaboration_api._service
+    conversations = await service.pause_unfinished_on_startup()
+    team = get_team()
+    pending = []
+    for project, conversation in conversations:
+        if hasattr(team, 'cancel_conversation'):
+            pending.append(team.cancel_conversation(conversation))
+        if _collaboration_scheduler:
+            pending.append(_collaboration_scheduler.cancel_conversation(project, conversation))
+    await asyncio.gather(*pending)
+    return {'paused_conversations': len(conversations)}
+
+
+@app.post('/api/execution/pause', response_model=PauseExecutionResponse, tags=['Projects'])
+async def pause_previous_execution():
+    """App close/open handshake: preserve unfinished work, require explicit resume."""
+    global _execution_pause
+    await ensure_runtime()
+    if _execution_pause is None or _execution_pause.done():
+        _execution_pause = asyncio.create_task(_pause_previous_execution())
+        _execution_pause.add_done_callback(lambda task: None if task.cancelled() else task.exception())
+    return await asyncio.shield(_execution_pause)
+
+
+def reject_during_execution_pause():
+    if _execution_pause and not _execution_pause.done():
+        raise HTTPException(409, '正在挂起旧任务，请稍后重试')
+
+
+@app.get('/api/conversations/{conversation_id}/execution', response_model=ExecutionStatusResponse, tags=['Projects'])
+async def conversation_execution(conversation_id: str):
+    service, project = await execution_context(conversation_id)
+    result = await service.conversation_execution(project, conversation_id)
+    live = getattr(get_team(), '_conversation_tasks', {}).get(conversation_id)
+    if live and not await service.conversation_stopped(project, conversation_id):
+        result['running'] = True
+    return result
+
+
+async def _stop_conversation(conversation_id, service, project):
+    generation = await service.stop_conversation_run(project, conversation_id)
+    team = get_team()
+    pending = []
+    if hasattr(team, 'cancel_conversation'):
+        pending.append(team.cancel_conversation(conversation_id))
+    if _collaboration_scheduler:
+        pending.append(_collaboration_scheduler.cancel_conversation(project, conversation_id))
+    await asyncio.gather(*pending)
+    await service.finish_conversation_stop(project, conversation_id, generation)
+    return await service.conversation_execution(project, conversation_id)
+
+
+@app.post('/api/conversations/{conversation_id}/execution/stop', response_model=ExecutionStatusResponse, tags=['Projects'])
+async def stop_conversation(conversation_id: str):
+    service, project = await execution_context(conversation_id)
+    task = _conversation_stops.get(conversation_id)
+    if task is None or task.done():
+        task = asyncio.create_task(_stop_conversation(conversation_id, service, project))
+        _conversation_stops[conversation_id] = task
+        def finished(done):
+            if _conversation_stops.get(conversation_id) is done:
+                _conversation_stops.pop(conversation_id, None)
+            if not done.cancelled():
+                done.exception()
+        task.add_done_callback(finished)
+    # A page switch or disconnect must not abandon server-side cancellation.
+    return await asyncio.shield(task)
+
+
+@app.post('/api/conversations/{conversation_id}/execution/resume', response_model=ExecutionStatusResponse, tags=['Projects'])
+async def resume_conversation(conversation_id: str):
+    reject_during_execution_pause()
+    service, project = await execution_context(conversation_id)
+    try:
+        await service.resume_conversation_run(project, conversation_id)
+    except StorageConflictError as exc:
+        raise storage_http_error(exc) from exc
+    return await service.conversation_execution(project, conversation_id)
+
+
 @app.get("/api/conversations/{conversation_id}/events", response_model=ConversationEventsResponse, tags=["Projects"])
 async def conversation_events(conversation_id: str, after: int = Query(0, ge=0), limit: int = Query(200, ge=1, le=500)):
     try:
@@ -408,11 +572,13 @@ async def conversation_message_stream(
     request: Request,
 ):
     await ensure_runtime()
+    reject_during_execution_pause()
     if not os.getenv("DASHSCOPE_API_KEY"):
         raise HTTPException(status_code=503, detail="DASHSCOPE_API_KEY is not configured")
     try:
         workspace = resolve_workspace(await store.conversation_workspace(conversation_id))
-        await store.add_user_message(conversation_id, body.content, body.client_message_id)
+        project = (await store.get_conversation_summary(conversation_id))['project_id']
+        generation = await collaboration_api._service.begin_conversation_run(project, conversation_id, message_id=body.client_message_id, content=body.content)
         stored_history = await store.model_history(conversation_id)
         initial_title = (await store.get_conversation_summary(conversation_id))["title"]
     except (StorageNotFoundError, StorageConflictError) as error:
@@ -435,7 +601,8 @@ async def conversation_message_stream(
         completed = False
         try:
             async with aclosing(
-                team.stream(history, conversation_id=conversation_id, workspace_path=workspace)
+                team.stream(history, conversation_id=conversation_id, workspace_path=workspace,
+                            **({'generation': generation} if hasattr(team, 'cancel_conversation') else {}))
             ) as team_events:
                 async for event_name, payload in team_events:
                     if await request.is_disconnected():
@@ -472,6 +639,8 @@ async def conversation_message_stream(
             yield sse("done", {"message_id": reply_id if reply_started else None})
             if is_initial_turn and reply_started:
                 try:
+                    from app.agents.usage import usage_scope
+                    usage_scope.set({'conversation_id': conversation_id, 'project_id': project})
                     title = conversation_title.clean_title(await asyncio.wait_for(
                         conversation_title.generate_title(body.content, reply), timeout=20
                     ))
@@ -491,6 +660,7 @@ async def conversation_message_stream(
             await store.add_event(conversation_id, "error", {"message": "Team request failed"})
             yield sse("error", {"message": "Team request failed; check backend logs"})
         finally:
+            await collaboration_api._service.end_conversation_run(project, conversation_id, generation)
             if reply_started and not completed and await request.is_disconnected():
                 await store.update_assistant_message(reply_id, reply, "cancelled")
 

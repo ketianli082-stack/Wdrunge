@@ -195,6 +195,26 @@ class IsolatedWorkspace:
                     os.unlink(temp)
         journal.unlink()
 
+    def sync(self, names):
+        """Copy just-published shared documents into this snapshot as unchanged
+        base files, so file tools see them and plan() does not treat them as edits."""
+        if not self.manifest_path.exists():
+            return
+        manifest = json.loads(self.manifest_path.read_text())
+        for name in names:
+            source = self.source/name
+            if source.is_symlink() or not source.is_file() or not source.resolve().is_relative_to(self.source):
+                continue
+            local = self.work/name
+            if hash_bytes(local.read_bytes() if local.is_file() else None) != manifest.get(name):
+                continue  # Never overwrite this request's own edits.
+            data = source.read_bytes()
+            for target in (self.base/name, local):
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(data)
+            manifest[name] = hash_bytes(data)
+        save_json(self.manifest_path, manifest)
+
     def refresh(self):
         """Pull new dependency artifacts without overwriting this request's edits."""
         manifest = json.loads(self.manifest_path.read_text())

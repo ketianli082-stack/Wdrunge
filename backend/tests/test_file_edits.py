@@ -4,9 +4,9 @@ from threading import Barrier
 
 import pytest
 
-from app.tools import _workspace
-from app.tools.read_project_file import make_read_project_file
-from app.tools.write_project_file import make_write_project_file
+from app.agents.tools import _workspace
+from app.agents.tools.read_project_file import make_read_project_file
+from app.agents.tools.write_project_file import make_write_project_file
 
 
 @pytest.fixture
@@ -94,8 +94,8 @@ def test_partial_edit_cannot_bypass_managed_document_guard(files):
     (root / 'docs/spec.md').write_text('original')
     token = active.set(Context(object(), 'p', 'product', 'c', 'ctx'))
     try:
-        result = write.invoke({'path': 'docs/spec.md', 'edits': [{'old_text': 'original', 'new_text': 'bypass'}]})
-        assert 'collaborate publish' in result
+        with pytest.raises(ValueError, match='collaboration_publish'):
+            write.invoke({'path': 'docs/spec.md', 'edits': [{'old_text': 'original', 'new_text': 'bypass'}]})
         assert (root / 'docs/spec.md').read_text() == 'original'
     finally:
         active.reset(token)

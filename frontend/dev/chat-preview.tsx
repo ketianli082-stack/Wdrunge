@@ -20,7 +20,7 @@ const delivery = `## 接口交付说明
 | name | string | 姓名（角色） |
 
 \`\`\`ts
-const response = await fetch("http://localhost:8000/api/team");
+const response = await fetch("http://localhost:17420/api/team");
 const { agents } = await response.json();
 \`\`\`
 

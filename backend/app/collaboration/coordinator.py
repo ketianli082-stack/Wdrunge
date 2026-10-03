@@ -18,8 +18,8 @@ class LeaderCoordinator:
         self.job = None
 
     async def start(self):
-        # Resume existing project conversations after an API restart. Fresh test
-        # or integration requests without any human conversation remain detached.
+        # Reconstruct session records; startup execution fences keep historical
+        # conversations dormant until the user explicitly continues them.
         async with self.service.transaction() as c:
             rows = (await c.execute(text("SELECT DISTINCT c.id,c.project_id FROM conversations c JOIN messages m ON m.conversation_id=c.id WHERE m.kind='user'"))).mappings().all()
             for row in rows:
@@ -45,6 +45,8 @@ class LeaderCoordinator:
             if session['state'] in {'running', 'failed'} or session.get('retry_after', 0) > now:
                 continue
             project, conversation = row['project'], session['id']
+            if await self.service.conversation_stopped(project, conversation):
+                continue
             async with self.service.reading() as c:
                 settings = await self.service._get(c, 'settings', project, 'project', False)
             if settings and settings.get('paused'):
@@ -99,7 +101,7 @@ class LeaderCoordinator:
             session = await self.service._get(c, 'leader_session', project, conversation)
             if session['state'] in {'running', 'failed'} or now-max(session.get('last_wake', now), session.get('last_progress', 0)) < 180:
                 return
-            requests = [r for r in await self.service._list(c, 'request', project) if r['conversation']==conversation and r['state'] in {'queued','running','blocked','review'}]
+            requests = [r for r in await self.service._list(c, 'request', project) if not r.get('paused_on_restart') and not r.get('goal_id') and r['conversation']==conversation and r['state'] in {'queued','running','blocked','review'}]
             if not requests:
                 return
             session['last_progress'] = now

@@ -146,6 +146,58 @@
         }
       }
     },
+    "/api/projects/{project_id}/collaboration/requests/{request_id}/journal": {
+      "get": {
+        "tags": [
+          "Collaboration"
+        ],
+        "summary": "Export Journal",
+        "description": "Export a task's work journal as Markdown, for download on request.",
+        "operationId": "export_journal_api_projects__project_id__collaboration_requests__request_id__journal_get",
+        "parameters": [
+          {
+            "name": "project_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Project Id"
+            }
+          },
+          {
+            "name": "request_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Request Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/projects/{project_id}/delivery/tree": {
       "get": {
         "tags": [
@@ -326,6 +378,361 @@
                 "schema": {}
               },
               "text/event-stream": {}
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/execution/capabilities": {
+      "get": {
+        "tags": [
+          "Execution"
+        ],
+        "summary": "Capabilities",
+        "operationId": "capabilities_api_execution_capabilities_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/execution/permissions": {
+      "get": {
+        "tags": [
+          "Execution"
+        ],
+        "summary": "Permission State",
+        "operationId": "permission_state_api_execution_permissions_get",
+        "parameters": [
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "default": "",
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/execution/settings": {
+      "post": {
+        "tags": [
+          "Execution"
+        ],
+        "summary": "Configure Approvals",
+        "operationId": "configure_approvals_api_execution_settings_post",
+        "parameters": [
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "default": "",
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ApprovalSettings"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/execution/permissions/{identifier}": {
+      "post": {
+        "tags": [
+          "Execution"
+        ],
+        "summary": "Decide",
+        "operationId": "decide_api_execution_permissions__identifier__post",
+        "parameters": [
+          {
+            "name": "identifier",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Identifier"
+            }
+          },
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "default": "",
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Decision"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/execution/grants/{identifier}/revoke": {
+      "post": {
+        "tags": [
+          "Execution"
+        ],
+        "summary": "Revoke",
+        "operationId": "revoke_api_execution_grants__identifier__revoke_post",
+        "parameters": [
+          {
+            "name": "identifier",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Identifier"
+            }
+          },
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "default": "",
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/execution/processes": {
+      "get": {
+        "tags": [
+          "Execution"
+        ],
+        "summary": "List Processes",
+        "operationId": "list_processes_api_execution_processes_get",
+        "parameters": [
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "default": "",
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/execution/processes/{identifier}/stop": {
+      "post": {
+        "tags": [
+          "Execution"
+        ],
+        "summary": "Stop Process",
+        "operationId": "stop_process_api_execution_processes__identifier__stop_post",
+        "parameters": [
+          {
+            "name": "identifier",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Identifier"
+            }
+          },
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "default": "",
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/conversations/{conversation_id}/usage": {
+      "get": {
+        "tags": [
+          "Conversations"
+        ],
+        "summary": "Conversation Usage",
+        "description": "Tokens, cache hit rate, calls, approvals and tool failures of one session.",
+        "operationId": "conversation_usage_api_conversations__conversation_id__usage_get",
+        "parameters": [
+          {
+            "name": "conversation_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Conversation Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConversationUsageResponse"
+                }
+              }
             }
           },
           "422": {
@@ -603,6 +1010,154 @@
         }
       }
     },
+    "/api/execution/pause": {
+      "post": {
+        "tags": [
+          "Projects"
+        ],
+        "summary": "Pause Previous Execution",
+        "description": "App close/open handshake: preserve unfinished work, require explicit resume.",
+        "operationId": "pause_previous_execution_api_execution_pause_post",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PauseExecutionResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/conversations/{conversation_id}/execution": {
+      "get": {
+        "tags": [
+          "Projects"
+        ],
+        "summary": "Conversation Execution",
+        "operationId": "conversation_execution_api_conversations__conversation_id__execution_get",
+        "parameters": [
+          {
+            "name": "conversation_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Conversation Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ExecutionStatusResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/conversations/{conversation_id}/execution/stop": {
+      "post": {
+        "tags": [
+          "Projects"
+        ],
+        "summary": "Stop Conversation",
+        "operationId": "stop_conversation_api_conversations__conversation_id__execution_stop_post",
+        "parameters": [
+          {
+            "name": "conversation_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Conversation Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ExecutionStatusResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/conversations/{conversation_id}/execution/resume": {
+      "post": {
+        "tags": [
+          "Projects"
+        ],
+        "summary": "Resume Conversation",
+        "operationId": "resume_conversation_api_conversations__conversation_id__execution_resume_post",
+        "parameters": [
+          {
+            "name": "conversation_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Conversation Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ExecutionStatusResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/conversations/{conversation_id}/events": {
       "get": {
         "tags": [
@@ -820,6 +1375,16 @@
           "context_percent": {
             "type": "number",
             "title": "Context Percent"
+          },
+          "cache_input_tokens": {
+            "type": "integer",
+            "title": "Cache Input Tokens",
+            "default": 0
+          },
+          "cached_tokens": {
+            "type": "integer",
+            "title": "Cached Tokens",
+            "default": 0
           }
         },
         "type": "object",
@@ -831,6 +1396,35 @@
           "context_percent"
         ],
         "title": "AgentUsageResponse"
+      },
+      "ApprovalSettings": {
+        "properties": {
+          "allow_all": {
+            "type": "boolean",
+            "title": "Allow All",
+            "default": false
+          },
+          "ai_review": {
+            "type": "boolean",
+            "title": "Ai Review",
+            "default": true
+          },
+          "whitelist": {
+            "items": {
+              "type": "string",
+              "enum": [
+                "versions",
+                "git_status"
+              ]
+            },
+            "type": "array",
+            "maxItems": 2,
+            "title": "Whitelist"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "title": "ApprovalSettings"
       },
       "ChatMessage": {
         "properties": {
@@ -935,7 +1529,19 @@
               "handoff",
               "recover",
               "inspect_message",
-              "history"
+              "history",
+              "create_goal",
+              "get_goal",
+              "update_goal",
+              "complete_goal",
+              "create_task",
+              "submit_task",
+              "complete_task",
+              "environment",
+              "register_service",
+              "register_command",
+              "journal",
+              "check_delivery"
             ],
             "title": "Action"
           },
@@ -1121,6 +1727,123 @@
         ],
         "title": "ConversationSummaryResponse"
       },
+      "ConversationUsageResponse": {
+        "properties": {
+          "conversation_id": {
+            "type": "string",
+            "title": "Conversation Id"
+          },
+          "totals": {
+            "$ref": "#/components/schemas/UsageGroup"
+          },
+          "by_agent": {
+            "items": {
+              "$ref": "#/components/schemas/UsageGroup"
+            },
+            "type": "array",
+            "title": "By Agent"
+          },
+          "by_purpose": {
+            "items": {
+              "$ref": "#/components/schemas/UsageGroup"
+            },
+            "type": "array",
+            "title": "By Purpose"
+          },
+          "by_task": {
+            "items": {
+              "$ref": "#/components/schemas/UsageGroup"
+            },
+            "type": "array",
+            "title": "By Task"
+          },
+          "by_model": {
+            "items": {
+              "$ref": "#/components/schemas/UsageGroup"
+            },
+            "type": "array",
+            "title": "By Model"
+          },
+          "approvals": {
+            "additionalProperties": {
+              "type": "integer"
+            },
+            "type": "object",
+            "title": "Approvals"
+          },
+          "tool_calls": {
+            "additionalProperties": {
+              "type": "integer"
+            },
+            "type": "object",
+            "title": "Tool Calls"
+          }
+        },
+        "type": "object",
+        "required": [
+          "conversation_id",
+          "totals",
+          "by_agent",
+          "by_purpose",
+          "by_task",
+          "by_model",
+          "approvals",
+          "tool_calls"
+        ],
+        "title": "ConversationUsageResponse"
+      },
+      "Decision": {
+        "properties": {
+          "decision": {
+            "type": "string",
+            "enum": [
+              "once",
+              "always",
+              "deny"
+            ],
+            "title": "Decision"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "decision"
+        ],
+        "title": "Decision"
+      },
+      "ExecutionStatusResponse": {
+        "properties": {
+          "running": {
+            "type": "boolean",
+            "title": "Running"
+          },
+          "stopping": {
+            "type": "boolean",
+            "title": "Stopping"
+          },
+          "paused": {
+            "type": "boolean",
+            "title": "Paused"
+          },
+          "pending_tasks": {
+            "type": "integer",
+            "title": "Pending Tasks"
+          },
+          "active_goals": {
+            "type": "integer",
+            "title": "Active Goals"
+          }
+        },
+        "type": "object",
+        "required": [
+          "running",
+          "stopping",
+          "paused",
+          "pending_tasks",
+          "active_goals"
+        ],
+        "title": "ExecutionStatusResponse"
+      },
       "FileEntry": {
         "properties": {
           "path": {
@@ -1285,6 +2008,19 @@
           "paused"
         ],
         "title": "Pause"
+      },
+      "PauseExecutionResponse": {
+        "properties": {
+          "paused_conversations": {
+            "type": "integer",
+            "title": "Paused Conversations"
+          }
+        },
+        "type": "object",
+        "required": [
+          "paused_conversations"
+        ],
+        "title": "PauseExecutionResponse"
       },
       "PersistedActivityResponse": {
         "properties": {
@@ -1576,6 +2312,28 @@
             "type": "integer",
             "title": "Total Tokens"
           },
+          "cache_input_tokens": {
+            "type": "integer",
+            "title": "Cache Input Tokens",
+            "default": 0
+          },
+          "cached_tokens": {
+            "type": "integer",
+            "title": "Cached Tokens",
+            "default": 0
+          },
+          "cache_percent": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Cache Percent",
+            "description": "Cached share of input tokens, over calls that reported cache data"
+          },
           "agents": {
             "items": {
               "$ref": "#/components/schemas/AgentUsageResponse"
@@ -1590,6 +2348,82 @@
           "agents"
         ],
         "title": "TeamUsageResponse"
+      },
+      "UsageGroup": {
+        "properties": {
+          "key": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Key"
+          },
+          "calls": {
+            "type": "integer",
+            "title": "Calls"
+          },
+          "total_tokens": {
+            "type": "integer",
+            "title": "Total Tokens"
+          },
+          "input_tokens": {
+            "type": "integer",
+            "title": "Input Tokens"
+          },
+          "output_tokens": {
+            "type": "integer",
+            "title": "Output Tokens"
+          },
+          "cached_tokens": {
+            "type": "integer",
+            "title": "Cached Tokens"
+          },
+          "cache_input_tokens": {
+            "type": "integer",
+            "title": "Cache Input Tokens"
+          },
+          "cache_percent": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Cache Percent"
+          },
+          "latency_ms": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Latency Ms"
+          },
+          "retries": {
+            "type": "integer",
+            "title": "Retries"
+          }
+        },
+        "type": "object",
+        "required": [
+          "calls",
+          "total_tokens",
+          "input_tokens",
+          "output_tokens",
+          "cached_tokens",
+          "cache_input_tokens",
+          "retries"
+        ],
+        "title": "UsageGroup"
       },
       "ValidationError": {
         "properties": {

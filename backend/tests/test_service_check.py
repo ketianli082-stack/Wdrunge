@@ -2,8 +2,26 @@ import asyncio
 from urllib.error import URLError
 import pytest
 
-from app.tools.run_service_check import check_service, probe
-from app.tools._workspace import active_workspace
+from app.agents.tools.run_service_check import check_service, probe
+from app.agents.tools._workspace import active_workspace
+
+
+@pytest.fixture(autouse=True)
+def approve_test_service(monkeypatch):
+    """Deterministic human approval; the real OS sandbox still executes the service."""
+    import importlib
+    import sys
+    from types import SimpleNamespace
+    from app.execution import permissions
+    from app.execution.processes import processes
+    class Approval:
+        store = SimpleNamespace(sqlite_path=None)
+        async def authorize(self, *args, **kwargs):
+            return None
+    monkeypatch.setattr(permissions, 'current', Approval())
+    monkeypatch.setattr(processes, 'jobs', {})
+    module = importlib.import_module('app.agents.tools.run_service_check')
+    monkeypatch.setattr(module, 'verification_python', lambda directory: sys.executable)
 
 
 def test_service_check_starts_probes_and_stops_only_its_temporary_service(tmp_path):
@@ -40,7 +58,7 @@ def test_service_check_rejects_nonlocal_paths_before_startup(tmp_path):
 
 def test_cancelling_service_check_stops_its_process(tmp_path, monkeypatch):
     import importlib
-    module = importlib.import_module('app.tools.run_service_check')
+    module = importlib.import_module('app.agents.tools.run_service_check')
     app = tmp_path/'backend'/'app'
     app.mkdir(parents=True)
     (app/'main.py').write_text('import time\ntime.sleep(60)\n')

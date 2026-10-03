@@ -39,6 +39,16 @@ from sqlalchemy.pool import StaticPool
 
 metadata = MetaData()
 
+execution_permissions = Table(
+    'execution_permissions', metadata,
+    Column('id', String, primary_key=True),
+    Column('kind', String, nullable=False),
+    Column('scope', String, nullable=False),
+    Column('state', String, nullable=False),
+    Column('data', JSON, nullable=False),
+    Index('ix_execution_permissions_kind_state', 'kind', 'state'),
+)
+
 projects = Table(
     "projects",
     metadata,
@@ -153,6 +163,64 @@ agent_sessions = Table(
 )
 
 
+# Leader tool calls are not kept in LangGraph checkpoints like worker calls; this
+# bounded diagnostic log keeps their arguments and results for root-cause analysis.
+tool_calls = Table(
+    "tool_calls", metadata,
+    Column("conversation_id", String(36), primary_key=True),
+    Column("tool_call_id", String(120), primary_key=True),
+    Column("agent_id", String(64), nullable=False),
+    Column("tool", String(120), nullable=False),
+    Column("status", String(16), nullable=False),
+    Column("arguments", Text, nullable=False),
+    Column("result", Text, nullable=False),
+    Column("created_at", DateTime(timezone=True), nullable=False, index=True),
+)
+
+agent_usage = Table(
+    "agent_usage", metadata,
+    Column("id", String(80), primary_key=True),
+    Column("agent_id", String(64), nullable=False, index=True),
+    Column("total_tokens", Integer, nullable=False),
+    Column("context_tokens", Integer, nullable=False),
+    Column("created_at", DateTime(timezone=True), nullable=False),
+    # Provider-reported prompt cache hits; NULL when the provider omitted them.
+    Column("cached_tokens", Integer),
+    # Session attribution and call details (NULL for calls recorded before them).
+    Column("project_id", String(36)),
+    Column("conversation_id", String(36), index=True),
+    Column("request_id", String(200)),
+    Column("attempt", Integer),
+    Column("purpose", String(32)),
+    Column("model", String(80)),
+    Column("output_tokens", Integer),
+    Column("latency_ms", Integer),
+    Column("retries", Integer),
+)
+
+USAGE_COLUMNS = {
+    "cached_tokens": "INTEGER", "project_id": "VARCHAR(36)", "conversation_id": "VARCHAR(36)",
+    "request_id": "VARCHAR(200)", "attempt": "INTEGER", "purpose": "VARCHAR(32)", "model": "VARCHAR(80)",
+    "output_tokens": "INTEGER", "latency_ms": "INTEGER", "retries": "INTEGER",
+}
+
+context_compactions = Table(
+    "context_compactions", metadata,
+    Column("id", String(80), primary_key=True),
+    Column("scope", String(200), nullable=False, index=True),
+    Column("stage", String(24), nullable=False),
+    Column("record_json", JSON, nullable=False),
+    Column("created_at", DateTime(timezone=True), nullable=False),
+)
+
+context_memory = Table(
+    "context_memory", metadata,
+    Column("scope", String(200), primary_key=True),
+    Column("state_json", JSON, nullable=False),
+    Column("updated_at", DateTime(timezone=True), nullable=False),
+)
+
+
 class StorageNotFoundError(LookupError):
     pass
 
@@ -214,6 +282,14 @@ class ChatStore:
             path.parent.mkdir(parents=True, exist_ok=True)
         async with self.engine.begin() as connection:
             await connection.run_sync(metadata.create_all)
+            if path:
+                # create_all does not add columns to databases created before them.
+                columns = {row[1] for row in await connection.execute(text("PRAGMA table_info(agent_usage)"))}
+                for name, kind in USAGE_COLUMNS.items():
+                    if name not in columns:
+                        await connection.execute(text(f"ALTER TABLE agent_usage ADD COLUMN {name} {kind}"))
+                if "conversation_id" not in columns:
+                    await connection.execute(text("CREATE INDEX IF NOT EXISTS ix_agent_usage_conversation_id ON agent_usage (conversation_id)"))
         self._initialized = True
 
     async def clear_records(self) -> None:
@@ -338,19 +414,22 @@ class ChatStore:
 
     async def add_user_message(self, conversation_id: str, content: str, message_id: str) -> dict[str, Any]:
         await self.initialize()
-        now = utcnow()
         async with self.engine.begin() as connection:
-            if not await self._conversation_exists(connection, conversation_id):
-                raise StorageNotFoundError("Conversation not found")
-            duplicate = await connection.scalar(select(messages.c.id).where(messages.c.id == message_id))
-            if duplicate:
-                raise StorageConflictError("This message was already submitted")
-            sequence = await self._next_sequence(connection, conversation_id)
-            await connection.execute(insert(messages).values(
-                id=message_id, conversation_id=conversation_id, sequence=sequence,
-                sender_id="user", role="user", kind="user", content=content,
-                status="completed", metadata_json={}, created_at=now, completed_at=now,
-            ))
+            return await self.add_user_message_in_transaction(connection, conversation_id, content, message_id)
+
+    async def add_user_message_in_transaction(self, connection, conversation_id, content, message_id):
+        now = utcnow()
+        if not await self._conversation_exists(connection, conversation_id):
+            raise StorageNotFoundError("Conversation not found")
+        duplicate = await connection.scalar(select(messages.c.id).where(messages.c.id == message_id))
+        if duplicate:
+            raise StorageConflictError("This message was already submitted")
+        sequence = await self._next_sequence(connection, conversation_id)
+        await connection.execute(insert(messages).values(
+            id=message_id, conversation_id=conversation_id, sequence=sequence,
+            sender_id="user", role="user", kind="user", content=content,
+            status="completed", metadata_json={}, created_at=now, completed_at=now,
+        ))
         return {"id": message_id, "sequence": sequence, "created_at": now}
 
     async def set_initial_title(self, conversation_id: str, title: str) -> None:
@@ -544,6 +623,137 @@ class ChatStore:
             "messages": visible_messages,
             "activities": visible_activities,
         }
+
+    async def record_tool_calls(self, conversation_id: str, agent_id: str, calls: list[dict], keep: int = 5000) -> None:
+        """Insert once per (conversation, call ID); texts are bounded and the log is capped."""
+        if not calls:
+            return
+        from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+        await self.initialize()
+        rows = [{'conversation_id': conversation_id, 'tool_call_id': str(call['id'])[:120], 'agent_id': agent_id,
+                 'tool': str(call['tool'])[:120], 'status': call['status'], 'arguments': call['arguments'][:8000],
+                 'result': call['result'][:8000], 'created_at': utcnow()} for call in calls]
+        async with self.engine.begin() as connection:
+            await connection.execute(sqlite_insert(tool_calls).values(rows).on_conflict_do_nothing())
+            newest = select(tool_calls.c.created_at).order_by(tool_calls.c.created_at.desc()).offset(keep).limit(1)
+            await connection.execute(delete(tool_calls).where(tool_calls.c.created_at <= newest.scalar_subquery()))
+
+    async def load_tool_calls(self, conversation_id: str) -> list[dict]:
+        await self.initialize()
+        async with self.engine.connect() as connection:
+            rows = await connection.execute(select(tool_calls).where(tool_calls.c.conversation_id == conversation_id)
+                                            .order_by(tool_calls.c.created_at))
+            return [dict(row._mapping) for row in rows]
+
+    async def record_agent_usage(self, agent_id: str, total: int, context: int, cached: int | None = None, *,
+                                 project_id=None, conversation_id=None, request_id=None, attempt=None, purpose=None,
+                                 model=None, output_tokens=None, latency_ms=None, retries=None) -> None:
+        await self.initialize()
+        async with self.engine.begin() as connection:
+            await connection.execute(insert(agent_usage).values(
+                id=uuid4().hex, agent_id=agent_id, total_tokens=total,
+                context_tokens=context, cached_tokens=cached, created_at=utcnow(),
+                project_id=project_id, conversation_id=conversation_id, request_id=(request_id or None) and str(request_id)[:200],
+                attempt=attempt, purpose=purpose, model=(model or None) and str(model)[:80], output_tokens=output_tokens,
+                latency_ms=int(latency_ms) if isinstance(latency_ms, (int, float)) else None, retries=retries,
+            ))
+
+    async def conversation_tool_counts(self, conversation_id: str) -> dict[str, int]:
+        from sqlalchemy import func, case
+        await self.initialize()
+        async with self.engine.connect() as connection:
+            row = (await connection.execute(select(func.count(), func.sum(case((activities.c.phase == 'failed', 1), else_=0)))
+                                            .where(activities.c.conversation_id == conversation_id))).one()
+        return {'total': int(row[0] or 0), 'failed': int(row[1] or 0)}
+
+    async def conversation_usage(self, conversation_id: str) -> dict:
+        """Token, cache and call totals of one session, by agent, purpose and task."""
+        from sqlalchemy import func, case
+        await self.initialize()
+        cached_input = func.sum(case((agent_usage.c.cached_tokens.is_not(None), agent_usage.c.context_tokens), else_=0))
+        fields = (func.count().label('calls'), func.sum(agent_usage.c.total_tokens).label('total_tokens'),
+                  func.sum(agent_usage.c.context_tokens).label('input_tokens'), func.sum(agent_usage.c.output_tokens).label('output_tokens'),
+                  func.sum(agent_usage.c.cached_tokens).label('cached_tokens'), cached_input.label('cache_input_tokens'),
+                  func.avg(agent_usage.c.latency_ms).label('latency_ms'), func.sum(agent_usage.c.retries).label('retries'))
+        def shape(row) -> dict:
+            data = {key: (int(value) if value is not None else 0) for key, value in row._mapping.items()
+                    if key not in {'group', 'latency_ms'}}
+            data['latency_ms'] = round(row._mapping['latency_ms']) if row._mapping['latency_ms'] is not None else None
+            data['cache_percent'] = round(100 * data['cached_tokens'] / data['cache_input_tokens'], 1) if data['cache_input_tokens'] else None
+            return data
+        where = agent_usage.c.conversation_id == conversation_id
+        async with self.engine.connect() as connection:
+            total = shape((await connection.execute(select(*fields).where(where))).one())
+            groups = {}
+            for name, column in (('by_agent', agent_usage.c.agent_id), ('by_purpose', agent_usage.c.purpose),
+                                 ('by_task', agent_usage.c.request_id), ('by_model', agent_usage.c.model)):
+                rows = await connection.execute(select(column.label('group'), *fields).where(where).group_by(column)
+                                                .order_by(func.sum(agent_usage.c.total_tokens).desc()))
+                groups[name] = [{'key': row._mapping['group'], **shape(row)} for row in rows]
+        return {'conversation_id': conversation_id, 'totals': total, **groups}
+
+    async def load_agent_cache_usage(self) -> dict[str, tuple[int, int]]:
+        """Input and cached tokens per agent, over calls that reported cache data."""
+        from sqlalchemy import func
+        await self.initialize()
+        async with self.engine.connect() as connection:
+            rows = await connection.execute(select(
+                agent_usage.c.agent_id, func.sum(agent_usage.c.context_tokens), func.sum(agent_usage.c.cached_tokens)
+            ).where(agent_usage.c.cached_tokens.is_not(None)).group_by(agent_usage.c.agent_id))
+            return {row[0]: (int(row[1]), int(row[2])) for row in rows}
+
+    async def load_agent_usage(self) -> dict[str, int]:
+        from sqlalchemy import func
+        await self.initialize()
+        async with self.engine.connect() as connection:
+            rows = await connection.execute(select(
+                agent_usage.c.agent_id, func.sum(agent_usage.c.total_tokens)
+            ).group_by(agent_usage.c.agent_id))
+            return {row[0]: int(row[1]) for row in rows}
+
+    async def save_compaction(self, scope: str, stage: str, record: dict) -> None:
+        await self.initialize()
+        async with self.engine.begin() as connection:
+            await connection.execute(insert(context_compactions).values(
+                id=record['id'], scope=scope, stage=stage, record_json=record, created_at=utcnow(),
+            ))
+
+    async def load_compactions(self, scope: str) -> list[dict]:
+        await self.initialize()
+        async with self.engine.connect() as connection:
+            rows = await connection.scalars(select(context_compactions.c.record_json)
+                .where(context_compactions.c.scope == scope).order_by(context_compactions.c.created_at))
+            return list(rows)
+
+    async def find_compacted_message(self, scope: str, message_id: str) -> dict | None:
+        """The serialized message as first recorded by a compaction, i.e. its original."""
+        from sqlalchemy import cast, String
+        await self.initialize()
+        async with self.engine.connect() as connection:
+            rows = await connection.scalars(select(context_compactions.c.record_json)
+                .where(context_compactions.c.scope == scope,
+                       cast(context_compactions.c.record_json, String).contains(message_id))
+                .order_by(context_compactions.c.created_at))
+            for record in rows:
+                for message in record.get('source', []):
+                    if message.get('data', {}).get('id') == message_id:
+                        return message
+        return None
+
+    async def save_context_memory(self, scope: str, state: dict) -> None:
+        await self.initialize()
+        async with self.engine.begin() as connection:
+            existing = await connection.scalar(select(context_memory.c.scope).where(context_memory.c.scope == scope))
+            values = dict(state_json=state, updated_at=utcnow())
+            if existing:
+                await connection.execute(update(context_memory).where(context_memory.c.scope == scope).values(**values))
+            else:
+                await connection.execute(insert(context_memory).values(scope=scope, **values))
+
+    async def load_context_memory(self, scope: str) -> dict | None:
+        await self.initialize()
+        async with self.engine.connect() as connection:
+            return await connection.scalar(select(context_memory.c.state_json).where(context_memory.c.scope == scope))
 
     async def save_leader_checkpoint(self, conversation_id: str, history_cutoff: int, handoff: dict[str, Any]) -> None:
         await self.initialize()

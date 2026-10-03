@@ -20,6 +20,9 @@ dependencies = [
     "watchfiles>=1,<2",
 ]
 
+[project.optional-dependencies]
+browser = ["playwright>=1.51,<2"]
+
 [dependency-groups]
 dev = [
     "httpx>=0.27,<1",

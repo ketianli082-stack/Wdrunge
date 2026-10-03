@@ -9,10 +9,10 @@ cd backend
 cp .env.example .env
 # Set DASHSCOPE_API_KEY in .env
 uv sync
-uv run uvicorn app.main:app --host 127.0.0.1 --port 8000
+uv run uvicorn app.main:app --host 127.0.0.1 --port 17420
 ```
 
-Open `http://127.0.0.1:8000/docs` for the API schema. The frontend runs separately with `cd frontend && npm run dev`.
+Open `http://127.0.0.1:17420/docs` for the API schema. The frontend runs separately with `cd frontend && npm run dev`.
 
 The agent calls Alibaba Cloud Model Studio through its OpenAI-compatible API. The default model is `qwen3.7-max`. Set `DASHSCOPE_API_KEY` in `.env`; `QWEN_MODEL` and `DASHSCOPE_BASE_URL` can be changed for another model or region. The default URL uses the China (Beijing) endpoint. After the first conversation turn completes, a separate `QWEN_TITLE_MODEL` call (default `qwen-flash`) extracts a title of at most 15 characters and emits a `title` event.
 
@@ -67,13 +67,13 @@ workspace from SQLite.
 
 The response uses `text/event-stream`. `status` events contain an agent ID and `idle`, `running`, or `failed` state. `chat_message` contains short public team updates; all assignments from one Leader batch share one multiline message with structured `mentions`. `read_receipt` marks one member's @mention as read; `message_reaction` adds that member's `done` reaction under the assignment message. `activity` reports tool calls without their arguments. `usage` reports cumulative model tokens and each member's latest prompt context occupancy. `delta` contains the Leader's answer; `done` marks completion; `error` contains a safe message if generation fails after streaming starts. Each request includes the full conversation history, an absolute existing `workspace_path`, and the same `conversation_id` for that chat. The frontend saves the workspace with each conversation locally. `POST /api/workspaces/validate` checks a directory before the conversation starts. File tools resolve paths inside that selected workspace. Separate user requests run one at a time, while independent members within a batch run concurrently.
 
-Each delegation uses `context_mode`: `fresh` starts a clean worker thread, `continue` resumes that worker's thread in the same chat, and `auto` resumes while the latest reported input is below 60% of the configured context window. If usage is unavailable, `auto` starts fresh. If there is no saved thread, `continue` starts fresh. Every delegation also carries a private `handoff` with the goal, constraints, and relevant artifact paths. A fresh worker receives its role prompt, the current task, and this handoff; it does not receive the old chat transcript. The Leader may call `checkpoint_context` at a stage boundary to save a structured goal, constraints, artifacts, completed work, and pending work. Subsequent Leader calls in that chat use the checkpoint and later messages instead of older history.
+Each delegation uses `context_mode`: `fresh` starts a clean worker thread, `continue` resumes that worker's thread in the same chat, and `auto` resumes an existing thread and applies layered context compression before each model call. If there is no saved thread, `auto` starts fresh. If there is no saved thread, `continue` starts fresh. Every delegation also carries a private `handoff` with the goal, constraints, and relevant artifact paths. A fresh worker receives its role prompt, the current task, and this handoff; it does not receive the old chat transcript. Every role may call `checkpoint_context` alone at a stage boundary to save a structured goal, constraints, artifacts, completed work, and pending work. Subsequent Leader calls in that chat use the checkpoint and later messages instead of older history.
 
 `POST /api/chat/stream` remains available for compatibility, but it accepts a
 client-provided transcript and does not provide project-scoped persistence. New
 clients should use the conversation message endpoint above.
 
-Set `QWEN_CONTEXT_WINDOW` to the actual context limit of the configured model. The default `131072` is an application assumption for the draft UI, not a verified property of every Qwen model. Context percentage uses the latest reported input-token count divided by that configured limit. Cumulative token counts use provider-reported usage; no number is invented when usage is missing.
+Set `QWEN_CONTEXT_WINDOW` to the actual context limit of the configured model. The default `131072` is an application assumption for the draft UI, not a verified property of every Qwen model. Context percentage uses the latest reported input-token count divided by that configured limit. Cumulative role token counts (including memory summaries) use persisted provider-reported usage and survive restarts; no number is invented when usage is missing.
 
 `GET /api/health` returns `{"status":"ok"}`.
 
@@ -86,7 +86,7 @@ Set `QWEN_CONTEXT_WINDOW` to the actual context limit of the configured model. T
 - `app/agents/worker.py` runs each specialist through a LangGraph tool loop with per-chat memory checkpoints.
 - `app/agents/team.py` registers the six agents, executes delegation calls, and returns each worker's result to the Leader.
 - `app/agents/prompts/` contains each role's system prompt; `app/agents/skills/` contains optional role skill instructions.
-- `app/tools/` contains one Python module per tool. File tools are restricted to each role's assigned project paths.
+- `app/agents/tools/` contains one Python module per tool. File tools are restricted to each role's assigned project paths.
 
 The Leader can select any subset of members and call a member more than once over successive turns. Independent assignments in `delegate_tasks` run concurrently; dependent work waits for their results. For example, designer and frontend can exchange refinements over several calls. Greetings need no delegation. All members are initialized as `idle` on API startup and become `running` only during their assignment.
 
@@ -294,7 +294,10 @@ After replying/accepting, Leader returns to waiting if tasks remain, or idle.
 Read receipts are emitted after a successful model response, including tool-call
 responses. Inbox consumption remains deferred until the final reply is persisted:
 a crash can replay unfinished coordination without misrepresenting “read” as
-“resolved.” Restart restores eligible conversations and pending events. Failures
+“resolved.” Restart restores history and pending events but pauses unfinished
+work. Reopening the app also pauses work in a still-running backend. Only the
+current conversation's “继续任务” button resumes its saved tasks; other conversations
+remain paused. Sending a new message does not release old paused tasks. Failures
 retry with backoff up to three times, then wait for user intervention; a new user
 turn resets this failure state. Project pause and debug reset stop automatic work.
 
@@ -311,3 +314,109 @@ or agent checkpoints. Replies explicitly report a runtime snapshot (task states
 and latest tool activity), not an invented completion percentage or an extra
 model conversation. A reviewable delivery or explicit blocker found by a check
 creates a separate durable attention event so Leader can make a real decision.
+
+### Tool-call reliability and context boundaries
+
+Failed tool calls retain the legacy `error` text and now include `error_details`
+with `category`, `code`, `retry_policy` and `next_action`. Parameter validation
+adds bounded `fields` entries with the exact field path, actual JSON type,
+expected schema and an illustrative example. Submitted file bodies and secret
+values are not copied into validation diagnostics. Arrays and objects remain
+strictly typed; JSON-encoded strings are rejected rather than silently coerced.
+
+Leader tool calls are not stored in LangGraph checkpoints, so each call's arguments and result (8,000 characters each) are logged once per conversation and call ID in the `tool_calls` table, capped at the newest 5,000 rows and cleared by record reset. `refresh_api_contract` and `refresh_frontend_client` are shown to models only when the task workspace has `backend/scripts/export_openapi.py` or a frontend `api:generate` script; other projects use their own commands.
+
+Worker ToolMessages mark structured failures as `status=error`, including tools
+that return failure dictionaries instead of raising. Leader validation and
+collaboration tools use the same feedback contract. Explicit command diagnostics
+distinguish refused connections, occupied ports, OS permission denial, timeouts
+and other nonzero exits while retaining the original logs/exit status. Browser
+feedback identifies the failing stage/action and separates service navigation
+failures, page verification failures and tool/runtime defects. Vite HMR WebSockets
+use Playwright's synchronous `connect_to_server` method; other origins remain
+blocked. These recovery hints do not grant permissions or trigger automatic retries.
+
+Models now receive one `collaboration_*` tool per action, with the action's actual
+Pydantic schema. For example, `collaboration_publish` takes `changes` directly and
+`collaboration_read` takes `document_id`, `version` and optional `section_id`.
+There is no `action`/`payload` wrapper on these model-facing tools. The original
+`collaborate` entry point remains available to API clients and saved calls. Worker
+models do not receive Leader-only recovery, or `wait` outside a durable request.
+All calls still pass through the same runtime identity, lease and path checks.
+
+For document edits, `replace_section_body` preserves the following heading's line
+boundary even if the replacement omits its final newline. Both body replacement
+and exact-text replacement reject changes that unexpectedly remove or reparent
+existing headings, including unclosed Markdown fences swallowing later sections.
+Failures identify the zero-based edit index, operation and section; no revision or
+file is committed when a batch fails. Edits still execute sequentially: publish a
+structural change and reload its outline before edits that depend on the new
+structure. Replacement text must be explicit; omitting it cannot silently delete
+content. Updates to existing documents require an explicit positive base version.
+
+Tool errors name invalid fields without echoing the full submitted document.
+Missing/non-text files and forbidden managed-document file writes raise tool
+errors. Project checks and code generators return `passed`, `exit_code` and
+`output`; unavailable operations return an error. The activity timeline therefore
+records these failures rather than treating a normal function return as success.
+
+Read deduplication belongs to the model history containing the body. Leader
+checkpointing now rotates its read context when discarding tool messages. Worker
+read contexts already rotate with fresh sessions. Handoffs include document paths
+and remain valid JSON within the context budget: whole records are omitted with
+explicit `remaining` counts, rather than cutting an ID or JSON object in half.
+Worker graph caching also accounts for changes in available collaboration tools.
+
+#### Root-cause audit, 2026-10-01
+
+The audit used read-only local activity records and retained LangGraph tool
+calls/results, plus offline replay of the actual document edits. Checkpoint
+samples span multiple code versions and do not cover every Leader call; they are
+not an estimate of the current release's steady-state failure rate.
+
+- In the activity sample after 21:00 Hong Kong time, publication failed 9/16 times
+  and section reads failed 3/95 times. Five publication failures were malformed
+  parameters; two lost a target section during preceding edits; two tried matching
+  text in a section whose boundary had changed earlier in the same batch.
+- The model-facing legacy schema exposed `payload` as an arbitrary object, while
+  runtime validation enforced nested fields and enums. Recorded guesses included
+  missing `changes`, unsupported `replace`/`insert_after`, misplaced document IDs
+  or base versions, and missing message idempotency keys. Typed action schemas and
+  explicit examples address the shared cause, rather than adding blind retries.
+- Offline replay reproduced replacement text joining the next heading. A later
+  saved revision joined a closing code fence to a heading; its outline fell from
+  52 entries to 34. The three failed read targets remained in raw Markdown but
+  were no longer indexed as headings. `force=true` only bypasses read caching and
+  cannot repair this structure.
+- Retained file-tool calls included six managed-Markdown rejections previously
+  returned as ordinary strings. Two malformed file edits sent the edit array as
+  a JSON string; the old exception formatter echoed so much input that truncation
+  obscured the actual type error. Failure status and bounded diagnostics now
+  handle these cases explicitly.
+- Two worker calls attempted Leader-only publication recovery. Recovery does not
+  fix schema or matching failures; it is now omitted from worker model tools and
+  its limited purpose is documented.
+- Code inspection additionally found checkpoint/read-cache lifetime mismatch and
+  raw handoff JSON truncation. These are regression-tested correctness fixes;
+  the recorded three section-read failures were caused by document structure,
+  not attributed to these context defects.
+- Three retained graph-level failures were provider `Arrearage` responses. These
+  are model-account availability errors, separate from tool execution; no local
+  document-tool change can resolve provider account billing.
+
+Tests cover model-visible schemas, runtime typed dispatch, legacy compatibility,
+atomic publication, Markdown boundaries, diagnostic truncation, command failure
+status, context reset and complete handoff records. No paid provider calls are
+required for these regressions. Existing damaged document revisions are retained;
+code changes do not rewrite previously published project documents.
+
+## Persistent usage and layered context memory
+
+All six roles now share automatic folding, historical summarization and clean-context handoffs; each can also call `checkpoint_context` explicitly. Usage totals survive process restarts, and compression ranges are retained for inspection. See [context-memory.md](../docs/backend/context-memory.md) for budgets, persistence, failure behavior and accounting scope.
+
+开发执行工具、系统沙箱与单次/持久授权说明见 [开发工具与执行权限](../docs/execution-tools.md)。
+
+### Goal 与长期任务
+
+持久化 Goal、Task 工具、验收条件和 reminder 驱动的恢复已接入协作运行时。
+详见 [Goal 与长期任务](../docs/goals.md)。界面入口为群聊的“任务与协作”。

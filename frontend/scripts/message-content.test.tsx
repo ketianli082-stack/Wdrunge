@@ -77,3 +77,11 @@ test('public mention replies render a short summary and never their detailed pay
   assert.ok(html.includes('@林青禾（前端开发）'));
   assert.ok(!html.includes('完整内部交接参数'));
 });
+
+import { formatTokens } from '../src/formatTokens';
+test('token totals use compact units and promote rounded unit boundaries', () => {
+  for (const [input, expected] of [[0, '0'], [999, '999'], [1000, '1.0k'], [12500, '12.5k'],
+    [999949, '999.9k'], [999950, '1.0m'], [1000000, '1.0m'], [1500000000, '1.5b']] as const) {
+    assert.equal(formatTokens(input), expected);
+  }
+});

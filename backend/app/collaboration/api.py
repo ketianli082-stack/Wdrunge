@@ -1,6 +1,7 @@
 """Project collaboration API and explicit user controls."""
 from typing import Literal
 from fastapi import APIRouter, HTTPException
+from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel, Field
 from app.collaboration.tools import Context, active, collaborate
 from app.storage import StorageNotFoundError, StorageConflictError
@@ -17,7 +18,7 @@ def configure(service):
 class Command(BaseModel):
     member: Literal['leader', 'product', 'backend', 'frontend', 'designer', 'testing'] = 'leader'
     conversation: str = ''
-    action: Literal['catalog', 'read', 'publish', 'subscribe', 'send', 'request', 'inspect_request', 'transition', 'snapshot', 'search', 'diff', 'schedule', 'dependencies', 'decision', 'maintenance', 'handoff', 'recover', 'inspect_message', 'history']
+    action: Literal['catalog', 'read', 'publish', 'subscribe', 'send', 'request', 'inspect_request', 'transition', 'snapshot', 'search', 'diff', 'schedule', 'dependencies', 'decision', 'maintenance', 'handoff', 'recover', 'inspect_message', 'history', 'create_goal', 'get_goal', 'update_goal', 'complete_goal', 'create_task', 'submit_task', 'complete_task', 'environment', 'register_service', 'register_command', 'journal', 'check_delivery']
     payload: dict = Field(default_factory=dict)
 
 
@@ -63,3 +64,15 @@ async def pause(project_id: str, body: Pause):
         return await _service.set_paused(project_id, body.paused)
     except StorageNotFoundError as exc:
         raise HTTPException(404, str(exc)) from exc
+
+
+@router.get('/requests/{request_id}/journal', response_class=PlainTextResponse)
+async def export_journal(project_id: str, request_id: str):
+    """Export a task's work journal as Markdown, for download on request."""
+    if _service is None:
+        raise HTTPException(503, 'Collaboration is not initialized')
+    try:
+        text = await _service.journal_markdown(project_id, request_id)
+    except StorageNotFoundError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    return PlainTextResponse(text, headers={'Content-Disposition': f'attachment; filename="journal-{request_id[:40]}.md"'})

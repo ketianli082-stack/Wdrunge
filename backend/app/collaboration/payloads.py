@@ -14,6 +14,7 @@ class TransitionPayload(BaseModel):
     identifier: str = Field(min_length=1)
     state: Literal['queued', 'blocked', 'review', 'completed', 'failed', 'cancelled', 'rejected']
     result: str = Field(default='', description='Plain text delivery details, not a JSON object or list')
+    evidence: dict[str, str] | None = None
     artifacts: list[str] | None = None
     based_on: list[RevisionReference] | None = None
     summary: str | None = Field(default=None, max_length=160)
@@ -36,13 +37,15 @@ class StrictPayload(BaseModel):
 
 class DocumentEdit(StrictPayload):
     operation: Literal['replace_text', 'replace_section_body', 'insert_section', 'delete_section']
-    section_id: Text
+    section_id: Text = Field(description='Exact outline ID')
     old_text: str = ''
     new_text: str = ''
     include_children: bool = False
 
     @model_validator(mode='after')
     def valid_edit(self):
+        if self.operation in {'replace_text', 'replace_section_body', 'insert_section'} and 'new_text' not in self.model_fields_set:
+            raise ValueError(f'{self.operation} requires explicit new_text; use an empty string only for intentional removal')
         if self.operation == 'replace_text' and not self.old_text:
             raise ValueError('replace_text requires nonempty old_text')
         if self.operation == 'insert_section' and not self.new_text:
@@ -64,6 +67,8 @@ class DocumentChange(StrictPayload):
 
     @model_validator(mode='after')
     def valid_change(self):
+        if self.document_id and ('base_version' not in self.model_fields_set or self.base_version < 1):
+            raise ValueError('Existing documents require the base_version read from their outline')
         if not self.document_id and not self.path:
             raise ValueError('A new document requires path')
         if self.document_id and self.content is not None:
@@ -72,16 +77,26 @@ class DocumentChange(StrictPayload):
             raise ValueError('Import external content separately from edits')
         if not self.document_id and self.edits:
             raise ValueError('A new document requires content, not edits')
+        if not self.document_id and self.base_version != 0:
+            raise ValueError('New documents require base_version=0; to update a managed path use its document_id')
         return self
 
 
-def schema(name, **fields):
-    return create_model(name, __base__=StrictPayload, **fields)
+def schema(model_name, /, **fields):
+    return create_model(model_name, __base__=StrictPayload, **fields)
 
 
 Empty = schema('Empty')
+Need = schema('Need', document=(Annotated[str, Field(min_length=1, max_length=300)] | None, None),
+              service=(Annotated[str, Field(min_length=1, max_length=40)] | None, None),
+              min_version=(Annotated[int, Field(ge=1)] | None, None))
+Paths = Annotated[list[Annotated[str, Field(min_length=1, max_length=300)]], Field(max_length=30)]
+Services = Annotated[list[Annotated[str, Field(min_length=1, max_length=40)]], Field(max_length=10)]
+Needs = Annotated[list[Need], Field(max_length=10, description='Start when these exist')]
+SerialReason = Annotated[str, Field(min_length=1, max_length=500)]
 Read = schema('Read', document_id=(Text, ...), version=(Version | None, None), section_id=(Text | None, None),
-              offset=(Offset, 0), limit=(Annotated[int, Field(ge=1, le=12000)], 6000), force=(bool, False))
+              offset=(Offset, 0), limit=(Annotated[int, Field(ge=1, le=12000)], 6000), force=(bool, False),
+              whole=(bool, False))
 Identifier = schema('Identifier', identifier=(Text, ...))
 ACTION_PAYLOADS = {
     **{name: Empty for name in ('catalog', 'snapshot', 'dependencies', 'recover')},
@@ -91,7 +106,8 @@ ACTION_PAYLOADS = {
     'send': schema('Send', recipient=(Role, ...), content=(Text, ...), key=(Text, ...), summary=(str | None, None), reply_to=(Text | None, None), request_id=(Text | None, None)),
     'request': schema('Request', recipient=(Role, ...), goal=(Text, ...), key=(Text, ...), summary=(str | None, None),
                       based_on=(list[RevisionReference], []), dependencies=(list[Text], []), artifacts=(list[Text], []),
-                      priority=(Annotated[int, Field(ge=0, le=3)], 1), deadline=(float | None, None)),
+                      priority=(Annotated[int, Field(ge=0, le=3)], 1), deadline=(float | None, None),
+                      documents=(Paths, []), services=(Services, []), needs=(Needs, []), serial_reason=(SerialReason | None, None)),
     'inspect_request': Identifier,
     'inspect_message': schema('InspectMessage', identifier=(Text, ...), offset=(Offset, 0), limit=(Annotated[int, Field(ge=1, le=8000)], 4000)),
     'wait': schema('Wait', dependencies=(list[Text], ...)),
@@ -104,8 +120,48 @@ ACTION_PAYLOADS = {
     'maintenance': schema('Maintenance', stale_days=(Annotated[int, Field(ge=1)], 90)),
     'handoff': schema('Handoff', save=(bool, False), summary=(str, '')),
     'history': schema('History', document_id=(Text, ...), offset=(Offset, 0), limit=(Annotated[int, Field(ge=1, le=50)], 20)),
+    'environment': Empty,
+    'check_delivery': schema('CheckDelivery', artifacts=(Paths | None, None)),
+    'journal': schema('Journal',
+        kind=(Literal['done', 'next', 'blocked', 'decision', 'evidence'], ...),
+        text=(Annotated[str, Field(min_length=1, max_length=1500)], ...)),
+    'register_service': schema('RegisterService',
+        name=(Annotated[str, Field(min_length=1, max_length=40)], ...),
+        kind=(Literal['http', 'tcp', 'other'], 'http'),
+        port=(Annotated[int, Field(ge=1, le=65535)] | None, None),
+        host=(Annotated[str, Field(max_length=100)], '127.0.0.1'), base_url=(Annotated[str, Field(max_length=300)] | None, None),
+        health_path=(Annotated[str, Field(max_length=200)] | None, None),
+        command=(Annotated[list[Annotated[str, Field(max_length=2000)]], Field(max_length=40)] | None, None),
+        cwd=(Annotated[str, Field(max_length=300)], '.'), note=(Annotated[str, Field(max_length=300)] | None, None),
+        remove=(bool, False)),
+    'register_command': schema('RegisterCommand',
+        name=(Annotated[str, Field(min_length=1, max_length=40)], ...),
+        argv=(Annotated[list[Annotated[str, Field(max_length=2000)]], Field(min_length=1, max_length=40)], ...),
+        cwd=(Annotated[str, Field(max_length=300)], '.'), purpose=(Annotated[str, Field(max_length=200)] | None, None)),
 }
+
+
+Criteria = Annotated[list[Annotated[str, Field(min_length=1, max_length=300)]], Field(min_length=1, max_length=8)]
+Evidence = dict[Annotated[str, Field(min_length=1, max_length=300)], Annotated[str, Field(min_length=1, max_length=4000)]]
+GOAL_ACTIONS = {'create_goal', 'get_goal', 'update_goal', 'complete_goal', 'create_task', 'submit_task', 'complete_task'}
+ACTION_PAYLOADS.update({
+    'create_goal': schema('CreateGoal', objective=(Annotated[str, Field(min_length=1, max_length=4000)], ...), criteria=(Criteria, ...), key=(Annotated[str, Field(min_length=1, max_length=120)], ...), reminder_seconds=(Annotated[int, Field(ge=60, le=86400)], 180),
+                          scale=(Literal['small', 'medium', 'large'] | None, Field(None, description='small 3/3, medium 6/5, large 8/8 criteria per goal/task'))),
+    'get_goal': schema('GetGoal', identifier=(Text, ...), offset=(Offset, 0), limit=(Annotated[int, Field(ge=1, le=20)], 10)),
+    'update_goal': schema('UpdateGoal', identifier=(Text, ...), state=(Literal['active','paused','blocked','cancelled'], ...), reason=(Annotated[str, Field(min_length=1, max_length=2000)], ...),
+                          scale=(Literal['small', 'medium', 'large'] | None, None)),
+    'complete_goal': schema('CompleteGoal', identifier=(Text, ...), evidence=(Evidence, ...)),
+    'create_task': schema('CreateTask', goal_id=(Text, ...), recipient=(Role, ...), goal=(Annotated[str, Field(min_length=1, max_length=8000)], ...), criteria=(Criteria, ...), key=(Annotated[str, Field(min_length=1, max_length=160)], ...), dependencies=(list[Text], []), artifacts=(list[Text], []), based_on=(list[RevisionReference], []), summary=(Annotated[str, Field(max_length=160)] | None, None),
+                          documents=(Paths, []), services=(Services, []), needs=(Needs, []), serial_reason=(SerialReason | None, None),
+                          verification=(Literal['self', 'end_to_end'], Field('self'))),
+    'submit_task': schema('SubmitTask', identifier=(Text, ...), result=(Text, ...), artifacts=(list[Text] | None, None), based_on=(list[RevisionReference] | None, None)),
+    'complete_task': schema('CompleteTask', identifier=(Text, ...), result=(Text, ...), evidence=(Evidence, ...)),
+})
 
 
 def validate_payload(action, payload):
     return ACTION_PAYLOADS[action].model_validate(payload).model_dump(exclude_unset=True, exclude_none=True)
+
+
+WorkerRequest = schema('WorkerRequest', recipient=(Role, ...), goal=(Text, ...), key=(Text, ...), summary=(str | None, None),
+                       artifacts=(list[Text], []), dependencies=(list[Text], []))

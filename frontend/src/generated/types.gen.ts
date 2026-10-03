@@ -28,6 +28,32 @@ export type AgentUsageResponse = {
      * Context Percent
      */
     context_percent: number;
+    /**
+     * Cache Input Tokens
+     */
+    cache_input_tokens?: number;
+    /**
+     * Cached Tokens
+     */
+    cached_tokens?: number;
+};
+
+/**
+ * ApprovalSettings
+ */
+export type ApprovalSettings = {
+    /**
+     * Allow All
+     */
+    allow_all?: boolean;
+    /**
+     * Ai Review
+     */
+    ai_review?: boolean;
+    /**
+     * Whitelist
+     */
+    whitelist?: Array<'versions' | 'git_status'>;
 };
 
 /**
@@ -77,7 +103,7 @@ export type Command = {
     /**
      * Action
      */
-    action: 'catalog' | 'read' | 'publish' | 'subscribe' | 'send' | 'request' | 'inspect_request' | 'transition' | 'snapshot' | 'search' | 'diff' | 'schedule' | 'dependencies' | 'decision' | 'maintenance' | 'handoff' | 'recover' | 'inspect_message' | 'history';
+    action: 'catalog' | 'read' | 'publish' | 'subscribe' | 'send' | 'request' | 'inspect_request' | 'transition' | 'snapshot' | 'search' | 'diff' | 'schedule' | 'dependencies' | 'decision' | 'maintenance' | 'handoff' | 'recover' | 'inspect_message' | 'history' | 'create_goal' | 'get_goal' | 'update_goal' | 'complete_goal' | 'create_task' | 'submit_task' | 'complete_task' | 'environment' | 'register_service' | 'register_command' | 'journal' | 'check_delivery';
     /**
      * Payload
      */
@@ -215,6 +241,81 @@ export type ConversationSummaryResponse = {
 };
 
 /**
+ * ConversationUsageResponse
+ */
+export type ConversationUsageResponse = {
+    /**
+     * Conversation Id
+     */
+    conversation_id: string;
+    totals: UsageGroup;
+    /**
+     * By Agent
+     */
+    by_agent: Array<UsageGroup>;
+    /**
+     * By Purpose
+     */
+    by_purpose: Array<UsageGroup>;
+    /**
+     * By Task
+     */
+    by_task: Array<UsageGroup>;
+    /**
+     * By Model
+     */
+    by_model: Array<UsageGroup>;
+    /**
+     * Approvals
+     */
+    approvals: {
+        [key: string]: number;
+    };
+    /**
+     * Tool Calls
+     */
+    tool_calls: {
+        [key: string]: number;
+    };
+};
+
+/**
+ * Decision
+ */
+export type Decision = {
+    /**
+     * Decision
+     */
+    decision: 'once' | 'always' | 'deny';
+};
+
+/**
+ * ExecutionStatusResponse
+ */
+export type ExecutionStatusResponse = {
+    /**
+     * Running
+     */
+    running: boolean;
+    /**
+     * Stopping
+     */
+    stopping: boolean;
+    /**
+     * Paused
+     */
+    paused: boolean;
+    /**
+     * Pending Tasks
+     */
+    pending_tasks: number;
+    /**
+     * Active Goals
+     */
+    active_goals: number;
+};
+
+/**
  * FileEntry
  */
 export type FileEntry = {
@@ -326,6 +427,16 @@ export type Pause = {
      * Paused
      */
     paused: boolean;
+};
+
+/**
+ * PauseExecutionResponse
+ */
+export type PauseExecutionResponse = {
+    /**
+     * Paused Conversations
+     */
+    paused_conversations: number;
 };
 
 /**
@@ -528,9 +639,69 @@ export type TeamUsageResponse = {
      */
     total_tokens: number;
     /**
+     * Cache Input Tokens
+     */
+    cache_input_tokens?: number;
+    /**
+     * Cached Tokens
+     */
+    cached_tokens?: number;
+    /**
+     * Cache Percent
+     *
+     * Cached share of input tokens, over calls that reported cache data
+     */
+    cache_percent?: number | null;
+    /**
      * Agents
      */
     agents: Array<AgentUsageResponse>;
+};
+
+/**
+ * UsageGroup
+ */
+export type UsageGroup = {
+    /**
+     * Key
+     */
+    key?: string | null;
+    /**
+     * Calls
+     */
+    calls: number;
+    /**
+     * Total Tokens
+     */
+    total_tokens: number;
+    /**
+     * Input Tokens
+     */
+    input_tokens: number;
+    /**
+     * Output Tokens
+     */
+    output_tokens: number;
+    /**
+     * Cached Tokens
+     */
+    cached_tokens: number;
+    /**
+     * Cache Input Tokens
+     */
+    cache_input_tokens: number;
+    /**
+     * Cache Percent
+     */
+    cache_percent?: number | null;
+    /**
+     * Latency Ms
+     */
+    latency_ms?: number | null;
+    /**
+     * Retries
+     */
+    retries: number;
 };
 
 /**
@@ -665,6 +836,40 @@ export type PauseApiProjectsProjectIdCollaborationPausePostResponses = {
     200: unknown;
 };
 
+export type ExportJournalApiProjectsProjectIdCollaborationRequestsRequestIdJournalGetData = {
+    body?: never;
+    path: {
+        /**
+         * Project Id
+         */
+        project_id: string;
+        /**
+         * Request Id
+         */
+        request_id: string;
+    };
+    query?: never;
+    url: '/api/projects/{project_id}/collaboration/requests/{request_id}/journal';
+};
+
+export type ExportJournalApiProjectsProjectIdCollaborationRequestsRequestIdJournalGetErrors = {
+    /**
+     * Validation Error
+     */
+    422: HttpValidationError;
+};
+
+export type ExportJournalApiProjectsProjectIdCollaborationRequestsRequestIdJournalGetError = ExportJournalApiProjectsProjectIdCollaborationRequestsRequestIdJournalGetErrors[keyof ExportJournalApiProjectsProjectIdCollaborationRequestsRequestIdJournalGetErrors];
+
+export type ExportJournalApiProjectsProjectIdCollaborationRequestsRequestIdJournalGetResponses = {
+    /**
+     * Successful Response
+     */
+    200: string;
+};
+
+export type ExportJournalApiProjectsProjectIdCollaborationRequestsRequestIdJournalGetResponse = ExportJournalApiProjectsProjectIdCollaborationRequestsRequestIdJournalGetResponses[keyof ExportJournalApiProjectsProjectIdCollaborationRequestsRequestIdJournalGetResponses];
+
 export type TreeApiProjectsProjectIdDeliveryTreeGetData = {
     body?: never;
     path: {
@@ -794,6 +999,239 @@ export type EventsApiProjectsProjectIdDeliveryEventsGetResponses = {
      */
     200: unknown;
 };
+
+export type CapabilitiesApiExecutionCapabilitiesGetData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/api/execution/capabilities';
+};
+
+export type CapabilitiesApiExecutionCapabilitiesGetResponses = {
+    /**
+     * Successful Response
+     */
+    200: unknown;
+};
+
+export type PermissionStateApiExecutionPermissionsGetData = {
+    body?: never;
+    headers?: {
+        /**
+         * Authorization
+         */
+        authorization?: string;
+    };
+    path?: never;
+    query?: never;
+    url: '/api/execution/permissions';
+};
+
+export type PermissionStateApiExecutionPermissionsGetErrors = {
+    /**
+     * Validation Error
+     */
+    422: HttpValidationError;
+};
+
+export type PermissionStateApiExecutionPermissionsGetError = PermissionStateApiExecutionPermissionsGetErrors[keyof PermissionStateApiExecutionPermissionsGetErrors];
+
+export type PermissionStateApiExecutionPermissionsGetResponses = {
+    /**
+     * Successful Response
+     */
+    200: unknown;
+};
+
+export type ConfigureApprovalsApiExecutionSettingsPostData = {
+    body: ApprovalSettings;
+    headers?: {
+        /**
+         * Authorization
+         */
+        authorization?: string;
+    };
+    path?: never;
+    query?: never;
+    url: '/api/execution/settings';
+};
+
+export type ConfigureApprovalsApiExecutionSettingsPostErrors = {
+    /**
+     * Validation Error
+     */
+    422: HttpValidationError;
+};
+
+export type ConfigureApprovalsApiExecutionSettingsPostError = ConfigureApprovalsApiExecutionSettingsPostErrors[keyof ConfigureApprovalsApiExecutionSettingsPostErrors];
+
+export type ConfigureApprovalsApiExecutionSettingsPostResponses = {
+    /**
+     * Successful Response
+     */
+    200: unknown;
+};
+
+export type DecideApiExecutionPermissionsIdentifierPostData = {
+    body: Decision;
+    headers?: {
+        /**
+         * Authorization
+         */
+        authorization?: string;
+    };
+    path: {
+        /**
+         * Identifier
+         */
+        identifier: string;
+    };
+    query?: never;
+    url: '/api/execution/permissions/{identifier}';
+};
+
+export type DecideApiExecutionPermissionsIdentifierPostErrors = {
+    /**
+     * Validation Error
+     */
+    422: HttpValidationError;
+};
+
+export type DecideApiExecutionPermissionsIdentifierPostError = DecideApiExecutionPermissionsIdentifierPostErrors[keyof DecideApiExecutionPermissionsIdentifierPostErrors];
+
+export type DecideApiExecutionPermissionsIdentifierPostResponses = {
+    /**
+     * Successful Response
+     */
+    200: unknown;
+};
+
+export type RevokeApiExecutionGrantsIdentifierRevokePostData = {
+    body?: never;
+    headers?: {
+        /**
+         * Authorization
+         */
+        authorization?: string;
+    };
+    path: {
+        /**
+         * Identifier
+         */
+        identifier: string;
+    };
+    query?: never;
+    url: '/api/execution/grants/{identifier}/revoke';
+};
+
+export type RevokeApiExecutionGrantsIdentifierRevokePostErrors = {
+    /**
+     * Validation Error
+     */
+    422: HttpValidationError;
+};
+
+export type RevokeApiExecutionGrantsIdentifierRevokePostError = RevokeApiExecutionGrantsIdentifierRevokePostErrors[keyof RevokeApiExecutionGrantsIdentifierRevokePostErrors];
+
+export type RevokeApiExecutionGrantsIdentifierRevokePostResponses = {
+    /**
+     * Successful Response
+     */
+    200: unknown;
+};
+
+export type ListProcessesApiExecutionProcessesGetData = {
+    body?: never;
+    headers?: {
+        /**
+         * Authorization
+         */
+        authorization?: string;
+    };
+    path?: never;
+    query?: never;
+    url: '/api/execution/processes';
+};
+
+export type ListProcessesApiExecutionProcessesGetErrors = {
+    /**
+     * Validation Error
+     */
+    422: HttpValidationError;
+};
+
+export type ListProcessesApiExecutionProcessesGetError = ListProcessesApiExecutionProcessesGetErrors[keyof ListProcessesApiExecutionProcessesGetErrors];
+
+export type ListProcessesApiExecutionProcessesGetResponses = {
+    /**
+     * Successful Response
+     */
+    200: unknown;
+};
+
+export type StopProcessApiExecutionProcessesIdentifierStopPostData = {
+    body?: never;
+    headers?: {
+        /**
+         * Authorization
+         */
+        authorization?: string;
+    };
+    path: {
+        /**
+         * Identifier
+         */
+        identifier: string;
+    };
+    query?: never;
+    url: '/api/execution/processes/{identifier}/stop';
+};
+
+export type StopProcessApiExecutionProcessesIdentifierStopPostErrors = {
+    /**
+     * Validation Error
+     */
+    422: HttpValidationError;
+};
+
+export type StopProcessApiExecutionProcessesIdentifierStopPostError = StopProcessApiExecutionProcessesIdentifierStopPostErrors[keyof StopProcessApiExecutionProcessesIdentifierStopPostErrors];
+
+export type StopProcessApiExecutionProcessesIdentifierStopPostResponses = {
+    /**
+     * Successful Response
+     */
+    200: unknown;
+};
+
+export type ConversationUsageApiConversationsConversationIdUsageGetData = {
+    body?: never;
+    path: {
+        /**
+         * Conversation Id
+         */
+        conversation_id: string;
+    };
+    query?: never;
+    url: '/api/conversations/{conversation_id}/usage';
+};
+
+export type ConversationUsageApiConversationsConversationIdUsageGetErrors = {
+    /**
+     * Validation Error
+     */
+    422: HttpValidationError;
+};
+
+export type ConversationUsageApiConversationsConversationIdUsageGetError = ConversationUsageApiConversationsConversationIdUsageGetErrors[keyof ConversationUsageApiConversationsConversationIdUsageGetErrors];
+
+export type ConversationUsageApiConversationsConversationIdUsageGetResponses = {
+    /**
+     * Successful Response
+     */
+    200: ConversationUsageResponse;
+};
+
+export type ConversationUsageApiConversationsConversationIdUsageGetResponse = ConversationUsageApiConversationsConversationIdUsageGetResponses[keyof ConversationUsageApiConversationsConversationIdUsageGetResponses];
 
 export type ResetRecordsApiDebugRecordsResetPostData = {
     body: ResetRecordsRequest;
@@ -963,6 +1401,112 @@ export type ConversationDetailApiConversationsConversationIdGetResponses = {
 };
 
 export type ConversationDetailApiConversationsConversationIdGetResponse = ConversationDetailApiConversationsConversationIdGetResponses[keyof ConversationDetailApiConversationsConversationIdGetResponses];
+
+export type PausePreviousExecutionApiExecutionPausePostData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/api/execution/pause';
+};
+
+export type PausePreviousExecutionApiExecutionPausePostResponses = {
+    /**
+     * Successful Response
+     */
+    200: PauseExecutionResponse;
+};
+
+export type PausePreviousExecutionApiExecutionPausePostResponse = PausePreviousExecutionApiExecutionPausePostResponses[keyof PausePreviousExecutionApiExecutionPausePostResponses];
+
+export type ConversationExecutionApiConversationsConversationIdExecutionGetData = {
+    body?: never;
+    path: {
+        /**
+         * Conversation Id
+         */
+        conversation_id: string;
+    };
+    query?: never;
+    url: '/api/conversations/{conversation_id}/execution';
+};
+
+export type ConversationExecutionApiConversationsConversationIdExecutionGetErrors = {
+    /**
+     * Validation Error
+     */
+    422: HttpValidationError;
+};
+
+export type ConversationExecutionApiConversationsConversationIdExecutionGetError = ConversationExecutionApiConversationsConversationIdExecutionGetErrors[keyof ConversationExecutionApiConversationsConversationIdExecutionGetErrors];
+
+export type ConversationExecutionApiConversationsConversationIdExecutionGetResponses = {
+    /**
+     * Successful Response
+     */
+    200: ExecutionStatusResponse;
+};
+
+export type ConversationExecutionApiConversationsConversationIdExecutionGetResponse = ConversationExecutionApiConversationsConversationIdExecutionGetResponses[keyof ConversationExecutionApiConversationsConversationIdExecutionGetResponses];
+
+export type StopConversationApiConversationsConversationIdExecutionStopPostData = {
+    body?: never;
+    path: {
+        /**
+         * Conversation Id
+         */
+        conversation_id: string;
+    };
+    query?: never;
+    url: '/api/conversations/{conversation_id}/execution/stop';
+};
+
+export type StopConversationApiConversationsConversationIdExecutionStopPostErrors = {
+    /**
+     * Validation Error
+     */
+    422: HttpValidationError;
+};
+
+export type StopConversationApiConversationsConversationIdExecutionStopPostError = StopConversationApiConversationsConversationIdExecutionStopPostErrors[keyof StopConversationApiConversationsConversationIdExecutionStopPostErrors];
+
+export type StopConversationApiConversationsConversationIdExecutionStopPostResponses = {
+    /**
+     * Successful Response
+     */
+    200: ExecutionStatusResponse;
+};
+
+export type StopConversationApiConversationsConversationIdExecutionStopPostResponse = StopConversationApiConversationsConversationIdExecutionStopPostResponses[keyof StopConversationApiConversationsConversationIdExecutionStopPostResponses];
+
+export type ResumeConversationApiConversationsConversationIdExecutionResumePostData = {
+    body?: never;
+    path: {
+        /**
+         * Conversation Id
+         */
+        conversation_id: string;
+    };
+    query?: never;
+    url: '/api/conversations/{conversation_id}/execution/resume';
+};
+
+export type ResumeConversationApiConversationsConversationIdExecutionResumePostErrors = {
+    /**
+     * Validation Error
+     */
+    422: HttpValidationError;
+};
+
+export type ResumeConversationApiConversationsConversationIdExecutionResumePostError = ResumeConversationApiConversationsConversationIdExecutionResumePostErrors[keyof ResumeConversationApiConversationsConversationIdExecutionResumePostErrors];
+
+export type ResumeConversationApiConversationsConversationIdExecutionResumePostResponses = {
+    /**
+     * Successful Response
+     */
+    200: ExecutionStatusResponse;
+};
+
+export type ResumeConversationApiConversationsConversationIdExecutionResumePostResponse = ResumeConversationApiConversationsConversationIdExecutionResumePostResponses[keyof ResumeConversationApiConversationsConversationIdExecutionResumePostResponses];
 
 export type ConversationEventsApiConversationsConversationIdEventsGetData = {
     body?: never;
