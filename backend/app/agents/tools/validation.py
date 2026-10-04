@@ -78,6 +78,18 @@ def failure_result(message: str, category: str, code: str, next_action: str,
     }}
 
 
+def folded_call_failure(args) -> dict | None:
+    """Refuse a call that copies a placeholder from folded history in place of a value
+    (it would otherwise be written into files or documents as text)."""
+    from app.agents.context_fold import folded_argument
+    if (where := folded_argument(args)) is None:
+        return None
+    return failure_result(f'{where} is a placeholder left by context folding, not the real value; nothing was done.',
+        'invalid_arguments', 'folded_placeholder',
+        'Send the actual value. To build on earlier text, read the file or recall_context the original first.',
+        'correct_arguments')
+
+
 class ToolFailure(ValueError):
     """An expected operation rejection with an explicit recovery category."""
     def __init__(self, message, category, code, next_action, retry_policy='inspect_before_retry'):

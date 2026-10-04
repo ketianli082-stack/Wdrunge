@@ -3,8 +3,8 @@ For a multi-step request call create_goal with measurable criteria, a stable key
 a scale (small/medium/large: at most 3/6/8 goal criteria and 3/5/8 per task), then
 create_task per specialist
 assignment with the returned goal_id. Declare deliverables by type: artifacts
-(files), documents (shared documents) and services (registry services delivered
-running; they stay running after the task for colleagues and the user). Use needs ([{document}] or [{service}]) when a task only needs
+(files), documents (shared documents) and services (registry services kept
+running after delivery). Use needs ([{document}] or [{service}]) when a task only needs
 another task's deliverable; it then starts as soon as that exists, so a frontend can
 build on a published contract while the backend implements. Exactly one task per goal
 may own end-to-end verification (verification=end_to_end); others verify their own

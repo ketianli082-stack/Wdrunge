@@ -38,7 +38,7 @@ from app.agents.tools._workspace import active_workspace, workspace_root
 from app.agents.tools.development import development_tools
 from app.agents.tools.file_management import make_file_management
 from app.agents.tools.browser_verify import browser_verify
-from app.agents.tools.validation import exception_result, validation_failure, failure_result, normalize_failure
+from app.agents.tools.validation import exception_result, validation_failure, failure_result, normalize_failure, folded_call_failure
 
 if TYPE_CHECKING:
     from langgraph.checkpoint.base import BaseCheckpointSaver
@@ -444,6 +444,9 @@ class Team:
             for call in response.tool_calls:
                 call_id = call.get("id") or f"delegation-{count + 1}"
                 tool_name = call.get("name")
+                if failure := folded_call_failure(call.get('args')):
+                    messages.append(ToolMessage(content=json.dumps(failure, ensure_ascii=False), tool_call_id=call_id, status='error'))
+                    continue
                 if (tool_name == 'collaborate' or tool_name in COLLABORATION_TOOLS) and active.get():
                     from app.agents.worker import COLLABORATION_LABELS
                     action = collaboration_action(tool_name, call.get('args', {}))

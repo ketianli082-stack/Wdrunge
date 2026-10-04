@@ -10,7 +10,9 @@ can accept it or send the task back:
   project service (documents must match the environment registry);
 - evidence_in_contract: raw test transcripts inside interface documents (evidence
   belongs in the task result, journal or a test report);
-- oversized: more delivered text than the goal scale suggests;
+- oversized: more implementation than the goal scale suggests. It sizes what was
+  built, so required documents and test code do not count; it asks for a reason,
+  never for deleting working code to fit a number;
 - generated_without_command: generated artifacts (OpenAPI, clients) without a
   registered command that regenerates them.
 """
@@ -30,6 +32,11 @@ LOOPBACK_URL = re.compile(r'(?:https?|wss?)://(?:localhost|127\.0\.0\.1|0\.0\.0\
 EVIDENCE_HEADING = re.compile(r'^#{1,6}\s*.*(验证证据|实测|证据|evidence|test results?|verification)', re.I)
 HTTP_TRANSCRIPT = re.compile(r'^\s*(HTTP/1\.[01] \d{3}|< HTTP/|> (GET|POST|OPTIONS|PUT|DELETE) )')
 GENERATED = re.compile(r'(^|/)(openapi|swagger)\.(json|ya?ml)$|\.gen\.(ts|js|py)$|(^|/)generated/', re.I)
+# Test code by common conventions: a path segment or name part such as tests/, spec/,
+# test_x.py, x_test.go, x.spec.ts or selftest.py.
+TEST_PATH = re.compile(r'(^|[/_.-])(tests?|__tests__|specs?|e2e|selftests?)([/_.-]|$)', re.I)
+# Up to this much over the guide the size is noted only; beyond it, worth a look.
+SIZE_TOLERANCE = 1.25
 CONTRACT_NAME = re.compile(r'(contract|契约|api|interface|openapi|schema)', re.I)
 
 
@@ -110,14 +117,16 @@ async def delivery_findings(service, project, request, root, artifacts=None) -> 
     doc_paths = [p for p in [*request.get('documents', []), *paths] if p in published]
     files = [(f, root) for f in delivered_files(root, [p for p in paths if p not in published])]
     files += [(f, project_root) for f in delivered_files(project_root, doc_paths)]
-    findings, lines = [], 0
+    required_documents = set(request.get('documents') or []) | set(doc_paths)
+    findings, sizes = [], {}
     for file, base in files:
         relative = str(file.relative_to(base.resolve()))
         try:
             text = file.read_text(errors='replace')
         except OSError:
             continue
-        lines += text.count('\n') + 1
+        if relative not in required_documents and not TEST_PATH.search(relative):
+            sizes[relative] = text.count('\n') + 1
         findings.extend(scan_file(relative, text, context))
         if GENERATED.search(relative) and not any(relative in ' '.join(c['argv']) or relative in (c.get('purpose') or '')
                                                   for c in environment['commands']):
@@ -126,10 +135,15 @@ async def delivery_findings(service, project, request, root, artifacts=None) -> 
                                         'collaboration_register_command (argv or purpose naming this file) or remove the hand-written copy.'})
     scale = (goal or {}).get('scale')
     limit = SIZE_LINES.get(scale) if scale else None
+    lines = sum(sizes.values())
     if limit and lines > limit:
-        findings.append({'kind': 'oversized', 'path': '', 'line': 0, 'excerpt': f'{lines} lines delivered', 'severity': 'medium',
-                         'message': f'{lines} lines of text delivered for a {scale} goal (guide: {limit}). Justify the size in the '
-                                    'result or remove what the criteria do not require.'})
+        largest = ', '.join(f'{path} {count}' for path, count in sorted(sizes.items(), key=lambda item: -item[1])[:3])
+        findings.append({'kind': 'oversized', 'path': '', 'line': 0, 'excerpt': f'{lines} lines ({largest})',
+                         'severity': 'low' if lines <= limit * SIZE_TOLERANCE else 'medium',
+                         'message': f'{lines} lines of implementation for a {scale} goal (guide: {limit}; required documents '
+                                    'and tests are not counted). If it includes features the criteria do not ask for, drop '
+                                    'them; otherwise give the reason in one sentence of the result. Do not rewrite or remove '
+                                    'working code just to meet the number.'})
     # Keep the list readable: the most important first, bounded per kind.
     order = {'high': 0, 'medium': 1, 'low': 2}
     findings.sort(key=lambda f: (order[f['severity']], f['kind'], f['path'], f['line']))

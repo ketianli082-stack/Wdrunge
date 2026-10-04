@@ -15,7 +15,11 @@ from pathlib import Path
 
 from app.storage import StorageConflictError
 
-EXCLUDED = {'.git', '.wdrunge-runs', 'node_modules', '.venv', '__pycache__', '.pytest_cache', 'dist', 'target', '.env', '.aws', '.codex', '.agents'}
+# A task's own throwaway helpers (mock servers, probe scripts) live here in its
+# snapshot: usable across its commands, never merged into the project.
+TASK_SCRATCH = '.task-scratch'
+EXCLUDED = {'.git', '.wdrunge-runs', 'node_modules', '.venv', '__pycache__', '.pytest_cache', 'dist', 'target', '.env', '.aws', '.codex', '.agents',
+            TASK_SCRATCH}
 MAX_BYTES = 128 * 1024 * 1024
 MAX_FILES = 10000
 

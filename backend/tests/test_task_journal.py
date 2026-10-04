@@ -228,6 +228,10 @@ def test_inspect_request_previews_long_text_unless_full_detail_is_asked(tmp_path
             assert full['goal'] == goal and 'truncated' not in full
             short = await s.create_request(p, 'leader', 'backend', 'Ping', 'ping')
             assert 'truncated' not in await execute_collaboration('inspect_request', {'identifier': short['id']})
+            # A whole delivery result (the runtime keeps at most 4000 characters) is shown by default.
+            r['result'] = 'Delivered. ' * 360
+            from app.collaboration.tools import inspect_view
+            assert inspect_view(r, await s.journal(p, r['id']), 'summary')['result'] == r['result']
         finally:
             active.reset(token)
         await store.close()

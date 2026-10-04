@@ -45,6 +45,30 @@ def test_whole_document_reads_return_text_and_outline_in_one_call(tmp_path):
     asyncio.run(run())
 
 
+def test_an_unfilled_draft_can_be_replaced_whole_but_a_written_document_cannot(tmp_path):
+    async def run():
+        store, s, p, conv, workspace = await setup(tmp_path)
+        task = await s.create_request(p, 'leader', 'testing', 'Write the README', 'readme', conversation=conv,
+                                      documents=['docs/README.md'])
+        [draft] = await s.create_document_drafts(p, task)
+        token = active.set(Context(s, p, 'testing', conv, 'ctx'))
+        try:
+            # The author's own structure replaces the placeholder outline in one publish.
+            body = '# Hello\n\n## Start\n\npython3 backend/server.py\n'
+            replaced = await execute_collaboration('publish', {'changes': [{'document_id': draft['document_id'],
+                'base_version': draft['version'], 'summary': 'README', 'content': body}]})
+            assert 'error' not in replaced
+            assert (workspace / 'docs' / 'README.md').read_text() == body and await s.draft_brief(p, task) == ''
+            # Once written, it changes by edits only.
+            again = await execute_collaboration('publish', {'changes': [{'document_id': draft['document_id'],
+                'base_version': draft['version'] + 1, 'summary': 'Rewrite', 'content': '# Other\n'}]})
+            assert 'change with edits, not content' in again['error']
+        finally:
+            active.reset(token)
+        await store.close()
+    asyncio.run(run())
+
+
 def test_drafts_are_sectioned_filled_progressively_and_gate_needs_and_delivery(tmp_path):
     async def run():
         store, s, p, conv, workspace = await setup(tmp_path)

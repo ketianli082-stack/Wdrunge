@@ -56,6 +56,9 @@ def test_kept_service_lifecycle_across_tasks(tmp_path, manager):
         service = Collaboration(store)
         await service.initialize()
         await service.register_service(project, 'leader', 'api', port=port)
+        async def declared(project):
+            return {'api'}  # the backend task delivers api
+        service.declared_services = declared
         source = source_workspace.set(project_root)
 
         def task(member, request):
@@ -85,10 +88,15 @@ def test_kept_service_lifecycle_across_tasks(tmp_path, manager):
                 await development.execute_command.ainvoke({'command': sys.executable, 'arguments': server,
                     'cwd': 'backend', 'background': True, 'name': 'api', 'ready_port': port})
 
-            # A later publish under the service's directory marks it stale for colleagues.
+            # A later publish under the service's directory: while the copy runs from the
+            # backend snapshot (moving to the root is pending) a restart would not help.
             manager.mark_stale(project_root, snapshots['testing'].resolve(), ['backend/app.py', 'README.md'])
-            brief = await service.environment_brief(project)
-            assert 'STALE' in brief['services'][0]['running'] and 'backend/app.py' in brief['services'][0]['running']
+            running = (await service.environment_brief(project))['services'][0]['running']
+            assert 'STALE' not in running and 'cannot see newer project changes in backend/app.py' in running
+            # Once the move has failed, it is stale and restarting it is the remedy.
+            manager.service_job(project_root, name='api').relaunch = 'failed'
+            running = (await service.environment_brief(project))['services'][0]['running']
+            assert 'STALE' in running and 'backend/app.py' in running
 
             # Restarting with keep_running replaces it.
             restarted = await development.execute_command.ainvoke({'command': sys.executable, 'arguments': server,
@@ -109,12 +117,40 @@ def test_kept_service_lifecycle_across_tasks(tmp_path, manager):
 
 
 def test_undelivered_task_stops_even_kept_services(tmp_path, manager):
+    snapshot = tmp_path / '.wdrunge-runs' / 'r1' / 'work'
+    snapshot.mkdir(parents=True)
     async def scenario():
-        tokens = active_workspace.set(tmp_path), source_workspace.set(tmp_path)
+        tokens = active_workspace.set(snapshot), source_workspace.set(tmp_path)
         try:
             job = await manager.start([sys.executable, '-c', 'import time; time.sleep(30)'], '.', 120, 'svc', keep=True)
-            await manager.close(workspace=tmp_path.resolve(), keep_services=False)
+            await manager.close(workspace=snapshot.resolve(), keep_services=False)
             assert job.process.returncode is not None
+        finally:
+            await manager.close()
+            source_workspace.reset(tokens[1])
+            active_workspace.reset(tokens[0])
+    asyncio.run(scenario())
+
+
+def test_delivery_keeps_only_services_some_task_declares(tmp_path, manager):
+    snapshot = tmp_path / '.wdrunge-runs' / 'r1' / 'work'
+    snapshot.mkdir(parents=True)
+    async def scenario():
+        tokens = active_workspace.set(snapshot), source_workspace.set(tmp_path)
+        try:
+            sleep = [sys.executable, '-c', 'import time; time.sleep(30)']
+            own = await manager.start(sleep, '.', 120, 'web')
+            own.service = 'web'
+            restored = await manager.start(sleep, '.', 120, 'api', keep=True)
+            restored.service = 'api'
+            preview = await manager.start(sleep, '.', 120, 'preview', keep=True)
+            preview.service = 'frontend-preview'
+            # The task delivers web; a colleague's task delivers api; nobody delivers the preview.
+            manager.settle_delivery({'web'}, {'web', 'api'})
+            await manager.close(workspace=snapshot.resolve(), keep_services=True)
+            assert own.keep and own.process.returncode is None
+            assert restored.process.returncode is None
+            assert preview.process.returncode is not None
         finally:
             await manager.close()
             source_workspace.reset(tokens[1])
@@ -214,3 +250,32 @@ def test_delivered_kept_service_moves_to_the_project_root(tmp_path, manager):
         finally:
             await manager.close()
     asyncio.run(scenario())
+
+
+def test_turn_cleanup_at_the_project_root_spares_kept_services(tmp_path, manager):
+    """Kept services serving the project root outlive any turn or task that runs there
+    (a Leader turn ends with close(workspace=root)); its other processes stop."""
+    async def scenario():
+        tokens = active_workspace.set(tmp_path), source_workspace.set(tmp_path)
+        try:
+            argv = [sys.executable, '-c', 'import time; time.sleep(30)']
+            kept = await manager.start(argv, '.', 120, 'api', keep=True)
+            temporary = await manager.start(argv, '.', 120, 'scratch')
+            await manager.close(workspace=tmp_path.resolve())
+            assert kept.process.returncode is None and temporary.process.returncode is not None
+            await manager.close()  # shutdown stops everything
+            assert kept.process.returncode is not None
+        finally:
+            await manager.close()
+            source_workspace.reset(tokens[1])
+            active_workspace.reset(tokens[0])
+    asyncio.run(scenario())
+
+
+def test_service_labels_advise_a_restart_only_where_it_helps():
+    from app.collaboration.environment import runtime_label
+    base = {'state': 'running', 'process_id': 'p1', 'started_by': 'backend', 'kept': True, 'stale': ['frontend/index.html']}
+    in_snapshot = runtime_label({**base, 'from_snapshot': True})
+    assert 'restart it' not in in_snapshot and 'until that task delivers' in in_snapshot
+    assert 'no action needed' in runtime_label({**base, 'relaunch': 'pending'})
+    assert 'STALE' in runtime_label(base) and 'STALE' in runtime_label({**base, 'from_snapshot': True, 'relaunch': 'failed'})

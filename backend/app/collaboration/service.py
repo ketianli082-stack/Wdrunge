@@ -36,7 +36,7 @@ from app.collaboration.runs import ConversationRuns
 from app.collaboration.environment import EnvironmentMixin
 from app.collaboration.journal import JournalMixin
 from app.collaboration.planning import (PlanningMixin, check_criteria_budget, check_deliverables, goal_scale,
-                                        need_satisfied, normalize_needs, serial_dependency)
+                                        need_satisfied, normalize_needs, project_relative, serial_dependency, still_draft)
 
 
 class Collaboration(GoalMixin, ConversationRuns, EnvironmentMixin, JournalMixin, PlanningMixin):
@@ -189,6 +189,13 @@ class Collaboration(GoalMixin, ConversationRuns, EnvironmentMixin, JournalMixin,
                     if actual is None:
                         raise StorageConflictError('External file is missing')
                     content = actual
+                elif current and change.get('content') is not None:
+                    # Nobody has written into a platform draft yet, so its author may replace
+                    # the placeholder outline wholesale; written documents change by edits.
+                    if merging or not await still_draft(self, c, project, current):
+                        raise ValueError(f'{path}: existing documents change with edits, not content; content replaces '
+                                         'a document only while it is still the unfilled platform draft')
+                    content = change['content']
                 elif current:
                     if merging:
                         base_revision = await self._get(c, 'revision', project, f'{identifier}:{base_version}')
@@ -455,7 +462,12 @@ class Collaboration(GoalMixin, ConversationRuns, EnvironmentMixin, JournalMixin,
         if sender not in ROLES or recipient not in ROLES - {'leader'} or not goal.strip() or len(goal) > 8000:
             raise ValueError('Invalid request')
         async with self.transaction() as c:
-            await self._project(c, project)
+            # Assignees work in a snapshot of the project: an absolute project path in
+            # the task would send them outside it, so task text names paths relative to it.
+            root = (await self._project(c, project))['workspace_path']
+            goal = project_relative(goal, root)
+            if isinstance(acceptance_criteria, list):
+                acceptance_criteria = [project_relative(item, root) for item in acceptance_criteria]
             await self._conversation(c, project, conversation)
             control = await self._get(c, 'conversation_run', project, conversation, False)
             if control and control['state'] != 'active':
@@ -463,7 +475,7 @@ class Collaboration(GoalMixin, ConversationRuns, EnvironmentMixin, JournalMixin,
             identifier = f'{sender}:{key}'
             spec = dict(sender=sender, recipient=recipient, goal=goal, conversation=conversation, based_on=based_on or [], dependencies=dependencies or [], artifacts=artifacts or [], parent=parent, priority=priority, deadline=deadline, summary=summary)
             # Typed deliverables and deliverable-level dependencies (only stored when used).
-            check_deliverables(spec['artifacts'], documents or [], services or [])
+            spec['artifacts'] = check_deliverables(spec['artifacts'], documents or [], services or [])
             extra = {'documents': list(documents or []), 'services': list(services or []), 'needs': normalize_needs(needs),
                      'serial_reason': (serial_reason or '').strip()[:500], 'verification': verification}
             if verification not in (None, 'self', 'end_to_end'):
@@ -668,6 +680,12 @@ class Collaboration(GoalMixin, ConversationRuns, EnvironmentMixin, JournalMixin,
     async def get_request(self, project, identifier):
         async with self.reading() as c:
             return await self._get(c, 'request', project, identifier)
+
+    async def declared_services(self, project):
+        """Services some live task of the project delivers (declared in its services)."""
+        async with self.reading() as c:
+            return {name for r in await self._list(c, 'request', project)
+                    if r['state'] not in {'cancelled', 'rejected', 'failed'} for name in r.get('services') or ()}
 
     async def snapshot(self, project):
         async with self.reading() as c:

@@ -196,11 +196,13 @@ class Scheduler:
             from app.execution.processes import processes
             delivered = outcome == 'delivered'
             if delivered:
-                # Services the task declared are deliverables: they keep serving colleagues
-                # and the user. Anything else it started stops unless it asked keep_running.
-                for job in processes.owned_jobs():
-                    if job.process.returncode is None and job.service and job.service in (request.get('services') or ()):
-                        processes.keep_service(job)
+                # Declared services keep serving colleagues and the user; the rest stops.
+                try:
+                    declared = await self.service.declared_services(project)
+                except Exception:
+                    logger.warning('Could not read the declared services', exc_info=True)
+                    declared = set(request.get('services') or ())
+                processes.settle_delivery(set(request.get('services') or ()), declared)
             await processes.close(workspace=active_workspace.get(), keep_services=delivered)
             if delivered:
                 # Its delivery is merged: kept services move from the task snapshot to the

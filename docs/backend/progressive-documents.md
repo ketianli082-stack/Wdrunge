@@ -10,11 +10,11 @@
 
 - 按路径判断文档类型：报告/验证/测试、契约/接口、设计、需求、其他，各有固定章节；按任务目标文本的语言生成中文或英文章节；
 - 记录为 `draft`（文档 ID → 任务、草稿版本）；
-- 负责人的 handoff 说明草稿位置和文档 ID，要求每完成一部分就用 `collaboration_publish` 的 `replace_section_body` 填写对应章节；
+- 负责人的 handoff 说明草稿位置和文档 ID，要求每完成一部分就用 `collaboration_publish` 的 `replace_section_body` 填写对应章节；草稿的章节结构不合适时，可在草稿未被填写前用 `changes=[{document_id, base_version, summary, content}]` 一次整体替换（已填写的文档仍只能用 edits 修改）；
 - 未被更新的草稿不满足其他任务的 `needs`，也不能交付（提交时提示“仍是平台草稿”）；负责人第一次更新后即视为已发布。
 
 这样证据和内容随工作逐步落盘，即使执行中断，已完成的部分也保留在文档中；配合工作记录与续跑，不再出现“最后统一写报告、一次失败全部丢失”。
 
 ## 回归覆盖
 
-`tests/test_documents_progressive.py` 覆盖整篇读取与分页、草稿的章节与语言、幂等、草稿不满足 needs 且不能交付、更新后放行，以及调度执行时创建草稿并告知负责人。
+`tests/test_documents_progressive.py` 覆盖整篇读取与分页、草稿的章节与语言、幂等、草稿不满足 needs 且不能交付、更新后放行、未填写的草稿可整体替换而已填写的不行，以及调度执行时创建草稿并告知负责人。

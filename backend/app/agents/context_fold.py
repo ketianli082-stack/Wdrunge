@@ -251,9 +251,26 @@ def fold_result(message: ToolMessage, name: str, args: dict) -> ToolMessage:
     return message.model_copy(update={'content': rendered + marker, 'artifact': None})
 
 
+# Folded call arguments stay in history in the place of the real ones, so a model can
+# copy one into a new call as if it were the value; tools refuse them (folded_argument).
+FOLDED_VALUE = re.compile(r'\A<\d+ characters written to .*; the file is on disk[^>]*>\Z|'
+                          r' …\[\d+ characters folded; not the value\]\Z', re.S)
+
+
+def folded_argument(value, path='') -> str | None:
+    """Where a tool call passes a folded placeholder instead of a real value."""
+    if isinstance(value, str):
+        return path or 'arguments' if FOLDED_VALUE.search(value) else None
+    items = value.items() if isinstance(value, dict) else enumerate(value) if isinstance(value, list) else ()
+    for key, item in items:
+        if found := folded_argument(item, f'{path}.{key}' if path else str(key)):
+            return found
+    return None
+
+
 def shrink(value, limit=400):
     if isinstance(value, str) and len(value) > limit:
-        return value[:limit // 2] + f' …[{len(value) - limit // 2} characters folded]'
+        return value[:limit // 2] + f' …[{len(value) - limit // 2} characters folded; not the value]'
     if isinstance(value, list):
         return [shrink(item, limit) for item in value]
     if isinstance(value, dict):
@@ -269,7 +286,7 @@ def fold_call(message: AIMessage) -> AIMessage:
         if call['name'] == 'write_project_file' and isinstance(args.get('content'), str) and len(args['content']) > 400:
             body = args['content']
             args = {**args, 'content': f'<{len(body)} characters written to {args.get("path")}; '
-                                       f'sha256 {hashlib.sha256(body.encode()).hexdigest()[:16]}…; the file is on disk>'}
+                                       f'sha256 {hashlib.sha256(body.encode()).hexdigest()[:16]}…; the file is on disk, not this text>'}
         calls.append({**call, 'args': shrink(args)})
     return message if calls == message.tool_calls else message.model_copy(update={'tool_calls': calls})
 

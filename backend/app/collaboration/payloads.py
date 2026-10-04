@@ -71,8 +71,8 @@ class DocumentChange(StrictPayload):
             raise ValueError('Existing documents require the base_version read from their outline')
         if not self.document_id and not self.path:
             raise ValueError('A new document requires path')
-        if self.document_id and self.content is not None:
-            raise ValueError('Existing documents require edits, not full content')
+        if self.document_id and self.content is not None and self.edits:
+            raise ValueError('Send content (replacing a draft) or edits, not both')
         if self.external and (self.content is not None or self.edits):
             raise ValueError('Import external content separately from edits')
         if not self.document_id and self.edits:

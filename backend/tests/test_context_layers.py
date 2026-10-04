@@ -105,6 +105,20 @@ def test_digests_keep_the_facts_agents_act_on():
     assert len(folded[text[1].id].content) <= 600 and 'recall_context' in folded[text[1].id].content
 
 
+def test_folded_call_arguments_cannot_be_sent_back_as_values():
+    from app.agents.tools.validation import folded_call_failure
+    [call] = context_fold.fold_call(AIMessage(content='', tool_calls=[
+        {'id': 'w', 'name': 'write_project_file', 'args': {'path': 'backend/server.py', 'content': 'x = 1\n' * 800}}])).tool_calls
+    [edit] = context_fold.fold_call(AIMessage(content='', tool_calls=[{'id': 'e', 'name': 'collaboration_publish', 'args': {
+        'changes': [{'path': 'docs/README.md', 'edits': [{'old_text': 'a', 'new_text': 'y' * 1000}]}]}}])).tool_calls
+    # A model copying either folded call from history is refused before anything is written.
+    assert folded_call_failure(call['args'])['error_details']['code'] == 'folded_placeholder'
+    assert folded_call_failure(edit['args'])['error'].startswith('changes.0.edits.0.new_text is a placeholder')
+    # Real values that merely mention such words still pass.
+    assert folded_call_failure({'path': 'notes.md', 'content': 'The file is on disk>, and 12 characters folded'}) is None
+    assert folded_call_failure({'path': 'a.py', 'content': 'x' * 3000}) is None
+
+
 def test_ledger_records_files_processes_checks_and_open_failures():
     body = [HumanMessage(content='task', id='task'),
             *turn(('write_project_file', {'path': 'backend/app.py', 'content': 'x' * 3000}, 'Wrote backend/app.py (3000 characters; sha256=abcdef1234567890ff).')),

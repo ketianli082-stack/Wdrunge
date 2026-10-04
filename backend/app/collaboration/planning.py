@@ -11,6 +11,7 @@
 """
 from __future__ import annotations
 
+import posixpath
 import re
 
 SCALES = ('small', 'medium', 'large')
@@ -58,14 +59,27 @@ def normalize_needs(needs) -> list[dict]:
 
 
 def check_deliverables(artifacts, documents, services):
-    clash = sorted({str(p).strip('./') for p in artifacts} & {str(p).strip('./') for p in documents})
-    if clash:
-        raise ValueError(f'{clash} declared both as files (artifacts) and as shared documents (documents). Shared documents '
-                         'are published with collaboration_publish and checked in project storage; declare each path once.')
+    """Validate typed deliverables. A path declared as a shared document is that one
+    deliverable (published, not merged as a file), so it is dropped from artifacts
+    rather than rejected; returns the artifacts to store."""
     from app.collaboration.environment import SERVICE_NAME
     for name in services:
         if not SERVICE_NAME.match(str(name)):
             raise ValueError(f'Service name {name!r} must be a registry name such as api or web')
+    shared = {deliverable_path(path) for path in documents}
+    return [path for path in artifacts if deliverable_path(path) not in shared]
+
+
+def project_relative(text, root) -> str:
+    """Rewrite absolute paths inside the project as project-relative ones."""
+    if not isinstance(text, str) or not root:
+        return text
+    root = str(root).rstrip('/')
+    return re.sub(re.escape(root) + r'(/|(?![\w-]))', lambda m: '' if m.group(1) else 'the project root', text)
+
+
+def deliverable_path(path) -> str:
+    return posixpath.normpath(str(path).replace('\\', '/'))
 
 
 def implementation_paths(artifacts) -> list[str]:
@@ -175,8 +189,9 @@ class PlanningMixin:
             return ''
         listed = ', '.join(f"{d['path']} (document_id={d['id']}, version={d['version']})" for d in drafts)
         return (f'Draft documents were created for your declared documents: {listed}. Read the outline and fill sections with '
-                'collaboration_publish (replace_section_body) as each part is done; tasks waiting on them start after your '
-                'first update. Delivery requires the drafts to be filled.')
+                'collaboration_publish (replace_section_body) as each part is done, or, if the outline does not fit, replace '
+                'the whole draft once with changes=[{document_id, base_version, summary, content}]; tasks waiting on them '
+                'start after your first update. Delivery requires the drafts to be filled.')
 
     async def task_brief(self, project, request) -> str:
         """Deliverable, dependency, scale and verification facts for the assignee."""

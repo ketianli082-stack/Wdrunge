@@ -11,7 +11,7 @@
 | platform_leak | low | 提到 Wdrunge/协作平台或沙箱（沙箱、seatbelt、network=true 等） |
 | port_mismatch | medium | 本机地址的端口不是项目环境中登记的服务端口 |
 | evidence_in_contract | low | 接口类文档中出现“验证证据/实测”等章节，或 3 行以上原始 HTTP 记录 |
-| oversized | medium | 交付文本行数超过目标规模的参考值（small 400 行、medium 2500 行） |
+| oversized | low / medium | 实现代码行数超过目标规模的参考值（small 400 行、medium 2500 行）；任务要求的文档和测试代码不计入，超出 25% 以内为 low。提示要求在结果中写一句理由或去掉标准未要求的功能，不要为凑行数删改可用代码 |
 | generated_without_command | low | OpenAPI、*.gen.*、generated/ 等生成文件没有登记重新生成命令 |
 
 依赖目录（node_modules、vendor、.venv、dist 等）、隐藏目录、二进制和超过 512 KB 的文件不检查。每类最多保留 8 条，同一行同一类只报一次，按严重程度排序。项目工作区就是 Wdrunge 仓库本身时不检查（它本来就会出现这些名字）。

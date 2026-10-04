@@ -167,8 +167,17 @@ def runtime_label(runtime: dict) -> str:
         return runtime['state']
     label = f"yes (process {runtime['process_id']}, started by {runtime.get('started_by') or 'a task'}"
     label += ', kept after its task' if runtime.get('kept') else ''
-    if runtime.get('stale'):
-        label += f", STALE: newer project changes in {', '.join(runtime['stale'][:3])} — restart it"
+    changes = ', '.join(runtime.get('stale', [])[:3])
+    # Advise a restart only where one would load the newer files: a copy in a task
+    # snapshot sees that snapshot alone, and the platform moves or restarts it itself.
+    if runtime.get('relaunch') == 'pending':
+        label += ', being restarted from the project root by the platform; no action needed'
+    elif runtime.get('from_snapshot') and runtime.get('relaunch') != 'failed':
+        label += ", running from its task's snapshot until that task delivers, then from the project root"
+        if changes:
+            label += f"; it cannot see newer project changes in {changes} before then, and restarting it would not change that"
+    elif changes:
+        label += f", STALE: newer project changes in {changes} — restart it with keep_running=true"
     return label + ')'
 
 

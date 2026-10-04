@@ -6,7 +6,7 @@
 
 | 工具 | 行为 |
 | --- | --- |
-| `execute_command` | 分开的 `command`、`arguments`、相对项目的 `cwd`；1–600 秒超时；返回退出码、合并 stdout/stderr、超时与截断信息。没有隐式 shell。`background=true` 立即返回进程 ID，最长 1800 秒，通过 manage_process 查状态、日志或停止；启动服务和安装依赖都使用此入口。`keep_running=true` 让服务在任务交付后继续运行并替换正在运行的同名服务（见 backend/environment-registry.md）。`ok_exit_codes` 追加在 0 之外，不替换 0。 |
+| `execute_command` | 分开的 `command`、`arguments`、相对项目的 `cwd`；1–600 秒超时；返回退出码、合并 stdout/stderr、超时与截断信息。没有隐式 shell。`background=true` 立即返回进程 ID，最长 1800 秒，通过 manage_process 查状态、日志或停止；启动服务和安装依赖都使用此入口。`keep_running=true` 替换正在运行的同名服务；只有某个任务声明的服务在任务交付后继续运行（见 backend/environment-registry.md）。`network=false` 时若输出显示套接字被沙箱拒绝（包括脚本内部监听或连接 127.0.0.1），即使退出码在 `ok_exit_codes` 中也会附 `warning`，提示用 `network=true` 重跑。`ok_exit_codes` 追加在 0 之外，不替换 0。 |
 | `manage_process` | 当前任务工作区的进程列表、状态、分页日志和停止；不接受任意 PID。 |
 | `detect_environment` | 识别 Python/Node 清单、包管理器、锁文件、脚本和环境；也识别 Rust/Go/Ruby/PHP 清单并提示显式配置安装命令。 |
 | `browse_directory` | 单层文件和目录分页；`offset`、`limit`，返回 `next_offset`。 |
@@ -17,7 +17,7 @@
 
 原有 `run_project_check`、`refresh_api_contract`、`refresh_frontend_client` 和 `run_service_check` 同样通过统一执行层。Python 验证优先使用任务自己的环境，必要时只读使用来源项目的 `.venv`，不会悄悄使用 Wdrunge 宿主的依赖冒充项目环境。
 
-任务快照中共享的依赖只能只读使用。需要修改依赖时，通过受审核的命令解除任务内的依赖符号链接，再创建任务自己的依赖目录；不得删除或覆盖链接目标。运行产生的缓存、HOME 和 Wdrunge 测试数据库位于私有临时目录。
+任务快照中共享的依赖只能只读使用。需要修改依赖时，通过受审核的命令解除任务内的依赖符号链接，再创建任务自己的依赖目录；不得删除或覆盖链接目标。运行产生的缓存、HOME 和 Wdrunge 测试数据库位于私有临时目录。任务快照中的 `.task-scratch/` 供成员存放只给自己用的辅助文件（mock 服务、探测脚本），可跨命令使用，但不会合并进项目。
 
 ## 小模型与人工授权
 
@@ -51,7 +51,7 @@ AI/白名单自动放行保留最近 200 条审核记录（理由、置信度、
 | Linux | 使用 Bubblewrap 调用内核用户、PID、挂载等命名空间；默认隔离网络，按路径只读/读写挂载。`bwrap` 不是发行版必装组件，用户命名空间也可能被禁用；缺失或启动失败都不会降级。 |
 | Windows | 返回明确的不可用状态并阻止命令。Windows Sandbox 是有版本/虚拟化要求的可选虚拟机功能，不能冒充任意子进程的默认沙箱。尚未实现并验证 AppContainer + Job Object 适配器。 |
 
-`network=true` 意味着共享宿主网络，包括本地服务和公网，需要审核；不宣称它仅允许 localhost。浏览器工具还限制 HTTP/WebSocket 请求到明确列出的 origins，阻止服务工作线程，使用全新配置且不载入用户 cookies。
+`network=true` 意味着共享宿主网络，包括本地服务和公网，需要审核；不宣称它仅允许 localhost。`network=false` 在 macOS 上禁止所有套接字（含 127.0.0.1），在 Linux 上命令只有自己的回环网络；`detect_environment` 的主机说明写明了这一点。浏览器工具还限制 HTTP/WebSocket 请求到明确列出的 origins，阻止服务工作线程，使用全新配置且不载入用户 cookies。
 
 进程输出保留最近 128 KiB，单次返回最多 30,000 字节；`execute_command` 前台输出超过 4,000 字节时只返回开头、整份保留日志中的错误/警告行和结尾，并标记 `output_truncated`，完整日志通过 `manage_process` 的 logs 分页读取；退出记录最多保留 100 条，不跨重启恢复 PID。最多并行 8 个进程，命令/服务受墙钟时间、CPU、文件大小和文件描述符限制，Linux 的普通命令另设 64 GiB 单进程虚拟地址空间上限；浏览器为兼容 V8 大地址预留不使用该上限。取消命令、任务结束、清除记录和正常退出会清理任务进程组；已交付任务保留的服务例外，随会话停止、应用关闭或寿命到期结束。进程组清理不等于完整的容器资源配额；特别是 macOS 上刻意脱离进程组的程序、系统强杀后端，以及磁盘总量/整个进程树的内存配额，仍需要更强的 OS 级监督与配额。不要把这套开发防护当作任意恶意代码的云多租户运行环境。
 

@@ -41,6 +41,15 @@ def compact_output(result: dict, full: str | None = None) -> dict:
 
 
 STARTUP_GRACE = 1.5
+# A sandboxed command without network gets EPERM on any socket, loopback included;
+# automatic_network sees only argv, not what a script opens itself.
+SOCKET_DENIED = re.compile(r'Errno 1\]|\bEPERM\b|Operation not permitted', re.I)
+SOCKET_USE = re.compile(r'socket|\.(bind|connect|listen)\(|\b(listen|connect|bind) EPERM|urlopen|HTTPConnection|'
+                        r'create_connection|fetch failed|server_bind', re.I)
+
+
+def socket_denied(output):
+    return bool(SOCKET_DENIED.search(output) and SOCKET_USE.search(output))
 
 
 def automatic_network(argv, background):
@@ -79,6 +88,18 @@ async def registry_service(name, port):
         return None
     return (next((s for s in services if s['name'] == name), None)
             or next((s for s in services if port and s.get('port') == port), None))
+
+
+async def declared_services():
+    """Services some task of the project delivers, or None outside a collaboration."""
+    from app.collaboration.tools import active
+    ctx = active.get()
+    if not ctx:
+        return None
+    try:
+        return await ctx.service.declared_services(ctx.project)
+    except Exception:
+        return None
 
 
 def tag_job(job, service):
@@ -124,8 +145,8 @@ async def execute_command(command: str, arguments: list[str], cwd: str = '.',
     """Run an executable with arguments (string array) in cwd; no shell. Foreground
     returns exit code and output (timeout default 120 s, max 600). background=true
     starts a service (lifetime up to 1800 s) and returns a process ID; ready_port
-    waits for its port. keep_running=true keeps it running after delivery and replaces
-    a running copy. network: omitted = automatic for services and loopback-only URLs.
+    waits for its port. keep_running=true replaces a running copy; services a task
+    declares stay running after delivery. network: omitted = automatic for services and loopback-only URLs.
     ok_exit_codes lists expected non-zero exits. Reviewed and sandboxed.
     """
     if not background and timeout is not None and timeout > 600:
@@ -194,10 +215,15 @@ async def execute_command(command: str, arguments: list[str], cwd: str = '.',
         if replaced:
             result['replaced_process'] = replaced
         if keep_running and job.process.returncode is None:
-            result['kept'] = True
-            if not job.service:
-                result['warning'] = ('Kept, but it serves no registered service yet; register its port with '
-                                     'collaboration_register_service so colleagues can find it.')
+            declared = await declared_services()
+            if declared is not None and job.service not in declared:
+                result['warning'] = ('It runs until your task ends: only services a task declares stay running '
+                                     'after delivery, so a helper (a preview, a mock) stops with your task.')
+            else:
+                result['kept'] = True
+                if not job.service:
+                    result['warning'] = ('Kept, but it serves no registered service yet; register its port with '
+                                         'collaboration_register_service so colleagues can find it.')
         if ready is not None:
             result['ready'] = ready
             if not ready:
@@ -213,7 +239,13 @@ async def execute_command(command: str, arguments: list[str], cwd: str = '.',
     result['network'] = network
     job = processes.jobs.get(result.get('id'))
     # Scan the whole retained log; run() already cut the output to its last 30 KB.
-    return compact_output(result, processes.logs(job, 0, 128 * 1024)['output'] if job else None)
+    full = processes.logs(job, 0, 128 * 1024)['output'] if job else None
+    if not network and socket_denied(full if full is not None else result.get('output', '')):
+        # Also when an expected exit code made the run count as a success.
+        result['warning'] = ('Socket access was denied: with network=false the sandbox blocks every socket the '
+                             'command opens, 127.0.0.1 included. If its code serves or connects locally, run it '
+                             'again with network=true; this output does not show the code failing.')
+    return compact_output(result, full)
 
 
 @tool
@@ -265,11 +297,15 @@ HOST_NOTES = {
         'localhost may resolve to ::1 before 127.0.0.1',
         '/usr/bin/python3 is an Xcode shim the sandbox blocks; run python3 from PATH (host.executables)',
         '/tmp is not writable; $TMPDIR is private to one command and deleted when it ends, '
-        'so files a later call needs belong in the workspace']},
+        'so files a later call needs belong in the workspace',
+        'network=false blocks every socket, 127.0.0.1 included: a script that serves or connects locally '
+        '(a test server, an HTTP client) needs network=true; loopback URLs in the arguments are detected']},
     'Linux': {'os': 'Linux', 'userland': 'GNU', 'notes': [
         'ss -ltnp lists listening TCP sockets', 'lsof may not be installed',
         '/tmp and $TMPDIR are private to one command and discarded when it ends, '
-        'so files a later call needs belong in the workspace']},
+        'so files a later call needs belong in the workspace',
+        'network=false gives a command its own loopback: it can serve and connect to itself, but reaching '
+        'project services needs network=true; loopback URLs in the arguments are detected']},
 }
 
 

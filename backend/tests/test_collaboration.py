@@ -299,6 +299,10 @@ def test_workspace_sync_keeps_env_templates_but_not_secrets(tmp_path):
     for name in ('.env', '.env.local', '.env.example', '.env.sample', 'app.py'):
         (tmp_path/name).write_text('X=1\n')
     assert sorted(files(tmp_path)) == ['.env.example', '.env.sample', 'app.py']
+    # A task's scratch helpers are never part of the project.
+    (tmp_path/'.task-scratch').mkdir()
+    (tmp_path/'.task-scratch'/'mock_server.py').write_text('X=1\n')
+    assert '.task-scratch/mock_server.py' not in files(tmp_path)
 
 
 def test_real_worker_graph_uses_isolated_request_workspace(tmp_path, monkeypatch):

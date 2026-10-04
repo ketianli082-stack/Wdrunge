@@ -19,7 +19,7 @@ import logging
 
 logger = logging.getLogger(__name__)
 from app.agents.limits import graph_recursion_limit
-from app.agents.tools.validation import tool_error, tool_result_failed, normalize_failure, model_tool_schemas
+from app.agents.tools.validation import tool_error, tool_result_failed, normalize_failure, model_tool_schemas, folded_call_failure
 from app.agents.base import Agent, build_model
 from app.collaboration.tools import active, collaborate, COLLABORATION_TOOLS, model_collaboration_tools, collaboration_action
 from app.collaboration.context import encode_handoff
@@ -247,6 +247,11 @@ class WorkerAgent(Agent):
                         if current['state'] != 'running' or (ctx.instance_id and current.get('instance_id') != ctx.instance_id):
                             results.append(ToolMessage(content='Request is no longer running; tool skipped.', tool_call_id=call['id'], status='error'))
                             continue
+                    if failure := folded_call_failure(call.get('args')):
+                        import json
+                        results.append(ToolMessage(content=json.dumps(failure, ensure_ascii=False), name=call['name'],
+                                                   tool_call_id=call['id'], status='error'))
+                        continue
                     single = last.model_copy(update={'tool_calls': [call]})
                     result = await tool_node.ainvoke({**state, 'messages': [*state['messages'][:-1], single]}, config)
                     for message in result['messages']:

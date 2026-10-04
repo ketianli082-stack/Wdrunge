@@ -27,10 +27,10 @@
 登记中的 `verified` 只表示“曾观察到本项目进程提供该端口”，不代表现在仍在运行。每次读取登记时，平台按运行中的进程为每个服务计算实时 `runtime`：`running`（进程 ID、启动成员、是否保留、是否 stale）、`listening`（端口有响应但不是团队进程）或 `stopped`。`detect_environment`、`collaboration_environment`、handoff 的 `environment.services[].running` 和协作面板都显示它。
 
 - 默认：任务结束时停止它启动的所有进程。
-- 保留：任务交付（review/completed）时，任务 `services` 中声明的服务自动保留；其他服务可用 `execute_command(background=true, keep_running=true)` 显式保留。未交付（失败、取消、冲突）的任务一律停止。
-- 保留的服务继续从启动它的任务快照运行（依赖已在快照中安装），寿命为 `WDRUNGE_SERVICE_LIFETIME_SECONDS`（默认 4 小时）；在停止会话、应用关闭、被同名服务替换或用户/成员手动停止时结束。
+- 保留：服务是否在任务后继续运行，以任务声明为准。任务交付（review/completed）时，自己 `services` 中声明的服务自动保留；用 `keep_running=true` 启动的进程只有在它提供的服务由某个任务声明时才保留（例如测试恢复了后端交付的服务），其余（预览服务、mock 等自测辅助进程）随任务停止，`keep_running` 的返回结果会提前说明。未交付（失败、取消、冲突）的任务一律停止。
+- 交付合并后，保留的服务由平台用同一命令改从项目根目录运行（命令照常审核，审核通过前旧副本继续服务）。寿命为 `WDRUNGE_SERVICE_LIFETIME_SECONDS`（默认 4 小时）；在停止会话、应用关闭、被同名服务替换或用户/成员手动停止时结束。项目根的保留服务属于项目，不属于在项目根运行的某个回合：Leader 回合或任务结束时的进程清理不会停止它。
 - 复用与替换：其他任务看到 running 时直接使用；不带 keep_running 再次启动同一服务会返回 `service_already_running`；带 keep_running 启动会替换正在运行的副本（改了代码后重启）。
-- stale：之后有其他任务发布了该服务目录下的文件时，服务被标记 stale 并列出变更路径，提示下一个成员重启。
+- stale：之后有其他任务发布了该服务目录下的文件时，记录变更路径。只在重启确实能加载新文件时提示重启：项目根的保留服务由平台自动重启（显示“平台正在重启，无需处理”）；仍在任务快照中运行的服务看不到合并的文件，重启也一样，显示为“任务交付后改从项目根运行”而不提示重启；只有改从项目根运行失败、或未保留的服务，才标 STALE 并提示用 keep_running=true 重启。
 - 管理：`manage_process` 可按服务名查看/读取日志/停止项目中运行的服务（含其他任务保留的）；协作面板“项目环境”提供“停止”，对应 `POST /api/projects/{project_id}/collaboration/services/{name}/stop`。
 - 交付检查：任务声明的服务在提交时必须正在运行，仅“曾验证”不够。
 
@@ -42,4 +42,4 @@
 
 ## 回归覆盖
 
-`tests/test_environment_registry.py` 覆盖端口分配与冲突、占用端口不归属、用户条目、项目配置发现、handoff 摘要、成员/用户工具、运行观察登记、审核信任登记端口与平台端口始终人工确认、平台端口学习。`tests/test_kept_services.py` 覆盖跨任务保留、复用与替换、stale 标记、随会话停止、寿命延长、未交付任务停止保留服务和面板停止接口。
+`tests/test_environment_registry.py` 覆盖端口分配与冲突、占用端口不归属、用户条目、项目配置发现、handoff 摘要、成员/用户工具、运行观察登记、审核信任登记端口与平台端口始终人工确认、平台端口学习。`tests/test_kept_services.py` 覆盖跨任务保留、复用与替换、stale 标记及只在有用时提示重启、项目根保留服务不随回合清理停止、随会话停止、寿命延长、未交付任务停止保留服务、交付时只保留有任务声明的服务和面板停止接口。

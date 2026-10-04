@@ -49,6 +49,14 @@ class Job:
     # Kept so a reviewed service command can be started again from the project root.
     network: bool = False
     reason: str = ''
+    # The platform starting it again from the project root: 'pending' (may wait for
+    # review), 'failed' (it keeps running where it was).
+    relaunch: str | None = None
+
+    @property
+    def from_snapshot(self):
+        """Runs from a task snapshot rather than the project root it belongs to."""
+        return self.workspace != self.scope
 
     def snapshot(self):
         return {'id': self.id, 'name': self.name, 'argv': self.argv, 'cwd': self.cwd,
@@ -60,7 +68,9 @@ class Job:
         """Live state of a service process, as shown beside its registry entry."""
         return {'state': 'running' if self.process.returncode is None else 'stopped', 'process_id': self.id,
                 'kept': self.keep, 'started_by': self.started_by, 'task': self.request,
-                'since': round(self.started_at), **({'stale': self.stale[:5]} if self.stale else {})}
+                'since': round(self.started_at), **({'stale': self.stale[:5]} if self.stale else {}),
+                **({'from_snapshot': True} if self.from_snapshot else {}),
+                **({'relaunch': self.relaunch} if self.relaunch else {})}
 
 
 _lifeline: tuple[int, int] | None = None
@@ -247,6 +257,19 @@ class Processes:
             job.timeout_task.cancel()
             job.timeout_task = asyncio.get_running_loop().call_later(service_lifetime(), self._expire, job)
 
+    def settle_delivery(self, task_services, project_services):
+        """At delivery, decide which of this task's processes outlive it. Services are
+        deliverables only when a task declares them: the task's own are kept; one it
+        (re)started with keep_running stays only if some task delivers it, e.g. a
+        colleague's service it restored. Anything else (a preview, a mock) stops."""
+        for job in self.owned_jobs():
+            if job.process.returncode is not None:
+                continue
+            if job.service and job.service in task_services:
+                self.keep_service(job)
+            elif job.keep and job.service not in project_services:
+                job.keep = False
+
     def mark_stale(self, project, workspace, paths, skip=()):
         """A publish from another workspace changed files a kept service serves from its
         own snapshot; the service keeps running but no longer matches the project."""
@@ -264,8 +287,10 @@ class Processes:
         try:
             cwd = Path(job.cwd).resolve().relative_to(Path(job.workspace).resolve()).as_posix()
         except ValueError:
+            job.relaunch = 'failed'
             return None
         ports = sorted(job.ports)
+        job.relaunch = 'pending'
 
         async def release():
             # The new command is reviewed like any other; the old copy keeps serving
@@ -281,6 +306,9 @@ class Processes:
             reason = (f'{job.reason}；' if job.reason else '') + '任务已交付，同一命令改从项目根目录运行'
             new = await self.start(job.argv, cwd, name=job.name, network=job.network, reason=reason, keep=True,
                                    before_spawn=release)
+        except BaseException:
+            job.relaunch = 'failed'
+            raise
         finally:
             source_workspace.reset(tokens[1])
             active_workspace.reset(tokens[0])
@@ -305,13 +333,13 @@ class Processes:
         return relaunched
 
     def refresh_after_publish(self, project, workspace, paths):
-        """A publish changed project files. Kept services running from the project root
-        restart (in the background) to load them; services still running in another
-        task's snapshot cannot see them and are marked stale for that task and colleagues."""
+        """A publish changed project files. Services that no longer match them are marked
+        stale; kept services running from the project root also restart (in the
+        background) to load them, which clears the mark once the new copy runs."""
         root = Path(project).resolve()
         restart = [job for job in self.project_services(project) if job.workspace != str(workspace)
-                   and job.keep and Path(job.workspace).resolve() == root and self.changed_paths(job, paths)]
-        self.mark_stale(project, workspace, paths, skip={job.id for job in restart})
+                   and job.keep and not job.from_snapshot and self.changed_paths(job, paths)]
+        self.mark_stale(project, workspace, paths)
         for job in restart:
             self.background(self.relaunch(job, root), f'restart kept service {job.service or job.name}')
 
@@ -382,10 +410,12 @@ class Processes:
             raise
 
     async def close(self, workspace=None, *, keep_services=False):
-        """Stop processes (of one task workspace); keep_services spares kept services
-        of a delivered task."""
+        """Stop processes (of one workspace) when a turn or task ends; keep_services
+        spares kept services of a delivered task. A kept service running from the project
+        root belongs to the project, not to whichever turn or task last ran there: only
+        an explicit stop, its lifetime or shutdown (workspace=None) ends it."""
         await asyncio.gather(*(self.stop(job) for job in list(self.jobs.values())
-            if (workspace is None or job.workspace == str(workspace)) and not (keep_services and job.keep)),
+            if workspace is None or (job.workspace == str(workspace) and not (job.keep and (keep_services or not job.from_snapshot)))),
             return_exceptions=True)
 
 

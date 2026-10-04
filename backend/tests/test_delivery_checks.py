@@ -107,6 +107,32 @@ def test_lockfiles_are_not_counted_and_platform_wording_is_not_checked(tmp_path)
     asyncio.run(run())
 
 
+def test_size_counts_implementation_only_and_asks_for_a_reason(tmp_path):
+    async def run():
+        store, s, p, conv, workspace = await setup(tmp_path)
+        goal = await s.create_goal(p, 'leader', conv, 'Hello world', ['page shows the message'], 'g', scale='small')
+        write(workspace, 'backend/server.py', 'pass\n' * 300)
+        write(workspace, 'backend/_selftest.py', 'pass\n' * 200)
+        write(workspace, 'backend/tests/test_api.py', 'pass\n' * 200)
+        write(workspace, 'frontend/app.spec.js', 'x\n' * 200)
+        write(workspace, 'docs/api.md', '# API\n' + 'line\n' * 300)
+        await s.publish(p, 'backend', [{'path': 'docs/api.md', 'base_version': 0, 'summary': 'API', 'external': True}])
+        request = await s.create_request(p, 'leader', 'backend', 'API', 'api', conversation=conv, goal_id=goal['id'],
+                                         acceptance_criteria=['works'], artifacts=['backend/', 'frontend/'], documents=['docs/api.md'])
+        assert not any(f['kind'] == 'oversized' for f in await delivery_findings(s, p, request, workspace))
+
+        write(workspace, 'backend/extra.py', 'pass\n' * 150)    # 451 lines: slightly over, noted only
+        [size] = [f for f in await delivery_findings(s, p, request, workspace) if f['kind'] == 'oversized']
+        assert size['severity'] == 'low' and 'backend/server.py 301' in size['excerpt']
+        assert 'one sentence' in size['message'] and 'Do not rewrite or remove working code' in size['message']
+
+        write(workspace, 'backend/extra.py', 'pass\n' * 400)    # well over the guide
+        [size] = [f for f in await delivery_findings(s, p, request, workspace) if f['kind'] == 'oversized']
+        assert size['severity'] == 'medium'
+        await store.close()
+    asyncio.run(run())
+
+
 def test_the_wdrunge_repository_itself_is_not_flagged(tmp_path, monkeypatch):
     from app.agents.tools import _workspace
     async def run():

@@ -54,9 +54,16 @@ def test_goal_scale_bounds_criteria_and_is_required_from_leader(tmp_path):
 def test_deliverables_are_typed_and_contradictions_rejected(tmp_path):
     async def run():
         store, s, p, conv = await setup(tmp_path)
-        with pytest.raises(ValueError, match='declared both as files'):
-            await s.create_request(p, 'leader', 'backend', 'API', 'api', conversation=conv,
-                                   artifacts=['backend/', 'docs/api.md'], documents=['docs/api.md'])
+        # A path declared both ways is one shared document, not also a file to merge.
+        both = await s.create_request(p, 'leader', 'backend', 'API', 'both', conversation=conv,
+                                      artifacts=['backend/', './docs/api.md'], documents=['docs/api.md'])
+        assert both['artifacts'] == ['backend/'] and both['documents'] == ['docs/api.md']
+        # Task text names project paths relative to the project: assignees work in a snapshot.
+        async with s.reading() as c:
+            root = (await s._project(c, p))['workspace_path']
+        located = await s.create_request(p, 'leader', 'backend', f'Serve {root}/frontend. Workspace: {root}', 'located',
+                                         conversation=conv)
+        assert located['goal'] == 'Serve frontend. Workspace: the project root'
         with pytest.raises(ValueError, match='registry name'):
             await s.create_request(p, 'leader', 'backend', 'API', 'api', conversation=conv, services=['My API'])
         with pytest.raises(ValueError, match='exactly one document'):

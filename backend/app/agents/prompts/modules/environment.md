@@ -7,10 +7,9 @@ served). Use a running service as it is; start one only when it is stopped, and
 restart it with keep_running=true (which replaces the running copy) only after
 changing its code or when it is marked stale. For a new server,
 collaboration_register_service gives it a free port (omit port); start it with
-execute_command(background=true, ready_port=<port>). Services your task declares are
-kept running after delivery, from the project root; keep_running=true keeps any other
-one. A colleague's running service cannot see your undelivered files: to test your
-changes, run your own copy on a newly registered port. manage_process reads logs of,
-or stops, any running project service by name. Put resolved addresses
+execute_command(background=true, ready_port=<port>). Only services a task declares
+stay running after delivery, from the project root. A service sees only the workspace
+it runs from: test undelivered changes on your own copy on a newly registered port. manage_process reads logs of, or stops, any
+running project service by name. Put resolved addresses
 in deliverables only where users need them (README, configuration) as plain
 values; never explain the registry or reserved ports.

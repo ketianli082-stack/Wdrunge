@@ -174,6 +174,23 @@ def test_background_defaults_and_explicit_network_choice(monkeypatch):
     assert calls == [(1800, True), (60, False), (120, True), (120, False)]
 
 
+def test_a_socket_the_sandbox_denied_is_explained_even_on_an_expected_exit(monkeypatch):
+    outputs = iter(['  File "selftest.py", line 9, in main\n    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)\n'
+                    '  File "socketserver.py", line 473, in server_bind\nPermissionError: [Errno 1] Operation not permitted\n',
+                    'Error: connect EPERM 127.0.0.1:8100\n',
+                    "ls: .: Operation not permitted\n"])
+    async def run(argv, cwd, timeout, **kwargs):
+        return {'exit_code': 1, 'output': next(outputs)}
+    monkeypatch.setattr(development.processes, 'run', run)
+    async def scenario():
+        call = {'command': 'python3', 'arguments': ['tests/e2e.py'], 'ok_exit_codes': [1]}
+        return [await development.execute_command.ainvoke(call) for _ in range(3)]
+    python, node, files = asyncio.run(scenario())
+    assert 'network=true' in python['warning'] and 'network=true' in node['warning']
+    # A file permission error is not a network problem.
+    assert 'warning' not in files
+
+
 @pytest.fixture
 def real_processes(tmp_path, monkeypatch):
     class Approve:

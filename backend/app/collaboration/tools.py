@@ -121,9 +121,10 @@ TRANSITION_RECEIPT = ('id', 'state', 'sender', 'recipient', 'goal_id', 'attempts
 INSPECT_HIDDEN = {'spec', 'lease_owner', 'lease_until', 'instance_id', 'workspace_id', 'origin_message', 'conversation'}
 
 
-# Default inspect view: the state and what was delivered, not the task text the caller
-# usually wrote itself. Long text is cut to a preview; detail='full' returns it all.
-INSPECT_PREVIEW = {'goal': 400, 'result': 1500}
+# Default inspect view: the state and the whole delivery (a delivered result is at most
+# 4000 characters), so reviewing needs nothing more; the task text the caller usually
+# wrote itself is cut to a preview. detail='full' returns it all.
+INSPECT_PREVIEW = {'goal': 400, 'result': 4000}
 
 
 def preview(value, limit):
@@ -345,11 +346,11 @@ ACTION_DESCRIPTIONS = {
     'complete_task': 'Sender or Leader: accept a reviewed goal task. evidence must map every exact task criterion to verification evidence. Use result for the acceptance summary. Inspect artifacts and tests before accepting.',
     'catalog': 'List managed documents with IDs, current versions and external-change flags. Use this before publishing changes to an existing path.',
     'read': 'Read a document: whole=true for full text plus outline; no section_id for the outline; section_id for one section body. Keep the same version.',
-    'publish': 'Publish managed Markdown atomically. New: changes=[{path, base_version:0, summary, content}]. Existing: changes=[{document_id, base_version, summary, edits}] with replace_text, replace_section_body, insert_section or delete_section.',
+    'publish': 'Publish managed Markdown atomically. New: changes=[{path, base_version:0, summary, content}]. Existing: changes=[{document_id, base_version, summary, edits}] with replace_text, replace_section_body, insert_section or delete_section; content replaces an unfilled draft.',
     'subscribe': 'Subscribe to changes of a document or a unique heading from its current outline; enabled=false unsubscribes.',
     'send': 'Send a coordination message with a short public summary and full content; key is stable across retries. Not a scheduled job.',
     'request': 'Schedule a colleague task within your scope. Include acceptance criteria in goal, expected artifact paths, based_on document versions and prerequisite request IDs in dependencies. key is required and stable across retries; summary is the short public notice.',
-    'inspect_request': "Inspect a task: state, result, dependencies, artifacts, findings and its work journal.",
+    'inspect_request': "Inspect a task: state, result, dependencies, artifacts, findings and its work journal. The default view suffices for review; detail='full' adds the task text.",
     'wait': 'Suspend the current durable worker request until its prerequisite request IDs are ready for review. Accept their deliveries before publishing dependent artifacts. Do not poll.',
     'transition': 'Move a task: deliver to review, accept completed, or queue rework. result is plain-text evidence; summary is a short public reply.',
     'snapshot': 'List the most recent team requests and their states.',
