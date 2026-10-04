@@ -279,3 +279,120 @@ def test_service_labels_advise_a_restart_only_where_it_helps():
     assert 'restart it' not in in_snapshot and 'until that task delivers' in in_snapshot
     assert 'no action needed' in runtime_label({**base, 'relaunch': 'pending'})
     assert 'STALE' in runtime_label(base) and 'STALE' in runtime_label({**base, 'from_snapshot': True, 'relaunch': 'failed'})
+
+
+PROXY = '''
+import http.server, sys
+port, upstream = int(sys.argv[1]), int(sys.argv[2])
+print(f"web listening on http://127.0.0.1:{port} (proxying /api -> http://127.0.0.1:{upstream})", flush=True)
+http.server.ThreadingHTTPServer(("127.0.0.1", port), http.server.SimpleHTTPRequestHandler).serve_forever()
+'''
+
+
+def test_a_proxy_does_not_own_the_port_it_forwards_to(tmp_path, manager):
+    """A port a process prints in its log but that another process already served is
+    its upstream: api stays api's, and looking api up never returns the proxy."""
+    project_root = tmp_path / 'project'
+    snapshot = project_root / '.wdrunge-runs' / 'frontend' / 'work'
+    snapshot.mkdir(parents=True)
+    api_port, web_port = free_port(), free_port()
+
+    async def scenario():
+        store = ChatStore(f'sqlite+aiosqlite:///{tmp_path / "proxy.db"}')
+        project = (await store.create_project('Proxy', str(project_root)))['id']
+        service = Collaboration(store)
+        await service.initialize()
+        await service.register_service(project, 'leader', 'api', port=api_port)
+        await service.register_service(project, 'leader', 'web', port=web_port)
+        tokens = (active.set(Context(service, project, 'frontend', '', 'request:r-frontend', 'r-frontend')),
+                  active_workspace.set(snapshot), source_workspace.set(project_root))
+        try:
+            api = await development.execute_command.ainvoke({'command': sys.executable, 'background': True, 'name': 'api',
+                'arguments': ['-m', 'http.server', '--bind', '127.0.0.1', str(api_port)], 'ready_port': api_port})
+            web = await development.execute_command.ainvoke({'command': sys.executable, 'background': True, 'name': 'web',
+                'arguments': ['-c', PROXY, str(web_port), str(api_port)], 'ready_port': web_port})
+            assert api['ports'] == [api_port] and web['ports'] == [web_port]
+            assert manager.service_job(project_root, name='api').id == api['id']
+            assert manager.service_job(project_root, port=api_port).id == api['id']
+            assert [s['name'] for s in web['registered_services']] == ['web']
+        finally:
+            source_workspace.reset(tokens[2])
+            active_workspace.reset(tokens[1])
+            active.reset(tokens[0])
+            await manager.close()
+            await store.close()
+    asyncio.run(scenario())
+
+
+def test_a_service_moving_to_the_root_is_restarting_not_stopped(tmp_path, manager):
+    """From delivery until the root copy serves, dependent tasks wait, the service shows
+    as restarting and nobody may start another copy in the gap."""
+    from app.collaboration.environment import service_runtime, runtime_label
+    project_root = tmp_path / 'project'
+    snapshot = project_root / '.wdrunge-runs' / 'frontend' / 'work'
+    snapshot.mkdir(parents=True)
+    port = free_port()
+    server = [sys.executable, '-m', 'http.server', '--bind', '127.0.0.1', str(port)]
+    record = {'name': 'web', 'port': port}
+
+    async def scenario():
+        tokens = active_workspace.set(snapshot), source_workspace.set(project_root)
+        try:
+            old = await manager.start(server, '.', 120, 'web', network=True, keep=True)
+            assert await manager.wait_ready(old, port, 10)
+            old.service, old.request = 'web', 'r-frontend'
+            # Delivered but not moved yet: tasks depending on the frontend task wait.
+            assert manager.moving_for(project_root, 'r-frontend') and not manager.moving_for(project_root, 'r-other')
+
+            hold, start = asyncio.Event(), manager.start
+            async def paused_start(*args, before_spawn, **kwargs):
+                async def stop_old_then_pause():
+                    await before_spawn()
+                    await hold.wait()
+                return await start(*args, before_spawn=stop_old_then_pause, **kwargs)
+            manager.start = paused_start
+            move = asyncio.create_task(manager.relaunch_delivered(snapshot, project_root))
+            while old.process.returncode is None:
+                await asyncio.sleep(.05)
+            runtime = await service_runtime(project_root, record)
+            assert runtime['state'] == 'restarting' and 'no action needed' in runtime_label(runtime)
+            assert manager.moving_for(project_root, 'r-frontend')
+            with pytest.raises(ToolFailure, match='being restarted from the project root'):
+                await development.execute_command.ainvoke({'command': server[0], 'arguments': server[1:], 'background': True,
+                    'name': 'web', 'ready_port': port, 'keep_running': True})
+
+            hold.set()
+            [moved] = await move
+            assert moved.ports == {port} and moved.relaunch is None
+            assert not manager.moving_for(project_root, 'r-frontend') and manager.restarting(project_root, name='web') is None
+            assert (await service_runtime(project_root, record))['state'] == 'running'
+        finally:
+            await manager.close()
+            source_workspace.reset(tokens[1])
+            active_workspace.reset(tokens[0])
+    asyncio.run(scenario())
+
+
+def test_a_snapshot_copy_does_not_replace_the_delivered_root_service(tmp_path, manager):
+    project_root = tmp_path / 'project'
+    snapshot = project_root / '.wdrunge-runs' / 'testing' / 'work'
+    snapshot.mkdir(parents=True)
+    port = free_port()
+    server = [sys.executable, '-m', 'http.server', '--bind', '127.0.0.1', str(port)]
+
+    async def scenario():
+        tokens = active_workspace.set(project_root), source_workspace.set(project_root)
+        try:
+            root_copy = await manager.start(server, '.', 120, 'web', network=True, keep=True)
+            assert await manager.wait_ready(root_copy, port, 10)
+            root_copy.service = 'web'
+            active_workspace.set(snapshot)
+            with pytest.raises(ToolFailure, match='already runs from the project root'):
+                await development.execute_command.ainvoke({'command': server[0], 'arguments': server[1:], 'background': True,
+                    'name': 'web', 'ready_port': port, 'keep_running': True})
+            assert root_copy.process.returncode is None
+        finally:
+            await manager.close()
+            source_workspace.reset(tokens[1])
+            active_workspace.reset(tokens[0])
+    asyncio.run(scenario())

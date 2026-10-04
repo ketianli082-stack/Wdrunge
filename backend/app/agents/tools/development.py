@@ -8,9 +8,9 @@ from typing import Annotated, Literal
 from pydantic import Field
 
 from app.agents.tools.validation import tool, ToolFailure, failure_result, command_failure
-from app.agents.tools._workspace import resolve_allowed
+from app.agents.tools._workspace import resolve_allowed, workspace_root
 from app.execution.processes import processes, port_open
-from app.execution.permissions import connection_texts, network_targets, argv_ports, LOG_PORT_PATTERN
+from app.execution.permissions import connection_texts, network_targets, argv_ports, scope, LOG_PORT_PATTERN
 from app.execution.sandbox import capability, host_path
 from app.execution.environment import inspect_environment
 
@@ -61,14 +61,17 @@ def automatic_network(argv, background):
     return bool(targets) and all(target['loopback'] for target in targets)
 
 
-async def served_ports(job, declared, ready_port):
+async def served_ports(job, declared, ready_port, held=frozenset()):
     """Ports this process is serving: the confirmed ready_port, argv ports that were
-    free before it started, and ports it printed in its own log, now accepting."""
+    free before it started, and ports it printed in its own log, now accepting. A
+    logged port that was already held before it started is one it connects to (a
+    proxy prints its upstream), not one it serves."""
     if job.process.returncode is not None:
         return set()
     ports = {ready_port} if ready_port else set()
     log = processes.logs(job, 0, 65536)['output']
-    candidates = (declared | {int(p) for p in LOG_PORT_PATTERN.findall(log) if 0 < int(p) < 65536}) - ports
+    logged = {int(p) for p in LOG_PORT_PATTERN.findall(log) if 0 < int(p) < 65536} - set(held)
+    candidates = (declared | logged) - ports
     for port in candidates:
         if await port_open(port, timeout=.3):
             ports.add(port)
@@ -76,18 +79,32 @@ async def served_ports(job, declared, ready_port):
     return ports
 
 
-async def registry_service(name, port):
-    """The registry service a start command targets: by name, else by port."""
+async def registry_services():
+    """The project's registry services with their live state; empty outside a collaboration."""
     from app.collaboration.tools import active
     ctx = active.get()
     if not ctx:
-        return None
+        return []
     try:
-        services = (await ctx.service.environment(ctx.project, discover_manifests=False))['services']
+        return (await ctx.service.environment(ctx.project, discover_manifests=False))['services']
     except Exception:
-        return None
+        return []
+
+
+def registry_service(services, name, port):
+    """The registry service a start command targets: by name, else by port."""
     return (next((s for s in services if s['name'] == name), None)
             or next((s for s in services if port and s.get('port') == port), None))
+
+
+async def held_ports(services):
+    """Ports served before a command starts: by running processes, or registry services
+    already answering."""
+    held = {port for job in processes.jobs.values() if job.process.returncode is None for port in job.ports}
+    for service in services:
+        if service.get('port') and service['port'] not in held and await port_open(service['port'], timeout=.2):
+            held.add(service['port'])
+    return held
 
 
 async def declared_services():
@@ -114,7 +131,6 @@ def tag_job(job, service):
 async def register_observed(job, ports):
     """Record verified project services in the environment registry."""
     from app.collaboration.tools import active
-    from app.agents.tools._workspace import workspace_root
     from app.collaboration.environment import service_url
     ctx = active.get()
     if not ctx:
@@ -163,9 +179,25 @@ async def execute_command(command: str, arguments: list[str], cwd: str = '.',
     # may exit 7 (closed port) also succeeds when the port answers.
     expected = (0, *(code for code in ok_exit_codes or () if code != 0))
     if background:
-        target = await registry_service(name, ready_port)
+        services = await registry_services()
+        target = registry_service(services, name, ready_port)
         current = processes.service_job(None, name=target and target['name'], port=ready_port)
         replaced = None
+        if current is None and (restarting := processes.restarting(None, name=target and target['name'], port=ready_port)):
+            raise ToolFailure(f'Service {restarting.service or restarting.name} is being restarted from the project root '
+                              'by the platform and serves again within seconds.',
+                              'service_unavailable', 'service_restarting',
+                              'Do not start it yourself: check detect_environment again in a few seconds and use it '
+                              'once it is running.', 'after_service_ready')
+        if current is not None and keep_running and current.keep and not current.from_snapshot and scope() != str(workspace_root().resolve()):
+            # A copy in a task snapshot would replace what the project and the user run.
+            label = current.service or current.name
+            raise ToolFailure(f'Service {label} already runs from the project root (process {current.id}) with '
+                              'everything delivered so far; a copy from your task\'s snapshot must not replace it.',
+                              'service_unavailable', 'service_already_running',
+                              f'Use the running {label} as it is; after a delivery changes its files the platform '
+                              'restarts it there. To try changes your task has not delivered, register a new service '
+                              'and start your copy on its port.', 'after_state_change')
         if current is not None and keep_running:
             # Restarting a service (e.g. after changing its code) replaces the running one.
             await processes.stop(current)
@@ -191,6 +223,7 @@ async def execute_command(command: str, arguments: list[str], cwd: str = '.',
                               'and tell dependent tasks the new endpoint. Do not terminate unowned services.',
                               'after_state_change')
         declared = {port for port in argv_ports(argv) if not await port_open(port, timeout=.2)}
+        held = await held_ports(services)
         job = await processes.start(argv, cwd, timeout, name, network, reason, keep=keep_running)
         tag_job(job, target)
         if ready_port is not None:
@@ -205,7 +238,7 @@ async def execute_command(command: str, arguments: list[str], cwd: str = '.',
         if job.process.returncode is not None and (job.process.returncode not in expected or job.timed_out):
             message = f"Background process exited during startup with code {job.process.returncode}"
             return {**result, **command_failure(message, processes.logs(job, 0, 128 * 1024)['output'])}
-        served = await served_ports(job, declared, ready_port if ready else None)
+        served = await served_ports(job, declared, ready_port if ready else None, held)
         if served:
             result['ports'] = sorted(served)
             registered = await register_observed(job, served)

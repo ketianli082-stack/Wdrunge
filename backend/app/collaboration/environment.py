@@ -157,12 +157,19 @@ async def service_runtime(root, service) -> dict:
     job = processes.service_job(root, name=service['name'], port=service.get('port'))
     if job:
         return job.runtime()
+    if old := processes.restarting(root, name=service['name'], port=service.get('port')):
+        # Between the old copy stopping and the new one serving: not stopped.
+        return {'state': 'restarting', 'process_id': old.id, 'started_by': old.started_by,
+                'note': 'the platform is starting it again from the project root; it serves again within seconds'}
     if service.get('port') and await port_open(service['port'], timeout=.2):
         return {'state': 'listening', 'note': 'the port answers, but no team process serves it'}
     return {'state': 'stopped'}
 
 
 def runtime_label(runtime: dict) -> str:
+    if runtime['state'] == 'restarting':
+        return ('restarting: the platform is starting it again from the project root and it serves again '
+                'within seconds; no action needed, do not start it yourself')
     if runtime['state'] != 'running':
         return runtime['state']
     label = f"yes (process {runtime['process_id']}, started by {runtime.get('started_by') or 'a task'}"

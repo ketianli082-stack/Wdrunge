@@ -729,6 +729,13 @@ class Collaboration(GoalMixin, ConversationRuns, EnvironmentMixin, JournalMixin,
                     continue
                 if any([not await need_satisfied(self, c, project, need) for need in r.get('needs', [])]):
                     continue
+                # A delivered task's kept services move to the project root right after
+                # delivery; dependent work starts once they serve there, not midway.
+                from app.execution.processes import processes
+                root = (await self._project(c, project))['workspace_path']
+                if (any(processes.moving_for(root, d['id']) for d in deps)
+                        or any(processes.restarting(root, name=need['service']) for need in r.get('needs', []) if 'service' in need)):
+                    continue
                 if r['attempts'] >= 12:
                     r.update(state='failed', result='Request execution budget exhausted')
                     await self._put(c, 'request', project, r['id'], r)

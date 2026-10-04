@@ -4,7 +4,7 @@ type Service = {
   name: string; kind: string; port?: number; host?: string; base_url?: string; status?: string; source?: string;
   claimed?: boolean; owner?: string; note?: string; command?: { argv: string[]; cwd: string }; runtime?: Runtime;
 };
-type Runtime = { state: 'running' | 'listening' | 'stopped'; process_id?: string; kept?: boolean; started_by?: string; stale?: string[]; note?: string };
+type Runtime = { state: 'running' | 'restarting' | 'listening' | 'stopped'; process_id?: string; kept?: boolean; started_by?: string; stale?: string[]; note?: string };
 type ProjectCommand = { name: string; argv: string[]; cwd: string; status: string; purpose?: string };
 type Environment = { host: { os: string; userland: string }; reserved_ports: number[]; services: Service[]; commands: ProjectCommand[] };
 
@@ -14,6 +14,7 @@ const sourceLabel: Record<string, string> = { user: '用户', agent: '成员', m
 function runtimeLabel(runtime?: Runtime) {
   if (!runtime || runtime.state === 'stopped') return '未运行';
   if (runtime.state === 'listening') return '端口有响应（非团队启动）';
+  if (runtime.state === 'restarting') return '正在从项目根目录重启';
   return `运行中${runtime.started_by ? `（${runtime.started_by} 启动${runtime.kept ? '，任务结束后保留' : ''}）` : ''}`
     + (runtime.stale?.length ? ` · 代码已更新，需重启：${runtime.stale.slice(0, 3).join('、')}` : '');
 }

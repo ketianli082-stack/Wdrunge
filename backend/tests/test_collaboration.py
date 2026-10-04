@@ -788,3 +788,20 @@ def test_identical_browser_screenshots_share_one_file(tmp_path):
     assert named_by_content(first) == named_by_content(second)
     files = list(tmp_path.iterdir())
     assert len(files) == 1 and files[0].name.startswith('browser-') and len(files[0].stem) == len('browser-') + 16
+
+
+def test_dependents_start_once_delivered_services_serve_from_the_project_root(tmp_path, monkeypatch):
+    from app.execution.processes import processes
+    async def scenario():
+        store, s, p, workspace = await setup(tmp_path)
+        backend = await s.create_request(p, 'leader', 'backend', 'Build api', 'api')
+        assert (await s.claim())[2]['id'] == backend['id']
+        await s.transition(p, backend['id'], 'backend', 'review', 'api ready')
+        testing = await s.create_request(p, 'leader', 'testing', 'Verify', 'verify', dependencies=[backend['id']])
+        moving = {backend['id']}
+        monkeypatch.setattr(processes, 'moving_for', lambda root, request: request in moving)
+        assert await s.claim() is None
+        moving.clear()
+        assert (await s.claim())[2]['id'] == testing['id']
+        await store.close()
+    run(scenario())

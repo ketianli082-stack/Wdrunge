@@ -17,6 +17,9 @@ from app.agents.tools.validation import command_failure
 from app.execution.ports import port_open
 
 logger = logging.getLogger(__name__)
+# Dependent tasks wait at most this long for a kept service to move to the project root
+# (its restart is reviewed and may wait for the user).
+MOVE_WAIT = 120
 
 @dataclass
 class Job:
@@ -115,6 +118,10 @@ class Processes:
         self.jobs: dict[str, Job] = {}
         self.lock = asyncio.Lock()
         self.tasks: set[asyncio.Task] = set()
+        # Kept services the platform is moving to (or restarting at) the project root,
+        # by old process ID: (old job, monotonic start). The old copy stops before the
+        # new one serves; in between the service is restarting, not stopped.
+        self.moving: dict[str, tuple[Job, float]] = {}
 
     async def start(self, argv, cwd='.', timeout=120, name='command', network=False,
                     reason='', *, extra_reads=(), write_paths=None, browser=False, keep=False, before_spawn=None):
@@ -245,9 +252,30 @@ class Processes:
         return sorted(jobs, key=lambda job: job.started_at, reverse=True)
 
     def service_job(self, project, name=None, port=None):
-        """The running process serving a registry service, by name or port."""
-        return next((job for job in self.project_services(project)
-                     if (name and job.service == name) or (port and port in job.ports)), None)
+        """The running process serving a registry service: by name, else by port."""
+        jobs = self.project_services(project)
+        return (next((job for job in jobs if name and job.service == name), None)
+                or next((job for job in jobs if port and port in job.ports), None))
+
+    def restarting(self, project, name=None, port=None):
+        """The old process of a service the platform is starting again from the project
+        root and that has no serving successor yet, by name or port."""
+        project = str(Path(project).resolve()) if project else scope()
+        now = time.monotonic()
+        return next((job for job, since in self.moving.values() if job.scope == project and now - since < MOVE_WAIT
+                     and ((name and job.service == name) or (port and port in job.ports))), None)
+
+    def moving_for(self, project, request):
+        """Whether kept services a delivered task started are still on their way to the
+        project root: still running in its snapshot, or being restarted there. Tasks
+        depending on it start once they serve from the root."""
+        project = str(Path(project).resolve())
+        now = time.monotonic()
+        if any(job.scope == project and job.request == request and now - since < MOVE_WAIT
+               for job, since in self.moving.values()):
+            return True
+        return any(job.scope == project and job.request == request and job.keep and job.from_snapshot
+                   and job.relaunch is None and job.process.returncode is None for job in self.jobs.values())
 
     def keep_service(self, job, service=None):
         """Let a service outlive its task: lifetime extends to service_lifetime()."""
@@ -283,13 +311,23 @@ class Processes:
         """Start a running kept service again from the project root with the same
         command. A service started in a task snapshot only sees that snapshot; once the
         task's delivery is merged, colleagues and the user expect the project itself."""
-        root = Path(root).resolve()
+        self.moving.setdefault(job.id, (job, time.monotonic()))
+        try:
+            return await self._relaunch(job, Path(root).resolve())
+        finally:
+            self.moving.pop(job.id, None)
+
+    async def _relaunch(self, job, root):
         try:
             cwd = Path(job.cwd).resolve().relative_to(Path(job.workspace).resolve()).as_posix()
         except ValueError:
             job.relaunch = 'failed'
             return None
-        ports = sorted(job.ports)
+        # Only ports this process serves itself: one it merely connects to (a proxy's
+        # upstream) stays open and would hold up the restart.
+        others = {port for other in self.jobs.values() if other is not job and other.process.returncode is None
+                  for port in other.ports}
+        ports = sorted(job.ports - others)
         job.relaunch = 'pending'
 
         async def release():
@@ -313,24 +351,40 @@ class Processes:
             source_workspace.reset(tokens[1])
             active_workspace.reset(tokens[0])
         new.service, new.started_by, new.request, new.conversation = job.service, job.started_by, job.request, job.conversation
-        for port in ports:
-            await self.wait_ready(new, port, 60)
+        # Until it serves, colleagues see it being restarted rather than stopped.
+        new.relaunch = 'pending'
+        try:
+            for port in ports:
+                await self.wait_ready(new, port, 60)
+        finally:
+            new.relaunch = None
         return new
 
-    async def relaunch_delivered(self, workspace, root):
+    def relaunch_delivered(self, workspace, root):
         """Move the kept services a delivered task started in its snapshot to the
-        project root, where its delivery was just merged."""
+        project root, where its delivery was just merged. They count as moving from this
+        call on, before the returned coroutine runs, so dependent tasks wait for them."""
         workspace = str(Path(workspace).resolve())
         jobs = [job for job in self.jobs.values() if job.workspace == workspace and job.keep
                 and job.process.returncode is None and Path(job.workspace).resolve() != Path(root).resolve()]
-        relaunched = []
         for job in jobs:
+            job.relaunch = 'pending'
+            self.moving[job.id] = (job, time.monotonic())
+
+        async def move():
+            relaunched = []
             try:
-                if new := await self.relaunch(job, root):
-                    relaunched.append(new)
-            except Exception:
-                logger.warning('Could not restart kept service %s from the project root', job.service or job.name, exc_info=True)
-        return relaunched
+                for job in jobs:
+                    try:
+                        if new := await self.relaunch(job, root):
+                            relaunched.append(new)
+                    except Exception:
+                        logger.warning('Could not restart kept service %s from the project root', job.service or job.name, exc_info=True)
+            finally:
+                for job in jobs:
+                    self.moving.pop(job.id, None)
+            return relaunched
+        return move()
 
     def refresh_after_publish(self, project, workspace, paths):
         """A publish changed project files. Services that no longer match them are marked
