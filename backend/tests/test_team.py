@@ -6,9 +6,9 @@ from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, Tool
 from app.agents.base import AgentSpec
 from app.agents.team import Team
 from app.agents.worker import WorkerAgent
-from app.tools import _workspace
-from app.tools.current_utc_time import current_utc_time
-from app.tools.write_project_file import make_write_project_file
+from app.agents.tools import _workspace
+from app.agents.tools.current_utc_time import current_utc_time
+from app.agents.tools.write_project_file import make_write_project_file
 
 
 def run_team(team: Team):
@@ -27,7 +27,7 @@ def test_leader_exposes_delegation_as_optional_function_call(monkeypatch):
 
         def bind_tools(self, tools, tool_choice):
             assert tool_choice == "auto"
-            self.bound_tools = [tool.name for tool in tools]
+            self.bound_tools = [tool['function']['name'] for tool in tools]
             return self
 
         async def ainvoke(self, _messages):
@@ -36,7 +36,7 @@ def test_leader_exposes_delegation_as_optional_function_call(monkeypatch):
     fake = FakeModel()
     monkeypatch.setattr(leader, "model", lambda: fake)
     result = asyncio.run(leader.next_message([HumanMessage(content="你好")]))
-    assert fake.bound_tools == ["delegate_task", "delegate_tasks", "checkpoint_context"]
+    assert fake.bound_tools == ["delegate_tasks", "checkpoint_context", "recall_context"]
     assert result.content == "你好！"
 
 
@@ -56,17 +56,17 @@ def test_leader_can_answer_greeting_without_dispatch(monkeypatch):
 
 def test_reported_token_usage_updates_total_and_context_percentage(monkeypatch):
     team = Team()
-    team.leader.spec = AgentSpec(id="leader", name="Leader", prompt_file="leader.md", context_window=1000)
+    team.leader.spec = AgentSpec(id="leader", name="Leader", prompt_file="leader.md", context_window=100000)
 
     async def answer(_messages, *, allow_delegation=True):
-        return AIMessage(content="你好！", usage_metadata={"input_tokens": 250, "output_tokens": 25, "total_tokens": 275})
+        return AIMessage(content="你好！", usage_metadata={"input_tokens": 25000, "output_tokens": 25, "total_tokens": 25025})
 
     monkeypatch.setattr(team.leader, "next_message", answer)
     events = run_team(team)
     usage = [payload for event, payload in events if event == "usage"]
     assert len(usage) == 1
-    assert usage[0]["total_tokens"] == 275
-    assert usage[0]["agents"][0]["context_tokens"] == 250
+    assert usage[0]["total_tokens"] == 25025
+    assert usage[0]["agents"][0]["context_tokens"] == 25000
     assert usage[0]["agents"][0]["context_percent"] == 25.0
 
 
@@ -266,8 +266,8 @@ def test_worker_reports_model_usage_after_loop(monkeypatch):
 
     class FakeGraph:
         async def astream_events(self, _state, *, config, version):
-            yield {"event": "on_chat_model_end", "name": "model", "metadata": {"langgraph_node": "agent"},
-                   "data": {"output": AIMessage(content="done", usage_metadata={"input_tokens": 40, "output_tokens": 5, "total_tokens": 45})}}
+            yield {"event": "on_chain_end", "name": "agent", "metadata": {"langgraph_node": "agent"},
+                   "data": {"output": {"messages": [AIMessage(content="done", usage_metadata={"input_tokens": 40, "output_tokens": 5, "total_tokens": 45})]}}}
 
     monkeypatch.setattr(worker, "build_graph", lambda: FakeGraph())
 
@@ -279,6 +279,43 @@ def test_worker_reports_model_usage_after_loop(monkeypatch):
     assert worker.context_tokens == 40
 
 
+def test_worker_records_latency_annotated_after_the_model_call(monkeypatch):
+    worker = WorkerAgent(AgentSpec(id="backend", name="后端", prompt_file="backend.md"))
+    records = []
+
+    class Store:
+        async def record_agent_usage(self, agent, tokens, context, cached, **details):
+            records.append((agent, tokens, details.get("latency_ms"), details.get("retries")))
+
+        async def save_agent_session(self, *args):
+            pass
+
+        async def delete_agent_session(self, *args):
+            pass
+
+    worker._store = Store()
+    response = AIMessage(content="done", usage_metadata={"input_tokens": 40, "output_tokens": 5, "total_tokens": 45})
+
+    class FakeGraph:
+        async def astream_events(self, _state, *, config, version):
+            # The model's own end event fires before the retry wrapper annotates latency.
+            yield {"event": "on_chat_model_end", "name": "model", "metadata": {"langgraph_node": "agent"},
+                   "data": {"output": response}}
+            response.response_metadata.update(wdrunge_latency_ms=850, wdrunge_retries=1)
+            yield {"event": "on_chain_end", "name": "agent", "metadata": {"langgraph_node": "agent"},
+                   "data": {"output": {"messages": [response]}}}
+            yield {"event": "on_chain_end", "name": "agent", "metadata": {"langgraph_node": "agent"},
+                   "data": {"output": {"needs_clean": True}}}
+
+    monkeypatch.setattr(worker, "build_graph", lambda: FakeGraph())
+
+    async def collect():
+        return [event async for event in worker.stream("task", conversation_id="chat-1", context_mode="fresh", handoff="Goal")]
+
+    asyncio.run(collect())
+    assert records == [("backend", 45, 850, 1)]
+
+
 def test_worker_context_modes_keep_sessions_isolated(monkeypatch):
     worker = WorkerAgent(AgentSpec(id="product", name="产品", prompt_file="product.md"))
     calls = []
@@ -286,8 +323,8 @@ def test_worker_context_modes_keep_sessions_isolated(monkeypatch):
     class FakeGraph:
         async def astream_events(self, state, *, config, version):
             calls.append((state["messages"], config["configurable"]["thread_id"]))
-            yield {"event": "on_chat_model_end", "name": "model", "metadata": {"langgraph_node": "agent"},
-                   "data": {"output": AIMessage(content="done", usage_metadata={"input_tokens": 100, "output_tokens": 5, "total_tokens": 105})}}
+            yield {"event": "on_chain_end", "name": "agent", "metadata": {"langgraph_node": "agent"},
+                   "data": {"output": {"messages": [AIMessage(content="done", usage_metadata={"input_tokens": 100, "output_tokens": 5, "total_tokens": 105})]}}}
 
     monkeypatch.setattr(worker, "build_graph", lambda: FakeGraph())
 
@@ -312,15 +349,16 @@ def test_worker_context_modes_keep_sessions_isolated(monkeypatch):
     assert "first" not in str(calls[3][0])
 
 
-def test_auto_starts_fresh_at_sixty_percent_of_context_window():
+def test_auto_preserves_existing_session_for_layered_compaction():
     worker = WorkerAgent(AgentSpec(id="product", name="产品", prompt_file="product.md", context_window=100))
     assert worker.resolve_context_mode("chat-a", "auto") == "fresh"
     worker._threads["chat-a"] = "thread-a"
-    assert worker.resolve_context_mode("chat-a", "auto") == "fresh"
+    assert worker.resolve_context_mode("chat-a", "auto") == "continue"
     worker._context_by_session["chat-a"] = 59
     assert worker.resolve_context_mode("chat-a", "auto") == "continue"
     worker._context_by_session["chat-a"] = 60
-    assert worker.resolve_context_mode("chat-a", "auto") == "fresh"
+    assert worker.resolve_context_mode("chat-a", "auto") == "continue"
+    assert worker.resolve_context_mode("chat-a", "fresh") == "fresh"
     assert worker.resolve_context_mode("chat-a", "continue") == "continue"
 
 
@@ -329,6 +367,9 @@ def test_langgraph_checkpoint_resumes_messages_without_remote_model(monkeypatch)
     seen = []
 
     class FakeModel:
+        def bind_tools(self, tools):
+            return self
+
         async def ainvoke(self, messages):
             seen.append([message.content for message in messages])
             return AIMessage(content="local result")
@@ -424,8 +465,8 @@ def test_file_tool_stays_within_role_scope(tmp_path, monkeypatch):
 
 
 def test_selected_workspace_is_used_by_file_tools(tmp_path):
-    from app.tools.list_project_files import make_list_project_files
-    from app.tools.read_project_file import make_read_project_file
+    from app.agents.tools.list_project_files import make_list_project_files
+    from app.agents.tools.read_project_file import make_read_project_file
 
     token = _workspace.active_workspace.set(tmp_path)
     try:
@@ -468,3 +509,29 @@ def test_team_stream_scopes_each_conversation_to_its_workspace(tmp_path, monkeyp
     assert [path for path, _ in observed] == [first, second]
     assert all(str(path) in prompt for path, prompt in observed)
     assert _workspace.active_workspace.get() is None
+
+
+def test_worker_can_finish_beyond_default_graph_recursion_limit(monkeypatch):
+    from langchain_core.runnables import RunnableLambda
+    from app.agents.limits import graph_recursion_limit
+    monkeypatch.delenv('WDRUNGE_GRAPH_RECURSION_LIMIT', raising=False)
+    monkeypatch.setenv('WDRUNGE_READ_STREAK', '100')  # 30 clock reads would pause reads at 24
+    assert graph_recursion_limit() == 1000
+    calls = []
+    async def respond(messages):
+        calls.append(messages)
+        if len(calls) <= 30:
+            return AIMessage(content='', tool_calls=[{'name':'current_utc_time', 'args':{}, 'id':f'clock-{len(calls)}'}])
+        return AIMessage(content='Long task finished')
+    class Model:
+        def bind_tools(self, tools):
+            return RunnableLambda(respond)
+    worker = WorkerAgent(AgentSpec(id='testing', name='Test', prompt_file='testing.md', tools=(current_utc_time,)))
+    monkeypatch.setattr(worker, 'model', lambda: Model())
+    async def scenario():
+        return [e async for e in worker.stream('Long task', conversation_id='long', context_mode='fresh', handoff='')]
+    events = asyncio.run(scenario())
+    assert len(calls) == 31
+    assert sum(name == 'activity' and data['phase'] == 'completed' for name, data in events) == 30
+    monkeypatch.setenv('WDRUNGE_GRAPH_RECURSION_LIMIT', '7')
+    assert graph_recursion_limit() == 7

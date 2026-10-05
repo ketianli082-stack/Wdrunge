@@ -1,0 +1,1201 @@
+"""Durable project collaboration with short SQLite write transactions.
+
+Revision snapshots are the recovery journal. Files are materialized before events
+are published. A pending revision is never visible as a published document.
+"""
+from __future__ import annotations
+
+import asyncio
+import difflib
+import json
+import logging
+import os
+import tempfile
+import time
+from contextlib import asynccontextmanager
+from pathlib import Path
+from uuid import uuid4
+
+from sqlalchemy import text
+
+from app.collaboration.documents import digest, outline, section, edit_document, page
+from app.collaboration.schema import DDL
+from app.collaboration.payloads import TransitionPayload
+from app.collaboration.workspaces import MERGED_COPIES, merge_text, IsolatedWorkspace, unreferenced_screenshots, secret_leaks, unmerged_reason
+from app.storage import ChatStore, StorageConflictError, StorageNotFoundError, write_transaction
+
+ROLES = {'leader', 'product', 'backend', 'frontend', 'designer', 'testing'}
+TERMINAL = {'completed', 'cancelled', 'rejected', 'failed'}
+
+
+from app.collaboration.goals import GoalMixin, criteria_list, check_evidence
+
+
+from app.collaboration.runs import ConversationRuns
+
+
+from app.collaboration.environment import EnvironmentMixin
+from app.collaboration.journal import JournalMixin
+from app.collaboration.replies import ReplyMixin
+from app.collaboration.planning import (PlanningMixin, check_criteria_budget, check_deliverables, goal_scale,
+                                        need_satisfied, normalize_needs, project_relative, serial_dependency, still_draft)
+
+logger = logging.getLogger(__name__)
+
+
+class Collaboration(GoalMixin, ConversationRuns, EnvironmentMixin, JournalMixin, PlanningMixin, ReplyMixin):
+    def __init__(self, store: ChatStore):
+        self.store = store
+        self._lock = asyncio.Lock()
+        self._ready = False
+        # Migrations running after a merge, by (project, task): moving that task's
+        # services to the project root waits for them.
+        self.migrations: dict = {}
+        self.max_running = max(1, min(32, int(os.getenv('WDRUNGE_MAX_CONCURRENCY', '4'))))
+        self.role_concurrency = max(1, min(8, int(os.getenv('WDRUNGE_ROLE_CONCURRENCY', '2'))))
+
+    async def initialize(self):
+        if self._ready:
+            return
+        await self.store.initialize()
+        async with self._lock:
+            async with self.store.engine.begin() as c:
+                for sql in DDL:
+                    await c.execute(text(sql))
+            self._ready = True
+        await self.recover()
+        await self.rebuild_search()
+        async with self.transaction() as c:
+            await c.execute(text("UPDATE collaboration_records SET state='stopped', data=json_set(data,'$.state','stopped') WHERE kind='conversation_run' AND state='stopping'"))
+
+    @asynccontextmanager
+    async def transaction(self):
+        await self.initialize()
+        async with self._lock:
+            # Cancel-safe: a stopped task never leaves the write lock held (storage.complete).
+            async with write_transaction(self.store.engine, 'BEGIN IMMEDIATE') as c:
+                yield c
+
+    @asynccontextmanager
+    async def reading(self):
+        await self.initialize()
+        async with self.store.engine.connect() as c:
+            await c.exec_driver_sql('BEGIN')
+            try:
+                yield c
+            finally:
+                await c.rollback()
+
+    async def _project(self, c, project):
+        row = (await c.execute(text('SELECT * FROM projects WHERE id=:id'), {'id': project})).mappings().first()
+        if not row:
+            raise StorageNotFoundError('Project not found')
+        return dict(row)
+
+    async def project_for_conversation(self, conversation):
+        await self.initialize()
+        async with self.store.engine.connect() as c:
+            return await c.scalar(text('SELECT project_id FROM conversations WHERE id=:id'), {'id': conversation})
+
+    async def _conversation(self, c, project, conversation):
+        if conversation and not await c.scalar(text('SELECT id FROM conversations WHERE id=:id AND project_id=:p'), {'id': conversation, 'p': project}):
+            raise ValueError('Conversation does not belong to project')
+
+    @staticmethod
+    def _decode_record(kind, value):
+        record = json.loads(value)
+        # Older builds accepted object/list delivery results. Preserve their
+        # evidence as JSON text when loading, and persist it on the next update.
+        if kind == 'request' and not isinstance(record.get('result'), str):
+            result = record.get('result')
+            record['result'] = '' if result is None else json.dumps(result, ensure_ascii=False)
+        return record
+
+    async def _get(self, c, kind, project, identifier, required=True):
+        value = await c.scalar(text('SELECT data FROM collaboration_records WHERE kind=:k AND project=:p AND id=:i'), {'k': kind, 'p': project, 'i': identifier})
+        if value is None and required:
+            raise StorageNotFoundError(f'{kind} not found')
+        return self._decode_record(kind, value) if value else None
+
+    async def _put(self, c, kind, project, identifier, data):
+        await c.execute(text('''INSERT INTO collaboration_records(kind,project,id,data,state,owner,updated)
+          VALUES(:k,:p,:i,:d,:s,:o,:t) ON CONFLICT(kind,project,id) DO UPDATE SET
+          data=excluded.data,state=excluded.state,owner=excluded.owner,updated=excluded.updated'''),
+          dict(k=kind, p=project, i=identifier, d=json.dumps(data, ensure_ascii=False), s=data.get('state', ''), o=data.get('recipient', data.get('author', '')), t=time.time()))
+
+    async def _list(self, c, kind, project):
+        rows = await c.scalars(text('SELECT data FROM collaboration_records WHERE kind=:k AND project=:p ORDER BY updated,id'), {'k': kind, 'p': project})
+        return [self._decode_record(kind, r) for r in rows]
+
+    async def _event(self, c, project, recipient, data, conversation=''):
+        await c.execute(text('INSERT INTO collaboration_events(project,recipient,conversation,data,created) VALUES(:p,:r,:v,:d,:t)'), dict(p=project, r=recipient, v=conversation, d=json.dumps(data, ensure_ascii=False), t=time.time()))
+
+    @staticmethod
+    def _path(workspace, path):
+        root = Path(workspace).resolve()
+        rel = Path(path)
+        result = (root / rel).resolve()
+        if rel.is_absolute() or '..' in rel.parts or not result.is_relative_to(root) or any(part in {'.git', '.wdrunge-runs', '.aws', '.codex', '.agents'} for part in rel.parts):
+            raise ValueError('Path must stay inside the project workspace')
+        return result
+
+    @staticmethod
+    def _artifact_exists(target):
+        # Delegators often declare a directory such as "backend/".
+        return target.is_file() or target.is_dir() and any(item.is_file() for item in target.rglob('*'))
+
+    async def _dependencies(self, c, project, based_on):
+        for dependency in based_on:
+            doc = await self._get(c, 'document', project, dependency['document_id'])
+            if doc['version'] != dependency['version']:
+                raise StorageConflictError(f"Dependency changed: {doc['id']} is v{doc['version']}")
+
+    async def publish(self, project, author, changes, conversation=''):
+        """Validate all documents/dependencies, journal a batch, then publish together."""
+        if author not in ROLES or not isinstance(changes, list) or not changes or len(changes) > 20:
+            raise ValueError('Invalid author or batch size')
+        batch_id = uuid4().hex
+        async with self.transaction() as c:
+            p = await self._project(c, project)
+            await self._conversation(c, project, conversation)
+            if await self._list(c, 'pending', project):
+                raise StorageConflictError('An unfinished publication requires recovery')
+            revisions = []
+            seen = set()
+            paths = {d['path']: d['id'] for d in await self._list(c, 'document', project)}
+            for change in changes:
+                identifier = change.get('document_id') or uuid4().hex
+                if identifier in seen:
+                    raise ValueError(f'Several changes target document {identifier}; put all its edits in one change '
+                                     '(edits apply in order) with a single base_version')
+                seen.add(identifier)
+                current = await self._get(c, 'document', project, identifier, False)
+                version = current['version'] if current else 0
+                base_version = change.get('base_version', 0)
+                merging = base_version != version
+                if merging and (not change.get('allow_merge') or not current or change.get('external')):
+                    raise StorageConflictError(f'{identifier}: expected version {version}')
+                summary = change.get('summary', '').strip()
+                if not summary or len(summary) > 2000:
+                    raise ValueError('A nonempty change summary of at most 2000 characters is required')
+                await self._dependencies(c, project, change.get('based_on', []))
+                old = (await self._get(c, 'revision', project, f'{identifier}:{version}'))['content'] if current else ''
+                path = current['path'] if current else change['path']
+                target = self._path(p['workspace_path'], path)
+                path = str(target.relative_to(Path(p['workspace_path']).resolve()))
+                if target.suffix.lower() != '.md':
+                    raise ValueError('Managed documents must be Markdown files')
+                if path in paths and paths[path] != identifier:
+                    raise StorageConflictError('Path is already managed')
+                paths[path] = identifier
+                actual = target.read_text() if target.exists() else None
+                external = change.get('external', False)
+                if current and actual != old and not external:
+                    raise StorageConflictError('External file change detected; import it before editing')
+                if external:
+                    if actual is None:
+                        raise StorageConflictError('External file is missing')
+                    content = actual
+                elif current and change.get('content') is not None:
+                    # Nobody has written into a platform draft yet, so its author may replace
+                    # the placeholder outline wholesale; written documents change by edits.
+                    if merging or not await still_draft(self, c, project, current):
+                        raise ValueError(f'{path}: existing documents change with edits, not content; content replaces '
+                                         'a document only while it is still the unfilled platform draft')
+                    content = change['content']
+                elif current:
+                    if merging:
+                        base_revision = await self._get(c, 'revision', project, f'{identifier}:{base_version}')
+                        base_content = base_revision['content']
+                        # Automatic reconciliation is allowed only for unchanged
+                        # direct bodies of explicitly selected existing sections.
+                        for edit in change.get('edits', []):
+                            if edit['operation'] not in {'replace_text', 'replace_section_body'}:
+                                raise StorageConflictError('Structural edits require current document version')
+                            before = section(base_content, edit['section_id'])
+                            after = section(old, edit['section_id'])
+                            if base_content[before['start']:before['body_end']] != old[after['start']:after['body_end']]:
+                                raise StorageConflictError('The edited section changed concurrently')
+                        content = merge_text(base_content, old, edit_document(base_content, change.get('edits', [])))
+                    else:
+                        content = edit_document(old, change.get('edits', []))
+                else:
+                    content = change.get('content', actual or '')
+                    if actual is not None and actual != content:
+                        raise StorageConflictError('Existing file differs; import its current content first')
+                if len(content) > 500_000:
+                    raise ValueError('Document too large')
+                revision = dict(id=identifier, path=path, title=change.get('title', current['title'] if current else target.stem), version=version+1,
+                    content=content, hash=digest(content), outline=outline(content), summary=summary,
+                    author=author, conversation=conversation, based_on=change.get('based_on', []), batch_id=batch_id,
+                    created=time.time(), external=external, merged_from_version=base_version if merging else None,
+                    diff=''.join(difflib.unified_diff(old.splitlines(True), content.splitlines(True), fromfile=f'{path}@{version}', tofile=f'{path}@{version+1}')),
+                    previous_hash=digest(actual) if actual is not None else None)
+                revisions.append(revision)
+            await self._put(c, 'pending', project, batch_id, {'id': batch_id, 'revisions': revisions})
+        await self.recover(project)
+        async with self.transaction() as c:
+            if await self._get(c, 'pending', project, batch_id, False):
+                raise StorageConflictError('Publication blocked by an external file change; inspect pending batch')
+            # Publishing saves progress; dependents start on delivery or on this explicit mark.
+            for change, r in zip(changes, revisions):
+                if change.get('ready'):
+                    await self._put(c, 'ready', project, r['id'], {'version': r['version'], 'author': author, 'created': time.time()})
+        return [{'document_id': r['id'], 'version': r['version'], 'batch_id': batch_id} for r in revisions]
+
+    async def recover(self, project=None):
+        async with self.transaction() as c:
+            projects = [project] if project else list(await c.scalars(text("SELECT DISTINCT project FROM collaboration_records WHERE kind='pending'")))
+            for pid in projects:
+                p = await self._project(c, pid)
+                for pending in await self._list(c, 'pending', pid):
+                    targets = []
+                    for r in pending['revisions']:
+                        target = self._path(p['workspace_path'], r['path'])
+                        actual = digest(target.read_text()) if target.exists() else None
+                        if actual not in {r['previous_hash'], r['hash']}:
+                            break
+                        targets.append((target, r))
+                    else:
+                        for target, r in targets:
+                            target.parent.mkdir(parents=True, exist_ok=True)
+                            fd, temp = tempfile.mkstemp(dir=target.parent, prefix='.collab-')
+                            try:
+                                with os.fdopen(fd, 'w') as f:
+                                    f.write(r['content'])
+                                    f.flush()
+                                    os.fsync(f.fileno())
+                                os.replace(temp, target)
+                            finally:
+                                if os.path.exists(temp):
+                                    os.unlink(temp)
+                            await self._put(c, 'revision', pid, f"{r['id']}:{r['version']}", r)
+                            await self._index_sections(c, pid, r)
+                            await self._put(c, 'document', pid, r['id'], {k: r[k] for k in ('id', 'path', 'title', 'version', 'hash', 'author', 'created')})
+                        for r in pending['revisions']:
+                            previous = await self._get(c, 'revision', pid, f"{r['id']}:{r['version']-1}", False)
+                            old_sections = {s['id']: previous['content'][s['start']:s['body_end']] for s in previous['outline']} if previous else {}
+                            new_sections = {s['id']: r['content'][s['start']:s['body_end']] for s in r['outline']}
+                            changed = [key for key in old_sections.keys() | new_sections.keys() if old_sections.get(key) != new_sections.get(key)]
+                            notified = set()
+                            for sub in await self._list(c, 'subscription', pid):
+                                if sub['document_id'] == r['id'] and sub.get('section_id'):
+                                    selected = next((h for h in r['outline'] if h['id'] == sub['section_id']), None)
+                                    ambiguous = selected is None or sum(h['title'] == selected['title'] and h['parent'] == selected['parent'] for h in r['outline']) != 1
+                                    if ambiguous:
+                                        sub['needs_review'] = True
+                                        await self._put(c, 'subscription', pid, f"{sub['member']}:{r['id']}:{sub['section_id']}", sub)
+                                        await self._event(c, pid, sub['member'], {'type': 'subscription_structure_changed', 'document_id': r['id'], 'section_id': sub['section_id'], 'hint': 'Read the new outline and resubscribe; whole-document reminders remain enabled.'})
+                                if sub['document_id'] == r['id'] and (not sub.get('section_id') or sub.get('needs_review') or sub['section_id'] in changed) and sub['member'] not in notified:
+                                    notified.add(sub['member'])
+                                    await self._event(c, pid, sub['member'], {'type': 'document_changed', 'document_id': r['id'], 'version': r['version'], 'summary': r['summary'], 'batch_id': r['batch_id'], 'changed_sections': changed})
+                        changed_versions = {r['id']: r['version'] for r in pending['revisions']}
+                        for request in await self._list(c, 'request', pid):
+                            affected = [ref for ref in request['based_on'] if ref['document_id'] in changed_versions and ref['version'] != changed_versions[ref['document_id']]]
+                            if affected and request['state'] not in TERMINAL:
+                                request['needs_review'] = True
+                                await self._put(c, 'request', pid, request['id'], request)
+                                for member in {request['sender'], request['recipient']}:
+                                    await self._event(c, pid, member, {'type': 'request_basis_changed', 'request_id': request['id'], 'dependencies': affected}, request['conversation'])
+                        await c.execute(text("DELETE FROM collaboration_records WHERE kind='pending' AND project=:p AND id=:i"), {'p': pid, 'i': pending['id']})
+
+    async def catalog(self, project):
+        async with self.reading() as c:
+            p = await self._project(c, project)
+            docs = await self._list(c, 'document', project)
+            for d in docs:
+                path = self._path(p['workspace_path'], d['path'])
+                d['external_change'] = not path.exists() or digest(path.read_text()) != d['hash']
+            return docs
+
+    async def read(self, project, document_id, version=None, section_id=None, offset=0, limit=6000, whole=False):
+        if offset < 0 or not 1 <= limit <= 12000:
+            raise ValueError('Invalid read window')
+        async with self.reading() as c:
+            doc = await self._get(c, 'document', project, document_id)
+            r = await self._get(c, 'revision', project, f"{document_id}:{version or doc['version']}")
+            if whole:
+                # The full text in one call (paged), with section IDs for later edits.
+                content, next_offset, fragment = page(r['content'], offset, limit)
+                return {'document_id': document_id, 'version': r['version'], 'path': doc.get('path'),
+                        'outline': [{'id': h['id'], 'title': h['title'], 'level': h['level']} for h in r['outline'][:100]] if offset == 0 else [],
+                        'content': content, 'next_offset': next_offset, 'fragment': fragment}
+            if section_id is None:
+                return {'document_id': document_id, 'version': r['version'], 'outline': r['outline'][offset:offset+min(limit,100)], 'next_offset': offset+min(limit,100) if len(r['outline']) > offset+min(limit,100) else None}
+            try:
+                s = section(r['content'], section_id)
+            except ValueError as exc:
+                raise ValueError(f"Document {document_id} v{r['version']}: {exc}") from exc
+            body = r['content'][s['body_start']:s['body_end']]
+            content, next_offset, fragment = page(body, offset, limit)
+            return {'document_id': document_id, 'version': r['version'], 'section': s, 'content': content, 'next_offset': next_offset, 'fragment': fragment}
+
+
+    async def subscribe(self, project, member, document_id, enabled=True, section_id=None):
+        if member not in ROLES:
+            raise ValueError('Unknown member')
+        async with self.transaction() as c:
+            await self._get(c, 'document', project, document_id)
+            key = f'{member}:{document_id}:{section_id or "*"}'
+            if section_id:
+                doc = await self._get(c, 'document', project, document_id)
+                revision = await self._get(c, 'revision', project, f"{document_id}:{doc['version']}")
+                selected = section(revision['content'], section_id)
+                if sum(h['title'] == selected['title'] and h['parent'] == selected['parent'] for h in revision['outline']) != 1:
+                    raise ValueError('Section subscription requires a unique sibling heading')
+            if enabled:
+                await self._put(c, 'subscription', project, key, dict(member=member, document_id=document_id, section_id=section_id))
+            else:
+                await c.execute(text("DELETE FROM collaboration_records WHERE kind='subscription' AND project=:p AND id=:i"), dict(p=project, i=key))
+        return {'subscribed': enabled}
+
+    @staticmethod
+    def _summary(summary, fallback):
+        if summary is None:
+            return fallback
+        if not isinstance(summary, str):
+            raise ValueError('Public summary must be text')
+        value = ' '.join(summary.split())
+        if not value or len(value) > 160:
+            raise ValueError('Public summary must be 1..160 characters; keep full details in content/result')
+        return value
+
+    async def _group_message(self, c, project, conversation, sender, recipient, summary, key):
+        if not conversation:
+            return None
+        from app.agents.identity import member_name
+        identifier = digest(f'{project}:{key}')
+        # Models often repeat the mention themselves; the bubble adds it once.
+        summary = summary.removeprefix(f'@{member_name(recipient)}').strip() or summary
+        await self.store.add_chat_message_in_transaction(c, conversation, {
+            'id': identifier, 'sender': sender,
+            'content': f'@{member_name(recipient)} {summary}',
+            'mentions': [{'worker': recipient, 'name': member_name(recipient), 'summary': summary}],
+        })
+        return identifier
+
+    async def send(self, project, sender, recipient, content, key, conversation='', reply_to=None, request_id=None, summary=None, wake=True):
+        """wake=False (messages sent from a reply turn) never wakes an idle recipient,
+        so two members cannot keep waking each other."""
+        if not key or len(key) > 160 or sender not in ROLES or recipient not in ROLES or not content.strip() or len(content) > 4000:
+            raise ValueError('Invalid message')
+        summary = self._summary(summary, '有一条协作消息，请查看详细记录。')
+        async with self.transaction() as c:
+            await self._project(c, project)
+            await self._conversation(c, project, conversation)
+            if reply_to:
+                await self._get(c, 'message', project, reply_to)
+            if request_id:
+                request = await self._get(c, 'request', project, request_id)
+                if request['recipient'] != recipient or request['conversation'] != conversation:
+                    raise ValueError('Message request target must match recipient and conversation')
+            identifier = f'{sender}:{key}'
+            message = dict(id=identifier, sender=sender, recipient=recipient, content=content, conversation=conversation, reply_to=reply_to, target_request=request_id, summary=summary)
+            if not wake:
+                message['no_wake'] = True
+            old = await self._get(c, 'message', project, identifier, False)
+            if old:
+                old.setdefault('summary', '有一条协作消息，请查看详细记录。')
+            if old and {k: v for k, v in old.items() if k != 'chat_message_id'} != message:
+                raise StorageConflictError('Idempotency key was used for different message')
+            if not old:
+                message['chat_message_id'] = await self._group_message(c, project, conversation, sender, recipient, summary, 'message:'+identifier)
+                await self._put(c, 'message', project, identifier, message)
+                await self._event(c, project, recipient, {'type': 'message', **message}, conversation)
+            return {**(old or message), **await self.delivery(c, project, conversation, recipient, wake)}
+
+    async def inbox(self, project, member, context, conversation='', limit=6000, request=None, reply_turn=False):
+        """Unread events for this context. Receipts are per context, so a fresh task
+        context sees what earlier contexts read; a reply turn instead sees only
+        messages no context of this member has read."""
+        async with self.reading() as c:
+            rows = (await c.execute(text('''SELECT e.seq,e.data FROM collaboration_events e
+              LEFT JOIN collaboration_receipts r ON r.project=e.project AND r.context=:ctx AND r.seq=e.seq
+              WHERE e.project=:p AND e.recipient=:m AND (e.conversation='' OR e.conversation=:v)
+              AND (json_extract(e.data,'$.target_request') IS NULL OR json_extract(e.data,'$.target_request')=:request)
+              AND r.seq IS NULL
+              AND (:reply=0 OR (json_extract(e.data,'$.type')='message' AND NOT EXISTS (
+                SELECT 1 FROM collaboration_receipts o WHERE o.project=e.project AND o.seq=e.seq AND o.context LIKE :member_contexts)))
+              AND (COALESCE(json_extract(e.data,'$.type'),'') != 'goal_reminder' OR EXISTS (
+                SELECT 1 FROM collaboration_records g WHERE g.kind='goal' AND g.project=e.project
+                AND g.id=json_extract(e.data,'$.goal_id') AND g.state='active'
+                AND COALESCE(json_extract(g.data,'$.reminder_epoch'),0)=COALESCE(json_extract(e.data,'$.goal_epoch'),0)))
+              ORDER BY e.seq LIMIT 200'''), dict(ctx=f'{member}:{context}', p=project, m=member, v=conversation, request=request,
+                                                 reply=int(reply_turn), member_contexts=f'{member}:%'))).mappings().all()
+            items = []
+            size = 0
+            for row in rows:
+                item = {'event_id': row['seq'], **json.loads(row['data'])}
+                if request and item.get('type') == 'request' and item.get('request_id') == request and 'goal' in item:
+                    # The executing task's goal is already the Assigned task message.
+                    item['goal'] = '(your current assigned task; see the Assigned task message)'
+                original_length = len(json.dumps(item, ensure_ascii=False))
+                if original_length > limit//2:
+                    for field in ('content','summary','goal','result','detail'):
+                        if isinstance(item.get(field), str) and len(item[field]) > 600:
+                            item[field] = item[field][:600]
+                            item['preview_only'] = True
+                    if len(item.get('changed_sections', [])) > 20:
+                        item['changed_section_count'] = len(item['changed_sections'])
+                        item['changed_sections'] = item['changed_sections'][:20]
+                        item['preview_only'] = True
+                length = len(json.dumps(item, ensure_ascii=False)) + 180
+                if size + length > limit:
+                    break
+                items.append(item)
+                size += length
+            groups = {}
+            result = []
+            for item in items:
+                key = item.get('document_id') if item.get('type') == 'document_changed' else None
+                if key and key in groups:
+                    group = groups[key]
+                    group['event_ids'].append(item['event_id'])
+                    group['versions'].append(item['version'])
+                    group['changes'].append({'version': item['version'], 'summary': item['summary'], 'changed_sections': item.get('changed_sections', [])})
+                elif key:
+                    group = dict(type='document_changes', document_id=key, event_ids=[item['event_id']], versions=[item['version']], changes=[{'version': item['version'], 'summary': item['summary'], 'changed_sections': item.get('changed_sections', [])}])
+                    groups[key] = group
+                    result.append(group)
+                else:
+                    result.append(item)
+            return result
+
+    async def acknowledge(self, project, member, context, event_ids):
+        async with self.transaction() as c:
+            for identifier in event_ids:
+                await c.execute(text('''INSERT OR IGNORE INTO collaboration_receipts(project,context,seq)
+                  SELECT project,:ctx,seq FROM collaboration_events WHERE project=:p AND recipient=:m AND seq=:s'''), dict(ctx=f'{member}:{context}', p=project, m=member, s=identifier))
+                event = (await c.execute(text('SELECT conversation,data FROM collaboration_events WHERE project=:p AND recipient=:m AND seq=:s'), {'p': project, 'm': member, 's': identifier})).mappings().first()
+                if event:
+                    payload = json.loads(event['data'])
+                    if event['conversation'] and payload.get('chat_message_id'):
+                        await self.store.add_receipt_in_transaction(c, event['conversation'], {'message_id': payload['chat_message_id'], 'reader': member})
+
+
+    async def create_request(self, project, sender, recipient, goal, key, conversation='', based_on=None, dependencies=None, artifacts=None, parent=None, priority=1, deadline=None, summary=None, origin_message=None, goal_id=None, acceptance_criteria=None,
+                             documents=None, services=None, needs=None, serial_reason=None, verification=None):
+        summary = self._summary(summary, '请协作完成这项任务，详见任务记录。')
+        if not key or len(key) > 160:
+            raise ValueError('A bounded idempotency key is required')
+        if priority not in range(4) or (deadline is not None and deadline <= 0):
+            raise ValueError('Priority must be 0..3 and deadline a positive Unix timestamp')
+        if sender not in ROLES or recipient not in ROLES - {'leader'} or not goal.strip() or len(goal) > 8000:
+            raise ValueError('Invalid request')
+        for name in services or ():
+            if await self.connected_service(project, name):
+                raise ValueError(f'{name} is a service the platform connects for this project (environment.connected): it is '
+                                 'already running and reaches every command through environment variables, so no task '
+                                 'delivers it. Remove it from services; tasks that use it need no needs entry either.')
+        async with self.transaction() as c:
+            # Assignees work in a snapshot of the project: an absolute project path in
+            # the task would send them outside it, so task text names paths relative to it.
+            root = (await self._project(c, project))['workspace_path']
+            goal = project_relative(goal, root)
+            if isinstance(acceptance_criteria, list):
+                acceptance_criteria = [project_relative(item, root) for item in acceptance_criteria]
+            await self._conversation(c, project, conversation)
+            control = await self._get(c, 'conversation_run', project, conversation, False)
+            if control and control['state'] != 'active':
+                raise StorageConflictError('当前对话已停止，发送新消息后继续')
+            identifier = f'{sender}:{key}'
+            spec = dict(sender=sender, recipient=recipient, goal=goal, conversation=conversation, based_on=based_on or [], dependencies=dependencies or [], artifacts=artifacts or [], parent=parent, priority=priority, deadline=deadline, summary=summary)
+            # Typed deliverables and deliverable-level dependencies (only stored when used).
+            spec['artifacts'] = check_deliverables(spec['artifacts'], documents or [], services or [])
+            extra = {'documents': list(documents or []), 'services': list(services or []), 'needs': normalize_needs(needs),
+                     'serial_reason': (serial_reason or '').strip()[:500], 'verification': verification}
+            if verification not in (None, 'self', 'end_to_end'):
+                raise ValueError("verification must be 'self' or 'end_to_end'")
+            spec.update({k: v for k, v in extra.items() if v})
+            if parent:
+                parent_request = await self._get(c, 'request', project, parent)
+                if parent_request.get('goal_id'):
+                    if goal_id and goal_id != parent_request['goal_id']:
+                        raise ValueError('Child task must belong to the same goal')
+                    goal_id = parent_request['goal_id']
+                    acceptance_criteria = acceptance_criteria or [goal[:300]]
+            if goal_id:
+                linked_goal = await self._goal_in_conversation(c, project, goal_id, conversation)
+                criteria_list(acceptance_criteria)
+                check_criteria_budget(acceptance_criteria, goal_scale(linked_goal), 'task')
+                spec.update(goal_id=goal_id, acceptance_criteria=acceptance_criteria)
+                if verification == 'end_to_end' and any(
+                        r.get('goal_id') == goal_id and r.get('verification') == 'end_to_end' and r['state'] not in {'cancelled', 'rejected'}
+                        and r['id'] != f'{sender}:{key}' for r in await self._list(c, 'request', project)):
+                    raise ValueError('This goal already has an end-to-end verification task; give each check one owner')
+                # A service has one delivering task; others depend on it through needs.
+                for other in await self._list(c, 'request', project):
+                    shared = set(spec.get('services', [])) & set(other.get('services') or [])
+                    if (shared and other.get('goal_id') == goal_id and other['id'] != identifier
+                            and other['state'] not in {'cancelled', 'rejected'}):
+                        name = sorted(shared)[0]
+                        raise ValueError(f"Service {name} is already delivered by task {other['id']}; declare services only on "
+                                         f"the delivering task and use needs=[{{service: '{name}'}}] in tasks that use it")
+                for dep in spec['dependencies']:
+                    if (await self._get(c, 'request', project, dep)).get('goal_id') != goal_id:
+                        raise ValueError('Task dependencies must belong to the same goal')
+            old = await self._get(c, 'request', project, identifier, False)
+            if old:
+                if old['spec'] != spec:
+                    raise StorageConflictError('Idempotency key was used for another request')
+                return old
+            if goal_id and linked_goal['state'] != 'active':
+                raise ValueError('Tasks require an active goal')
+            await self._dependencies(c, project, spec['based_on'])
+            serial_dependency(recipient, [await self._get(c, 'request', project, dependency) for dependency in spec['dependencies']], serial_reason)
+            if parent:
+                await self._get(c, 'request', project, parent)
+            requests = await self._list(c, 'request', project)
+            if sum(r['state'] not in TERMINAL for r in requests) >= 50 or (parent and sum(r['spec']['parent'] == parent for r in requests) >= 12):
+                raise ValueError('Outstanding request budget reached')
+            project_info = await self._project(c, project)
+            for path in [*spec['artifacts'], *spec.get('documents', [])]:
+                self._path(project_info['workspace_path'], path)
+            request = dict(id=identifier, **spec, spec=spec, state='queued', created=time.time(), attempts=0, result='', delivered=[], needs_review=False)
+            if origin_message:
+                if not await c.scalar(text('SELECT 1 FROM messages WHERE id=:i AND conversation_id=:c'), {'i': origin_message, 'c': conversation}):
+                    raise ValueError('Origin message must belong to the request conversation')
+                request['origin_message'] = origin_message
+            else:
+                request['origin_message'] = await self._group_message(c, project, conversation, sender, recipient, summary, 'request:'+identifier)
+            await self._put(c, 'request', project, identifier, request)
+            await self._event(c, project, recipient, {'type': 'request', 'request_id': identifier, 'goal': goal[:1000], 'target_request': identifier}, conversation)
+            return request
+
+    async def wait_for(self, project, identifier, dependencies, actor):
+        async with self.transaction() as c:
+            request = await self._get(c, 'request', project, identifier)
+            if actor != request['recipient'] or request['state'] != 'running':
+                raise ValueError('Only the running recipient may suspend a request')
+            all_requests = {r['id']: r for r in await self._list(c, 'request', project)}
+            for dep in dependencies:
+                if dep not in all_requests:
+                    raise ValueError('Unknown dependency')
+                if request.get('goal_id') and all_requests[dep].get('goal_id') != request['goal_id']:
+                    raise ValueError('Task dependencies must belong to the same goal')
+                todo, seen = [dep], set()
+                while todo:
+                    node = todo.pop()
+                    if node == identifier:
+                        raise StorageConflictError('Dependency cycle detected')
+                    if node not in seen:
+                        seen.add(node)
+                        todo.extend(all_requests[node]['dependencies'])
+            request.update(dependencies=sorted(set(request['dependencies'] + dependencies)), state='blocked')
+            await self._put(c, 'request', project, identifier, request)
+            return request
+
+    async def transition(self, project, identifier, actor, state, result='', artifacts=None, based_on=None, summary=None, evidence=None, expected_instance=None):
+        TransitionPayload.model_validate(dict(identifier=identifier, state=state, result=result, artifacts=artifacts, based_on=based_on, summary=summary, evidence=evidence))
+        public_summary = self._summary(summary, {'review': '已提交交付，请验收。', 'completed': '验收通过，可以继续后续工作。', 'queued': '请继续处理原任务并重新交付。', 'failed': '任务执行失败，需要处理后重试。', 'blocked': '当前任务等待依赖或问题处理。', 'cancelled': '这项任务已取消。', 'rejected': '暂不执行这项任务。'}.get(state, '任务状态已更新。'))
+        async with self.transaction() as c:
+            p = await self._project(c, project)
+            r = await self._get(c, 'request', project, identifier)
+            if r.get('paused_on_restart') and state != 'cancelled':
+                raise StorageConflictError('任务已在重启后挂起，请先点击继续任务')
+            if expected_instance and (r['state'] != 'running' or r.get('instance_id') != expected_instance or r.get('lease_until', 0) <= time.time()):
+                raise StorageConflictError('Execution lease no longer belongs to this task instance')
+            if r.get('goal_id'):
+                linked_goal = await self._get(c, 'goal', project, r['goal_id'])
+                if state == 'completed':
+                    check_evidence(r['acceptance_criteria'], evidence)
+                    if r['state'] == 'completed' and r.get('evidence') == evidence and actor in {r['sender'], 'leader'}:
+                        return r
+                    r['evidence'] = evidence
+                if linked_goal['state'] != 'active' and state != 'cancelled':
+                    raise StorageConflictError('Resume the goal before updating its tasks')
+            allowed = {'running': {'review', 'blocked', 'failed', 'cancelled'}, 'queued': {'cancelled', 'rejected'}, 'blocked': {'queued', 'cancelled'}, 'review': {'completed', 'queued', 'cancelled'}, 'failed': {'queued', 'cancelled'}}
+            if state not in allowed.get(r['state'], set()):
+                raise StorageConflictError(f"Cannot move {r['state']} to {state}")
+            if actor not in {r['sender'], r['recipient'], 'leader'} or (state == 'completed' and actor not in {r['sender'], 'leader'}):
+                raise ValueError('Actor cannot make this transition')
+            if r['state'] == 'failed' and actor not in {r['sender'], 'leader'}:
+                raise ValueError('Only sender or Leader may retry a failed request')
+            if r['state'] == 'review' and state == 'queued':
+                # Rework continues the assignee's own context with the feedback.
+                r.update(resume=True, rework=(result or 'Rework requested; inspect the review feedback.')[:2000])
+            if r['state'] == 'failed' and state == 'queued':
+                r['attempts'] = 0
+                if r.pop('resumable', False):
+                    # The runtime failed, not the work: continue the saved context. Once only:
+                    # a resumed attempt that fails again starts fresh (see Scheduler.execute).
+                    r.update(resume=True, resume_after_failure=True,
+                             interrupted_reason=f"the previous attempt failed: {(r.get('result') or '')[:300]}")
+            if based_on is not None:
+                await self._dependencies(c, project, based_on)
+                r['based_on'] = based_on
+            if state in {'review', 'completed'}:
+                await self._dependencies(c, project, r['based_on'])
+                if not (result or r['result']).strip():
+                    raise ValueError('A delivery summary is required')
+                if state == 'review':
+                    await self._check_typed_deliverables(c, project, r)
+                delivered = artifacts if artifacts is not None else r['delivered']
+                for path in set(delivered + r['artifacts']):
+                    if not self._artifact_exists(self._path(p['workspace_path'], path)):
+                        raise ValueError(f'Artifact does not exist in the project after merging your task workspace: {path} '
+                                         '(a directory needs at least one file)')
+                if any(d['state'] != 'completed' for d in [await self._get(c, 'request', project, dep) for dep in r['dependencies']]):
+                    raise StorageConflictError('Dependencies are not completed')
+                r['delivered'] = delivered
+            r.update(state=state, result=result or r['result'], needs_review=False)
+            if state == 'queued':
+                r.pop('blocked_reason', None)
+            if state == 'cancelled':
+                await self._cancel_dependents(c, project, identifier)
+            await self._put(c, 'request', project, identifier, r)
+            recipient = r['recipient'] if actor != r['recipient'] else r['sender']
+            chat_message_id = await self._group_message(c, project, r['conversation'], actor, recipient, public_summary, f'transition:{identifier}:{uuid4().hex}')
+            status_event = {'type': 'request_status', 'request_id': identifier, 'state': state, 'result': r['result'][:1200], 'target_request': r.get('parent'), 'chat_message_id': chat_message_id if recipient == r['sender'] else None}
+            if state == 'review' and r.get('findings'):
+                from app.collaboration.delivery_checks import findings_summary
+                status_event['findings'] = findings_summary(r['findings'])[:1200]
+            await self._event(c, project, r['sender'], status_event, r['conversation'])
+            if state == 'completed' and r.get('origin_message') and r['conversation']:
+                await self.store.add_reaction_in_transaction(c, r['conversation'], {'message_id': r['origin_message'], 'worker': r['recipient'], 'reaction': 'done'})
+            return r
+
+    async def requeue_interrupted(self, project, identifier, instance_id, reason, limit=2):
+        """Requeue an execution that a transient provider failure interrupted, to resume
+        its saved context. Returns False when the automatic resume budget is used up."""
+        async with self.transaction() as c:
+            r = await self._get(c, 'request', project, identifier)
+            if r['state'] != 'running' or r.get('instance_id') != instance_id or r.get('auto_resumes', 0) >= limit:
+                return False
+            r.update(state='queued', resume=True, auto_resumes=r.get('auto_resumes', 0) + 1, interrupted_reason=reason[:500],
+                     lease_owner=None, lease_until=0, instance_id=None)
+            await self._put(c, 'request', project, identifier, r)
+            return True
+
+    async def _check_typed_deliverables(self, c, project, r):
+        published = {d.get('path'): d for d in await self._list(c, 'document', project)}
+        missing = [path for path in r.get('documents', []) if path not in published]
+        if missing:
+            raise ValueError(f'Declared documents are not published: {missing}. Publish them with collaboration_publish '
+                             '(base_version 0 for a new document) before delivering.')
+        from app.collaboration.planning import still_draft
+        unfilled = [path for path in r.get('documents', []) if await still_draft(self, c, project, published[path])]
+        if unfilled:
+            raise ValueError(f'Declared documents are still the platform drafts: {unfilled}. Fill their sections with '
+                             'collaboration_publish edits before delivering.')
+        from app.execution.processes import processes
+        root = (await self._project(c, project))['workspace_path'] if r.get('services') else None
+        for name in r.get('services', []):
+            record = await self._get(c, 'service', project, name, False)
+            if not record or record.get('status') != 'verified':
+                raise ValueError(f'Declared service {name!r} is not verified. Register it with collaboration_register_service '
+                                 'and start it with execute_command(background=true, ready_port=<its port>) so the platform '
+                                 'observes it serving before delivering.')
+            # Declared services are delivered running (and kept after the task); a past
+            # verification of a process that has since stopped does not count.
+            if not processes.service_job(root, name=name, port=record.get('port')):
+                raise ValueError(f'Declared service {name!r} is not running. Start it with execute_command(background=true, '
+                                 f'ready_port={record.get("port")}) and deliver while it serves; it stays running after '
+                                 'your task for colleagues and the user.')
+
+    async def set_findings(self, project, identifier, findings):
+        async with self.transaction() as c:
+            r = await self._get(c, 'request', project, identifier)
+            r['findings'] = findings
+            await self._put(c, 'request', project, identifier, r)
+
+    async def mark_resumable(self, project, identifier):
+        """A runtime failure ended this run: a retry continues its saved context."""
+        async with self.transaction() as c:
+            r = await self._get(c, 'request', project, identifier)
+            r['resumable'] = True
+            await self._put(c, 'request', project, identifier, r)
+
+    async def get_request(self, project, identifier):
+        async with self.reading() as c:
+            return await self._get(c, 'request', project, identifier)
+
+    async def declared_services(self, project):
+        """Services some live task of the project delivers (declared in its services)."""
+        async with self.reading() as c:
+            return {name for r in await self._list(c, 'request', project)
+                    if r['state'] not in {'cancelled', 'rejected', 'failed'} for name in r.get('services') or ()}
+
+    async def snapshot(self, project):
+        async with self.reading() as c:
+            await self._project(c, project)
+            result = {kind: await self._list(c, kind, project) for kind in ('document', 'subscription', 'message', 'request', 'pending', 'decision', 'handoff', 'settings', 'goal')}
+            result['journal'] = [{'request': j['request'], **self.journal_summary(j, notes=8)}
+                                 for j in await self._list(c, 'journal', project)]
+            return result
+
+    async def claim(self, owner="local"):
+        await self.recover_requests()
+        async with self.transaction() as c:
+            rows = (await c.execute(text("SELECT project,data FROM collaboration_records WHERE kind='request' AND state IN ('queued','blocked','running') ORDER BY updated"))).mappings().all()
+            from collections import Counter
+            busy = Counter((row['project'], json.loads(row['data'])['recipient']) for row in rows if json.loads(row['data'])['state'] == 'running')
+            if sum(busy.values()) >= self.max_running:
+                return None
+            rows = sorted(rows, key=lambda row: (-json.loads(row['data']).get('priority', 1), json.loads(row['data'])['created']))
+            for row in rows:
+                project, r = row['project'], json.loads(row['data'])
+                control = await self._get(c, 'conversation_run', project, r['conversation'], False)
+                if control and control['state'] != 'active':
+                    continue
+                paused = await self._get(c, 'settings', project, 'project', False)
+                if paused and paused.get('paused'):
+                    continue
+                if r.get('goal_id') and (await self._get(c, 'goal', project, r['goal_id']))['state'] != 'active':
+                    continue
+                if r.get('paused_on_restart') or r.get('blocked_reason') in {'merge_conflict', 'basis_changed'}:
+                    continue
+                if r['state'] == 'running' or busy[(project, r['recipient'])] >= self.role_concurrency:
+                    continue
+                deps = [await self._get(c, 'request', project, d) for d in r['dependencies']]
+                if any(d['state'] in {'cancelled', 'rejected', 'failed'} for d in deps):
+                    if r.get('blocked_reason') != 'dependency_failed':
+                        r.update(state='blocked', blocked_reason='dependency_failed')
+                        await self._put(c, 'request', project, r['id'], r)
+                        await self._event(c, project, 'leader', {'type': 'dependency_failed', 'request_id': r['id']}, r['conversation'])
+                    continue
+                if any(d['state'] not in {'completed', 'review'} for d in deps):
+                    continue
+                if any([not await need_satisfied(self, c, project, need) for need in r.get('needs', [])]):
+                    continue
+                # A delivered task's kept services move to the project root right after
+                # delivery; dependent work starts once they serve there, not midway.
+                from app.execution.processes import processes
+                root = (await self._project(c, project))['workspace_path']
+                if (any(processes.moving_for(root, d['id']) for d in deps)
+                        or any(processes.restarting(root, name=need['service']) for need in r.get('needs', []) if 'service' in need)):
+                    continue
+                if r['attempts'] >= 12:
+                    r.update(state='failed', result='Request execution budget exhausted')
+                    await self._put(c, 'request', project, r['id'], r)
+                    continue
+                r.pop('blocked_reason', None)
+                # An interrupted execution continues its saved context once.
+                rework = r.pop('rework', None)
+                resume = bool(r.pop('resume', False)) and (not r.get('workspace_published') or bool(rework))
+                after_failure = bool(r.pop('resume_after_failure', False)) and resume
+                r.update(state='running', attempts=r['attempts']+1, lease_owner=owner, lease_until=time.time()+60)
+                if not r.get('workspace_id') or r.get('workspace_published'):
+                    r.update(workspace_id=uuid4().hex, workspace_published=False)
+                r['instance_id'] = uuid4().hex
+                await self._put(c, 'request', project, r['id'], r)
+                p = await self._project(c, project)
+                return project, p['workspace_path'], {**r, 'resume': resume, 'rework': rework, 'after_failure': after_failure}
+        return None
+
+    async def recover_requests(self):
+        async with self.transaction() as c:
+            rows = (await c.execute(text("SELECT project,id,data FROM collaboration_records WHERE kind='request' AND state='running'"))).mappings().all()
+            for row in rows:
+                r = json.loads(row['data'])
+                if r.get('lease_until', 0) > time.time():
+                    continue
+                r.update(state='queued', resume=True, interrupted_reason='execution lease expired')
+                await self._put(c, 'request', row['project'], row['id'], r)
+
+    async def set_paused(self, project, paused):
+        async with self.transaction() as c:
+            await self._project(c, project)
+            await self._put(c, 'settings', project, 'project', {'paused': paused})
+        return {'paused': paused}
+
+
+    async def section_diff(self, project, document_id, from_version, to_version, section_id, offset=0, limit=6000):
+        if offset < 0 or not 1 <= limit <= 12000:
+            raise ValueError('Invalid diff window')
+        async with self.reading() as c:
+            contents = []
+            for version in (from_version, to_version):
+                r = await self._get(c, 'revision', project, f'{document_id}:{version}')
+                found = next((s for s in r['outline'] if s['id'] == section_id), None)
+                contents.append(r['content'][found['start']:found['body_end']] if found else '')
+            diff = ''.join(difflib.unified_diff(contents[0].splitlines(True), contents[1].splitlines(True), fromfile=f'v{from_version}', tofile=f'v{to_version}'))
+            return {'diff': diff[offset:offset+limit], 'next_offset': offset+limit if len(diff) > offset+limit else None}
+
+    async def search(self, project, query, offset=0, limit=20):
+        if not query.strip() or len(query) > 200 or offset < 0 or not 1 <= limit <= 50:
+            raise ValueError('Invalid search query or window')
+        async with self.reading() as c:
+            await self._project(c, project)
+            rows = (await c.execute(text("""SELECT document,version,section,title,body,
+              instr(lower(body),lower(:q)) AS position FROM collaboration_sections
+              WHERE project=:p AND instr(lower(body),lower(:q))>0
+              ORDER BY document,section LIMIT :n OFFSET :offset"""),
+              {'p': project, 'q': query, 'n': limit+1, 'offset': offset})).mappings().all()
+            matches = [{'document_id': row['document'], 'version': row['version'], 'section_id': row['section'], 'title': row['title'],
+                        'excerpt': row['body'][max(0,row['position']-81):row['position']+239]} for row in rows[:limit]]
+            return {'matches': matches, 'next_offset': offset+limit if len(rows)>limit else None}
+
+
+
+    async def _cancel_dependents(self, c, project, identifier):
+        requests = await self._list(c, 'request', project)
+        cancelled = {identifier}
+        while True:
+            changed = False
+            for r in requests:
+                if r['state'] not in TERMINAL and r['id'] not in cancelled and (set(r['dependencies']) & cancelled or r.get('parent') in cancelled):
+                    r.update(state='cancelled', result=f"Cancelled because prerequisite or parent {identifier} was cancelled")
+                    cancelled.add(r['id'])
+                    await self._put(c, 'request', project, r['id'], r)
+                    await self._event(c, project, r['sender'], {'type': 'request_status', 'request_id': r['id'], 'state': 'cancelled', 'result': r['result']}, r['conversation'])
+                    changed = True
+            if not changed:
+                break
+
+    async def scheduling_tick(self, now=None):
+        now = now or time.time()
+        async with self.transaction() as c:
+            rows = (await c.execute(text("SELECT project,data FROM collaboration_records WHERE kind='request' AND state NOT IN ('completed','cancelled','rejected','failed')"))).mappings().all()
+            for row in rows:
+                r = json.loads(row['data'])
+                if r.get('paused_on_restart'):
+                    continue
+                if r.get('goal_id') and (await self._get(c, 'goal', row['project'], r['goal_id']))['state'] != 'active':
+                    continue
+                if r.get('deadline') and r['deadline'] <= now and not r.get('escalated_at'):
+                    r.update(escalated_at=now, priority=min(3, r.get('priority', 1)+1))
+                    await self._put(c, 'request', row['project'], r['id'], r)
+                    await self._event(c, row['project'], 'leader', {'type': 'request_overdue', 'request_id': r['id'], 'state': r['state'], 'deadline': r['deadline']}, r['conversation'])
+
+        await self.goal_tick(now)
+
+    async def schedule_request(self, project, identifier, actor, priority=None, deadline=None):
+        async with self.transaction() as c:
+            r = await self._get(c, 'request', project, identifier)
+            if actor not in {r['sender'], 'leader'} or r['state'] in TERMINAL:
+                raise ValueError('Only sender or leader may schedule an active request')
+            if priority is not None:
+                if priority not in range(4):
+                    raise ValueError('Priority must be 0..3')
+                r['priority'] = priority
+            if deadline is not None:
+                if deadline <= 0:
+                    raise ValueError('Deadline must be a positive Unix timestamp')
+                r['deadline'] = deadline
+                r.pop('escalated_at', None)
+            await self._put(c, 'request', project, identifier, r)
+            return r
+
+    async def dependency_graph(self, project):
+        async with self.reading() as c:
+            await self._project(c, project)
+            requests = await self._list(c, 'request', project)
+            return {'nodes': [{key: r.get(key) for key in ('id','goal','state','recipient','priority','deadline','blocked_reason')} for r in requests],
+                    'edges': [{'from': r['id'], 'to': dependency, 'type': 'depends_on'} for r in requests for dependency in r['dependencies']]}
+
+    async def record_decision(self, project, actor, title, rationale, links, facts=None, identifier=None, base_version=0, state='proposed', supersedes=None):
+        if state not in {'proposed', 'accepted', 'superseded', 'rejected'} or not title.strip() or not rationale.strip():
+            raise ValueError('A decision needs a title, rationale and valid state')
+        if len(title) > 240 or len(rationale) > 4000 or len(links) > 30 or len(facts or {}) > 30:
+            raise ValueError('Decision exceeds size limits')
+        if actor != 'leader' and state != 'proposed':
+            raise ValueError('Only Leader can accept, reject or supersede a decision')
+        async with self.transaction() as c:
+            await self._project(c, project)
+            identifier = identifier or uuid4().hex
+            previous = await self._get(c, 'decision', project, identifier, False)
+            if base_version != (previous['version'] if previous else 0):
+                raise StorageConflictError('Decision version changed')
+            if previous and actor not in {previous['author'], 'leader'}:
+                raise ValueError('Only the author or Leader may edit a decision')
+            for link in links:
+                await self._get(c, 'revision', project, f"{link['document_id']}:{link['version']}")
+            if state == 'accepted':
+                if not links:
+                    raise ValueError('Accepted decisions must cite a published document revision')
+                await self._dependencies(c, project, links)
+            if supersedes:
+                old = await self._get(c, 'decision', project, supersedes)
+                if old['state'] != 'accepted' or state != 'accepted':
+                    raise ValueError('Only an accepted decision may supersede another accepted decision')
+                old.update(state='superseded', version=old['version']+1, superseded_by=identifier)
+                await self._put(c, 'decision', project, old['id'], old)
+                await self._put(c, 'decision_revision', project, f"{old['id']}:{old['version']}", old)
+            decision = dict(id=identifier, version=base_version+1, author=previous['author'] if previous else actor,
+                            title=title, rationale=rationale, links=links, facts=facts or {}, state=state,
+                            supersedes=supersedes, created=time.time())
+            await self._put(c, 'decision', project, identifier, decision)
+            await self._put(c, 'decision_revision', project, f'{identifier}:{base_version+1}', decision)
+            await self._event(c, project, 'leader', {'type': 'decision_changed', 'decision_id': identifier, 'state': state, 'title': title})
+            return decision
+
+    async def maintenance(self, project, stale_days=90):
+        if stale_days < 1:
+            raise ValueError('stale_days must be positive')
+        async with self.reading() as c:
+            await self._project(c, project)
+            docs = await self._list(c, 'document', project)
+            versions = {d['id']: d['version'] for d in docs}
+            decisions = await self._list(c, 'decision', project)
+            findings, bodies = [], []
+            for d in docs:
+                r = await self._get(c, 'revision', project, f"{d['id']}:{d['version']}")
+                stale_dependencies = [ref for ref in r.get('based_on', []) if versions.get(ref['document_id']) != ref['version']]
+                if stale_dependencies:
+                    findings.append({'kind': 'stale_dependency', 'document_id': d['id'], 'dependencies': stale_dependencies})
+                if time.time() - r['created'] > stale_days * 86400:
+                    findings.append({'kind': 'review_due', 'document_id': d['id'], 'last_updated': r['created']})
+                for heading in r['outline']:
+                    body = ' '.join(r['content'][heading['body_start']:heading['body_end']].split()).casefold()
+                    if len(body) >= 80:
+                        bodies.append((d['id'], heading['id'], body))
+            hashes = {}
+            for doc, sid, body in bodies:
+                h = digest(body)
+                if h in hashes:
+                    findings.append({'kind': 'duplicate_section', 'left': hashes[h], 'right': {'document_id': doc, 'section_id': sid}, 'requires_review': True})
+                else:
+                    hashes[h] = {'document_id': doc, 'section_id': sid}
+            facts = {}
+            for d in decisions:
+                if d['state'] != 'accepted':
+                    continue
+                if any(versions.get(ref['document_id']) != ref['version'] for ref in d['links']):
+                    findings.append({'kind': 'decision_evidence_changed', 'decision_id': d['id'], 'requires_review': True})
+                for key, value in d['facts'].items():
+                    if key in facts and facts[key]['value'] != value:
+                        findings.append({'kind': 'contradictory_decisions', 'fact': key, 'left': facts[key], 'right': {'decision_id': d['id'], 'value': value}, 'requires_review': True})
+                    else:
+                        facts[key] = {'decision_id': d['id'], 'value': value}
+            return {'findings': findings, 'coverage': 'Exact normalized section duplicates, explicit decision facts and version/age checks. Free-text semantic contradictions require review.'}
+
+    async def accepted_decisions(self, project):
+        async with self.reading() as c:
+            decisions = [d for d in await self._list(c, 'decision', project) if d['state'] == 'accepted']
+        return sorted(decisions, key=lambda d: d.get('created', 0), reverse=True)
+
+    async def handoff(self, project, member='leader', save=False, summary=''):
+        environment = await self.environment_brief(project)
+        async with self.transaction() as c:
+            await self._project(c, project)
+            docs = await self._list(c, 'document', project)
+            requests = [r for r in await self._list(c, 'request', project) if r['state'] not in TERMINAL and (member == 'leader' or member in {r['sender'], r['recipient']})]
+            decisions = [d for d in await self._list(c, 'decision', project) if d['state'] == 'accepted']
+            handoff = {'created': time.time(), 'member': member, 'summary': summary[:2000],
+                       'documents': [{'id': d['id'], 'version': d['version'], 'title': d['title'], 'path': d['path']} for d in docs[:30]],
+                       'pending': [{key: r.get(key) for key in ('id','state','recipient','dependencies','needs_review')} for r in requests[:30]],
+                       'decisions': [{'id': d['id'], 'version': d['version'], 'title': d['title'], 'links': d['links']} for d in decisions[:20]],
+                       'remaining': {'documents': max(0,len(docs)-30), 'pending': max(0,len(requests)-30), 'decisions': max(0,len(decisions)-20)}}
+            if save:
+                handoff['id'] = uuid4().hex
+                await self._put(c, 'handoff', project, handoff['id'], handoff)
+            # Live environment facts are not part of the saved stage record.
+            return {**handoff, 'environment': environment}
+
+
+    async def _index_sections(self, c, project, revision):
+        await c.execute(text('DELETE FROM collaboration_sections WHERE project=:p AND document=:d'), {'p': project, 'd': revision['id']})
+        for heading in revision['outline']:
+            await c.execute(text('INSERT INTO collaboration_sections(project,document,section,version,title,body) VALUES(:p,:d,:s,:v,:t,:b)'),
+                            {'p': project, 'd': revision['id'], 's': heading['id'], 'v': revision['version'], 't': heading['title'], 'b': revision['content'][heading['start']:heading['body_end']]})
+
+    async def rebuild_search(self):
+        async with self.transaction() as c:
+            rows = (await c.execute(text("SELECT project,data FROM collaboration_records WHERE kind='document'"))).mappings().all()
+            for row in rows:
+                d = json.loads(row['data'])
+                if not await c.scalar(text('SELECT 1 FROM collaboration_sections WHERE project=:p AND document=:d AND version=:v LIMIT 1'), {'p': row['project'], 'd': d['id'], 'v': d['version']}):
+                    r = await self._get(c, 'revision', row['project'], f"{d['id']}:{d['version']}")
+                    await self._index_sections(c, row['project'], r)
+
+    async def renew_leases(self, owner, active_requests):
+        async with self.transaction() as c:
+            rows = (await c.execute(text("SELECT project,id,data FROM collaboration_records WHERE kind='request' AND state='running'"))).mappings().all()
+            for row in rows:
+                r = json.loads(row['data'])
+                if r.get('lease_owner') == owner and (row['project'], row['id']) in active_requests:
+                    r['lease_until'] = time.time()+60
+                    await self._put(c, 'request', row['project'], row['id'], r)
+
+    async def prepare_workspace(self, project, identifier):
+        async with self.transaction() as c:
+            r = await self._get(c, 'request', project, identifier)
+            p = await self._project(c, project)
+            workspace = IsolatedWorkspace(p['workspace_path'], r['workspace_id'])
+            await asyncio.to_thread(workspace.prepare)
+            await asyncio.to_thread(workspace.refresh)
+            return workspace
+
+    async def publish_artifacts(self, project, identifier, instance_id, references='', delivered=None):
+        """Merge what the task snapshot changed since its last merge into the project.
+        Every artifact the task declares or this delivery lists (`delivered`) is checked
+        in the snapshot first, so a rejected delivery merges nothing and a corrected one
+        merges everything. `references` is the delivery text (result, evidence, artifact
+        paths) used to keep only screenshots it cites."""
+        credentials = await self._known_secrets(project)
+        async with self.transaction() as c:
+            r = await self._get(c, 'request', project, identifier)
+            if r.get('instance_id') != instance_id or r['state'] not in {'running', 'review'} or r.get('lease_until',0) <= time.time():
+                raise StorageConflictError('Request execution lease is no longer valid')
+            await self._dependencies(c, project, r['based_on'])
+            if any(dep['state'] != 'completed' for dep in [await self._get(c, 'request', project, identifier) for identifier in r['dependencies']]):
+                raise StorageConflictError('Accept dependency deliveries before publishing artifacts')
+            p = await self._project(c, project)
+            workspace = IsolatedWorkspace(p['workspace_path'], r['workspace_id'])
+            managed = {d['path'] for d in await self._list(c, 'document', project)}
+            for path in dict.fromkeys([*r['artifacts'], *(delivered or [])]):
+                declared = path in r['artifacts']
+                if reason := unmerged_reason(path):
+                    raise ValueError(f'{path} cannot be a deliverable: {reason}. List only project files that colleagues '
+                                     'and the user will use; nothing was merged, deliver again without it.')
+                # Shared documents are published to the project, not the request snapshot.
+                root = p['workspace_path'] if str(Path(path)) in managed else str(workspace.work)
+                if not self._artifact_exists(self._path(root, path)):
+                    where = 'the project documents' if root == p['workspace_path'] else 'your task workspace'
+                    raise ValueError(f'Artifact is missing from {where}: {path} (a directory needs at least one file). '
+                                     + ('The request declares this path; create it or ask the sender to change the task.'
+                                        if declared else 'Create it or remove it from artifacts; nothing was merged.'))
+            await asyncio.to_thread(workspace.recover_merge)
+            # Finish an interrupted merge before considering a new plan.
+            changes = await asyncio.to_thread(workspace.plan, managed)
+            if r.get('workspace_published') and not changes:
+                return
+            documents = [Path(p['workspace_path'], path).read_text(errors='replace') for path in managed
+                         if Path(p['workspace_path'], path).is_file()]
+            skipped = unreferenced_screenshots(changes, workspace.source, '\n'.join(
+                [references, r.get('result') or '', json.dumps(r.get('evidence') or [], ensure_ascii=False), *r['artifacts'], *documents]))
+            changes = [item for item in changes if item['path'] not in skipped]
+            if leaks := secret_leaks(changes, credentials):
+                # The one delivery check that blocks: a published password cannot be taken back.
+                raise ValueError('These files contain the real password of a connected service: '
+                                 + ', '.join(f'{path} ({name})' for path, name in leaks[:8])
+                                 + '. Read credentials from the environment variables the platform provides (see '
+                                 'environment.connected) and keep only placeholders such as .env.example in files; '
+                                 'then deliver again.')
+            await asyncio.to_thread(workspace.publish, changes)
+            await asyncio.to_thread(workspace.rebase, changes)
+            r['workspace_published'] = True
+            r['merged_paths'] = [item['path'] for item in changes]
+            if skipped:
+                r['unmerged_screenshots'] = skipped
+            await self._put(c, 'request', project, identifier, r)
+        if r['merged_paths']:
+            try:
+                await self.share_merged(project, r, r['merged_paths'])
+            except Exception:
+                # The merge stands; running tasks pick the files up when they next start.
+                logger.warning('Could not bring merged files into running task snapshots', exc_info=True)
+            # Kept services serving the project restart to load the merged files; those
+            # still running in another task's snapshot are flagged stale.
+            from app.execution.processes import processes
+            command = await self.migration_for(project, r['merged_paths'])
+            if command is None:
+                processes.refresh_after_publish(p['workspace_path'], workspace.work.resolve(), r['merged_paths'])
+            else:
+                # The schema changes first; services move to the merged code only after it.
+                self.migrations[(project, identifier)] = processes.background(self._migrate_then_refresh(
+                    project, identifier, p['workspace_path'], workspace.work.resolve(), r['merged_paths'], command,
+                    r.get('conversation') or ''), 'apply the project migration')
+
+    async def share_merged(self, project, delivered, paths):
+        """Bring the files a delivery just merged into the snapshots of tasks running now.
+        A snapshot is otherwise refreshed only when an attempt starts, so a task that
+        started early (on a ready document) never saw files merged after it, rebuilt
+        them itself and met a conflict at its own delivery. Paths a task changed itself
+        are left alone and named in its notice."""
+        from app.agents.identity import member_name
+        async with self.reading() as c:
+            root = (await self._project(c, project))['workspace_path']
+            running = [r for r in await self._list(c, 'request', project)
+                       if r['state'] == 'running' and r['id'] != delivered['id'] and r.get('workspace_id')
+                       and r['workspace_id'] != delivered.get('workspace_id')]
+        for other in running:
+            result = await asyncio.to_thread(IsolatedWorkspace(root, other['workspace_id']).sync, paths)
+            if not result['pulled'] and not result['kept']:
+                continue
+            summary = f"{member_name(delivered['recipient'])} 的交付已合并进项目"
+            if result['pulled']:
+                summary += f"，{len(result['pulled'])} 个文件已同步到你的工作区"
+            if result['kept']:
+                summary += (f"；{len(result['kept'])} 个文件你也改过，保留了你的版本，项目里的版本放在 {MERGED_COPIES}/ 下同名路径："
+                            '交付时两者会冲突，请对照后改用项目版本、把你的修改合并进去，或删掉你的副本')
+            async with self.transaction() as c:
+                await self._event(c, project, other['recipient'], {
+                    'type': 'project_files_merged', 'target_request': other['id'], 'from_request': delivered['id'],
+                    'summary': summary, 'pulled': result['pulled'][:40], 'kept': result['kept'][:40]}, other['conversation'])
+
+    async def _migrate_then_refresh(self, project, identifier, root, work, paths, command, conversation):
+        from app.execution.processes import processes
+        ok = await self.apply_migration(project, identifier, root, work, command, conversation)
+        if ok:
+            processes.refresh_after_publish(root, work, paths)
+        else:
+            processes.mark_stale(root, work, paths)
+        return ok
+
+    async def _known_secrets(self, project):
+        from app.resources import service
+        if service.current is None:
+            return {}
+        try:
+            return await service.current.known_secrets(project)
+        except Exception:
+            logger.warning('Could not read connected-service credentials', exc_info=True)
+            return {}
+
+    async def sync_published(self, project, identifier, paths):
+        """Make documents this request just published visible in its snapshot."""
+        async with self.reading() as c:
+            r = await self._get(c, 'request', project, identifier)
+            p = await self._project(c, project)
+        if r.get('workspace_id'):
+            await asyncio.to_thread(IsolatedWorkspace(p['workspace_path'], r['workspace_id']).sync, list(paths))
+
+    async def mark_conflict(self, project, identifier, detail, instance_id=None):
+        async with self.transaction() as c:
+            r = await self._get(c, 'request', project, identifier)
+            if r['state'] not in {'running', 'review'} or (instance_id and r.get('instance_id') != instance_id):
+                return
+            r.update(state='blocked', blocked_reason='basis_changed' if 'Dependency changed:' in detail else 'merge_conflict', result=detail[:2000])
+            await self._put(c, 'request', project, identifier, r)
+            await self._event(c, project, 'leader', {'type': 'merge_conflict', 'request_id': identifier, 'detail': detail[:1000]}, r['conversation'])
+
+
+    async def inspect_message(self, project, identifier, offset=0, limit=4000):
+        if offset < 0 or not 1 <= limit <= 8000:
+            raise ValueError('Invalid message window')
+        async with self.reading() as c:
+            message = await self._get(c, 'message', project, identifier)
+            content = message['content']
+            return {**message, 'content': content[offset:offset+limit], 'next_offset': offset+limit if len(content)>offset+limit else None}
+
+
+    async def history(self, project, document_id, offset=0, limit=20):
+        if offset < 0 or not 1 <= limit <= 50:
+            raise ValueError('Invalid revision window')
+        async with self.reading() as c:
+            await self._get(c, 'document', project, document_id)
+            rows = await c.scalars(text("""SELECT data FROM collaboration_records WHERE project=:p AND kind='revision'
+              AND json_extract(data,'$.id')=:d ORDER BY CAST(json_extract(data,'$.version') AS INTEGER) DESC
+              LIMIT :n OFFSET :offset"""), {'p': project, 'd': document_id, 'n': limit+1, 'offset': offset})
+            revisions = [json.loads(row) for row in rows]
+            return {'revisions': [{key: r.get(key) for key in ('version','summary','author','created','conversation','based_on','batch_id','merged_from_version')} for r in revisions[:limit]],
+                    'next_offset': offset+limit if len(revisions)>limit else None}
+
+    async def leader_session(self, project, conversation, **updates):
+        async with self.transaction() as c:
+            await self._conversation(c, project, conversation)
+            session = await self._get(c, 'leader_session', project, conversation, False) or {
+                'id': conversation, 'state': 'waiting', 'last_wake': time.time(),
+                'last_progress': 0, 'retry_after': 0, 'failures': 0,
+            }
+            session.update(updates)
+            await self._put(c, 'leader_session', project, conversation, session)
+            return session
+
+    async def mark_leader_read(self, project, event_ids):
+        """UI read receipt after a successful model response, without consuming
+        the durable inbox until the coordination turn has been saved."""
+        async with self.transaction() as c:
+            for identifier in event_ids:
+                event = (await c.execute(text("SELECT conversation,data FROM collaboration_events WHERE project=:p AND recipient='leader' AND seq=:s"), {'p': project, 's': identifier})).mappings().first()
+                if event:
+                    payload = json.loads(event['data'])
+                    if event['conversation'] and payload.get('chat_message_id'):
+                        await self.store.add_receipt_in_transaction(c, event['conversation'], {'message_id': payload['chat_message_id'], 'reader': 'leader'})
+
+    async def leader_rest_state(self, project, conversation):
+        async with self.reading() as c:
+            pending = await c.scalar(text("SELECT 1 FROM collaboration_records WHERE project=:p AND kind='request' AND state IN ('queued','running','blocked','review') AND json_extract(data,'$.conversation')=:v LIMIT 1"), {'p':project, 'v':conversation})
+            return 'waiting' if pending else 'idle'

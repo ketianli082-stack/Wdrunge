@@ -52,3 +52,36 @@ test('tolerates incomplete Markdown arriving in streaming chunks', () => {
   for (let i = 0; i <= document.length; i++) assert.doesNotThrow(() => render(document.slice(0, i)));
   assert.ok(render(document).includes('<table>'));
 });
+
+// Real background-worker events arrive while the Leader SSE is still waiting.
+import { applyConversationEvent } from '../src/conversationEvents';
+test('background log replay preserves streamed text and deduplicates tool phases and mentions', () => {
+  const at = '2026-10-01T04:00:00Z';
+  let view = { messages: [{id:'reply', sender:'leader', content:'正在组织', time:'12:00'}], activities: [] };
+  const start = {sequence:1, type:'activity', created_at:at, payload:{id:'tool',agent:'product',tool:'read_project_file',description:'读取项目文件',phase:'running'}};
+  view = applyConversationEvent(view, start);
+  view = applyConversationEvent(view, {...start, sequence:2, payload:{...start.payload, phase:'completed'}});
+  view = applyConversationEvent(view, start);
+  const chat = {sequence:3, type:'chat_message', created_at:at, payload:{id:'mention',sender:'frontend',content:'@后端 接口已接入',mentions:[{worker:'backend',name:'后端',summary:'接口已接入'}]}};
+  view = applyConversationEvent(applyConversationEvent(view, chat), chat);
+  view = applyConversationEvent(view, {sequence:4,type:'assistant_completed',created_at:at,payload:{id:'reply',content:'stale'}});
+  assert.equal(view.messages[0].content, '正在组织');
+  assert.equal(view.messages.length, 2);
+  assert.equal(view.activities.length, 1);
+  assert.equal((view.activities[0] as {phase:string}).phase, 'completed');
+});
+
+test('public mention replies render a short summary and never their detailed payload', () => {
+  const html = render('完整内部交接参数不应出现在群里', {sender:'backend', mentions:[{worker:'frontend', name:'前端', summary:'接口契约已更新，请重新生成客户端。'}]});
+  assert.ok(html.includes('接口契约已更新，请重新生成客户端。'));
+  assert.ok(html.includes('@林青禾（前端开发）'));
+  assert.ok(!html.includes('完整内部交接参数'));
+});
+
+import { formatTokens } from '../src/formatTokens';
+test('token totals use compact units and promote rounded unit boundaries', () => {
+  for (const [input, expected] of [[0, '0'], [999, '999'], [1000, '1.0k'], [12500, '12.5k'],
+    [999949, '999.9k'], [999950, '1.0m'], [1000000, '1.0m'], [1500000000, '1.5b']] as const) {
+    assert.equal(formatTokens(input), expected);
+  }
+});

@@ -28,6 +28,12 @@ async def generate_title(user_message: str, assistant_reply: str) -> str:
         )),
         HumanMessage(content=f"用户请求：{user_message}\n助手回复：{assistant_reply[:2000]}"),
     ])
+    try:
+        from app.agents.usage import record_call
+        from app.storage import get_store
+        await record_call(get_store(), 'title', response, 'title')
+    except Exception:
+        pass
     if not isinstance(response.content, str):
         return ""
     return clean_title(response.content)

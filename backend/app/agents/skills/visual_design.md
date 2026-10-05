@@ -1,1 +1,1 @@
-Visual design skill: provide readable hierarchy, consistent spacing and color, keyboard accessibility, and responsive layout. Prefer project-native CSS and SVG assets.
+Visual design skill: deliver visual hierarchy, spacing, color, layout and responsive guidance in docs/design/. Provide project-native SVG/assets in frontend/public/ when needed. Frontend owns production CSS and components; coordinate changes through a concise group mention and versioned design references.

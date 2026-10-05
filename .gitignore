@@ -1,1 +1,4 @@
 .DS_Store
+
+# Durable isolated collaboration runs (local recoverable task state)
+.wdrunge-runs/
