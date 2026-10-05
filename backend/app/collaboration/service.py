@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import difflib
 import json
+import logging
 import os
 import tempfile
 import time
@@ -20,7 +21,7 @@ from sqlalchemy import text
 from app.collaboration.documents import digest, outline, section, edit_document, page
 from app.collaboration.schema import DDL
 from app.collaboration.payloads import TransitionPayload
-from app.collaboration.workspaces import merge_text, IsolatedWorkspace, unreferenced_screenshots
+from app.collaboration.workspaces import merge_text, IsolatedWorkspace, unreferenced_screenshots, secret_leaks
 from app.storage import ChatStore, StorageConflictError, StorageNotFoundError, write_transaction
 
 ROLES = {'leader', 'product', 'backend', 'frontend', 'designer', 'testing'}
@@ -38,12 +39,17 @@ from app.collaboration.journal import JournalMixin
 from app.collaboration.planning import (PlanningMixin, check_criteria_budget, check_deliverables, goal_scale,
                                         need_satisfied, normalize_needs, project_relative, serial_dependency, still_draft)
 
+logger = logging.getLogger(__name__)
+
 
 class Collaboration(GoalMixin, ConversationRuns, EnvironmentMixin, JournalMixin, PlanningMixin):
     def __init__(self, store: ChatStore):
         self.store = store
         self._lock = asyncio.Lock()
         self._ready = False
+        # Migrations running after a merge, by (project, task): moving that task's
+        # services to the project root waits for them.
+        self.migrations: dict = {}
         self.max_running = max(1, min(32, int(os.getenv('WDRUNGE_MAX_CONCURRENCY', '4'))))
         self.role_concurrency = max(1, min(8, int(os.getenv('WDRUNGE_ROLE_CONCURRENCY', '2'))))
 
@@ -230,6 +236,10 @@ class Collaboration(GoalMixin, ConversationRuns, EnvironmentMixin, JournalMixin,
         async with self.transaction() as c:
             if await self._get(c, 'pending', project, batch_id, False):
                 raise StorageConflictError('Publication blocked by an external file change; inspect pending batch')
+            # Publishing saves progress; dependents start on delivery or on this explicit mark.
+            for change, r in zip(changes, revisions):
+                if change.get('ready'):
+                    await self._put(c, 'ready', project, r['id'], {'version': r['version'], 'author': author, 'created': time.time()})
         return [{'document_id': r['id'], 'version': r['version'], 'batch_id': batch_id} for r in revisions]
 
     async def recover(self, project=None):
@@ -461,6 +471,11 @@ class Collaboration(GoalMixin, ConversationRuns, EnvironmentMixin, JournalMixin,
             raise ValueError('Priority must be 0..3 and deadline a positive Unix timestamp')
         if sender not in ROLES or recipient not in ROLES - {'leader'} or not goal.strip() or len(goal) > 8000:
             raise ValueError('Invalid request')
+        for name in services or ():
+            if await self.connected_service(project, name):
+                raise ValueError(f'{name} is a service the platform connects for this project (environment.connected): it is '
+                                 'already running and reaches every command through environment variables, so no task '
+                                 'delivers it. Remove it from services; tasks that use it need no needs entry either.')
         async with self.transaction() as c:
             # Assignees work in a snapshot of the project: an absolute project path in
             # the task would send them outside it, so task text names paths relative to it.
@@ -591,8 +606,10 @@ class Collaboration(GoalMixin, ConversationRuns, EnvironmentMixin, JournalMixin,
             if r['state'] == 'failed' and state == 'queued':
                 r['attempts'] = 0
                 if r.pop('resumable', False):
-                    # The failure was the model provider, not the work: continue the saved context.
-                    r['resume'] = True
+                    # The runtime failed, not the work: continue the saved context. Once only:
+                    # a resumed attempt that fails again starts fresh (see Scheduler.execute).
+                    r.update(resume=True, resume_after_failure=True,
+                             interrupted_reason=f"the previous attempt failed: {(r.get('result') or '')[:300]}")
             if based_on is not None:
                 await self._dependencies(c, project, based_on)
                 r['based_on'] = based_on
@@ -671,7 +688,7 @@ class Collaboration(GoalMixin, ConversationRuns, EnvironmentMixin, JournalMixin,
             await self._put(c, 'request', project, identifier, r)
 
     async def mark_resumable(self, project, identifier):
-        """A provider failure ended this run: a retry continues its saved context."""
+        """A runtime failure ended this run: a retry continues its saved context."""
         async with self.transaction() as c:
             r = await self._get(c, 'request', project, identifier)
             r['resumable'] = True
@@ -744,13 +761,14 @@ class Collaboration(GoalMixin, ConversationRuns, EnvironmentMixin, JournalMixin,
                 # An interrupted execution continues its saved context once.
                 rework = r.pop('rework', None)
                 resume = bool(r.pop('resume', False)) and (not r.get('workspace_published') or bool(rework))
+                after_failure = bool(r.pop('resume_after_failure', False)) and resume
                 r.update(state='running', attempts=r['attempts']+1, lease_owner=owner, lease_until=time.time()+60)
                 if not r.get('workspace_id') or r.get('workspace_published'):
                     r.update(workspace_id=uuid4().hex, workspace_published=False)
                 r['instance_id'] = uuid4().hex
                 await self._put(c, 'request', project, r['id'], r)
                 p = await self._project(c, project)
-                return project, p['workspace_path'], {**r, 'resume': resume, 'rework': rework}
+                return project, p['workspace_path'], {**r, 'resume': resume, 'rework': rework, 'after_failure': after_failure}
         return None
 
     async def recover_requests(self):
@@ -1004,6 +1022,7 @@ class Collaboration(GoalMixin, ConversationRuns, EnvironmentMixin, JournalMixin,
     async def publish_artifacts(self, project, identifier, instance_id, references=''):
         """Merge the task snapshot into the project. `references` is the delivery text
         (result, evidence, artifact paths) used to keep only screenshots it cites."""
+        credentials = await self._known_secrets(project)
         async with self.transaction() as c:
             r = await self._get(c, 'request', project, identifier)
             if r.get('instance_id') != instance_id or r['state'] not in {'running', 'review'} or r.get('lease_until',0) <= time.time():
@@ -1030,6 +1049,13 @@ class Collaboration(GoalMixin, ConversationRuns, EnvironmentMixin, JournalMixin,
             skipped = unreferenced_screenshots(changes, workspace.source, '\n'.join(
                 [references, r.get('result') or '', json.dumps(r.get('evidence') or [], ensure_ascii=False), *r['artifacts'], *documents]))
             changes = [item for item in changes if item['path'] not in skipped]
+            if leaks := secret_leaks(changes, credentials):
+                # The one delivery check that blocks: a published password cannot be taken back.
+                raise ValueError('These files contain the real password of a connected service: '
+                                 + ', '.join(f'{path} ({name})' for path, name in leaks[:8])
+                                 + '. Read credentials from the environment variables the platform provides (see '
+                                 'environment.connected) and keep only placeholders such as .env.example in files; '
+                                 'then deliver again.')
             await asyncio.to_thread(workspace.publish, changes)
             r['workspace_published'] = True
             r['merged_paths'] = [item['path'] for item in changes]
@@ -1040,7 +1066,33 @@ class Collaboration(GoalMixin, ConversationRuns, EnvironmentMixin, JournalMixin,
             # Kept services serving the project restart to load the merged files; those
             # still running in another task's snapshot are flagged stale.
             from app.execution.processes import processes
-            processes.refresh_after_publish(p['workspace_path'], workspace.work.resolve(), r['merged_paths'])
+            command = await self.migration_for(project, r['merged_paths'])
+            if command is None:
+                processes.refresh_after_publish(p['workspace_path'], workspace.work.resolve(), r['merged_paths'])
+            else:
+                # The schema changes first; services move to the merged code only after it.
+                self.migrations[(project, identifier)] = processes.background(self._migrate_then_refresh(
+                    project, identifier, p['workspace_path'], workspace.work.resolve(), r['merged_paths'], command,
+                    r.get('conversation') or ''), 'apply the project migration')
+
+    async def _migrate_then_refresh(self, project, identifier, root, work, paths, command, conversation):
+        from app.execution.processes import processes
+        ok = await self.apply_migration(project, identifier, root, work, command, conversation)
+        if ok:
+            processes.refresh_after_publish(root, work, paths)
+        else:
+            processes.mark_stale(root, work, paths)
+        return ok
+
+    async def _known_secrets(self, project):
+        from app.resources import service
+        if service.current is None:
+            return {}
+        try:
+            return await service.current.known_secrets(project)
+        except Exception:
+            logger.warning('Could not read connected-service credentials', exc_info=True)
+            return {}
 
     async def sync_published(self, project, identifier, paths):
         """Make documents this request just published visible in its snapshot."""

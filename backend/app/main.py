@@ -27,6 +27,7 @@ from app.collaboration.runtime import Scheduler
 from app.collaboration import api as collaboration_api
 from app.collaboration.delivery import router as delivery_router
 from app.execution import api as execution_api
+from app.resources import api as resource_api, service as resource_service
 from app.agents.team import get_team
 from app.storage import ChatStore, StorageConflictError, StorageNotFoundError, get_store
 
@@ -63,6 +64,9 @@ async def ensure_runtime() -> None:
     await collaboration.initialize()
     collaboration_api.configure(collaboration)
     await execution_api.initialize(store)
+    resource_service.current = resource_service.Resources(store)
+    from app.execution.processes import processes
+    processes.failure_handler = collaboration.report_service_failure
     if hasattr(team, "configure_persistence"):
         team.collaboration = collaboration
         team._checkpointer = checkpointer
@@ -102,6 +106,7 @@ app = FastAPI(
 app.include_router(collaboration_api.router)
 app.include_router(delivery_router)
 app.include_router(execution_api.router)
+app.include_router(resource_api.router)
 app.add_middleware(RecordsGateMiddleware, gate=_records_gate)
 app.add_middleware(PlatformPortsMiddleware)
 app.add_middleware(
@@ -113,7 +118,7 @@ app.add_middleware(
         "tauri://localhost",
     ],
     allow_credentials=False,
-    allow_methods=["GET", "POST"],
+    allow_methods=["GET", "POST", "PUT", "DELETE"],
     allow_headers=["Content-Type", "Authorization"],
 )
 
@@ -133,6 +138,8 @@ class UsageGroup(BaseModel):
     total_tokens: int
     input_tokens: int
     output_tokens: int
+    # Part of output_tokens spent reasoning; 0 when the provider did not report it.
+    reasoning_tokens: int = 0
     cached_tokens: int
     cache_input_tokens: int
     cache_percent: float | None = None
@@ -556,6 +563,18 @@ async def team_status():
     return TeamStatusResponse(agents=team.snapshot(), usage=team.usage_snapshot())
 
 
+async def captured_credentials(project, content):
+    """A connection URL with a password goes to the settings, not to the team."""
+    if resource_service.current is None:
+        return content
+    from app.resources.capture import capture
+    try:
+        return (await capture(resource_service.current, project, content))[0]
+    except Exception:
+        logging.getLogger(__name__).warning('Could not save pasted credentials', exc_info=True)
+        return content
+
+
 @app.post(
     "/api/conversations/{conversation_id}/messages/stream",
     response_class=StreamingResponse,
@@ -583,7 +602,8 @@ async def conversation_message_stream(
     try:
         workspace = resolve_workspace(await store.conversation_workspace(conversation_id))
         project = (await store.get_conversation_summary(conversation_id))['project_id']
-        generation = await collaboration_api._service.begin_conversation_run(project, conversation_id, message_id=body.client_message_id, content=body.content)
+        content = await captured_credentials(project, body.content)
+        generation = await collaboration_api._service.begin_conversation_run(project, conversation_id, message_id=body.client_message_id, content=content)
         stored_history = await store.model_history(conversation_id)
         initial_title = (await store.get_conversation_summary(conversation_id))["title"]
     except (StorageNotFoundError, StorageConflictError) as error:

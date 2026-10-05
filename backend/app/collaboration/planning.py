@@ -3,8 +3,12 @@
 - Typed deliverables: files/directories (artifacts), shared documents published with
   collaboration_publish (documents) and services that must be running and verified
   in the environment registry (services). Contradictions are rejected up front.
-- Deliverable-level dependencies (needs): a task can start as soon as a document is
-  published or a service is verified, instead of waiting for a whole task.
+- Deliverable-level dependencies (needs): a task starts when a document is delivered
+  (its producing task submitted it, or its author marked it ready) or a service is
+  verified, instead of waiting for a whole task. Progressive publication alone only
+  saves work in progress; it does not release dependents.
+- Declared documents have a length budget by goal scale, stated to the author and
+  reported (never enforced) when a publication crosses it.
 - Goal scale bounds the number of criteria and is passed to every assignee.
 - Verification ownership: at most one end-to-end verification task per goal; other
   tasks verify only their own deliverable; duplicated criteria are flagged.
@@ -21,6 +25,13 @@ SCALE_GUIDANCE = {
              'configuration options, styling or documentation sections beyond them.',
     'medium': 'Goal scale medium: cover the criteria with proportionate structure; avoid speculative features.',
     'large': 'Goal scale large: plan for maintainability, but still deliver only what the criteria and documents require.',
+}
+# Characters per declared document. Past runs wrote a 68K-character design and a 26K
+# contract for a personal blog; every later reader and editor paid for that length.
+DOCUMENT_BUDGETS = {
+    'small': {'requirements': 4000, 'design': 4000, 'contract': 4000, 'report': 4000, 'generic': 3000},
+    'medium': {'requirements': 10000, 'design': 15000, 'contract': 15000, 'report': 8000, 'generic': 8000},
+    'large': {'requirements': 20000, 'design': 30000, 'contract': 30000, 'report': 15000, 'generic': 15000},
 }
 
 
@@ -106,14 +117,36 @@ async def still_draft(service, c, project, document) -> bool:
     return bool(draft and document['version'] <= draft['version'])
 
 
+ABANDONED = {'cancelled', 'rejected', 'failed'}
+
+
+def same_document(declared, document) -> bool:
+    return declared == document['id'] or deliverable_path(declared) == deliverable_path(document.get('path') or '')
+
+
+async def document_released(service, c, project, document) -> bool:
+    """Whether dependents may build on a document: its author marked it ready, or a task
+    declaring it has delivered (review or completed). A document no live task declares
+    (written by the user or an earlier goal) is released once it exists."""
+    if await service._get(c, 'ready', project, document['id'], False):
+        return True
+    producers = [r for r in await service._list(c, 'request', project)
+                 if r['state'] not in ABANDONED and any(same_document(d, document) for d in r.get('documents') or ())]
+    return not producers or any(r['state'] in {'review', 'completed'} for r in producers)
+
+
 async def need_satisfied(service, c, project, need) -> bool:
     if 'service' in need:
+        # A service the user connected (a database) is provided, never delivered.
+        if await service.connected_service(project, need['service']):
+            return True
         record = await service._get(c, 'service', project, need['service'], False)
         return bool(record and record.get('status') == 'verified')
     target = need['document']
     for document in await service._list(c, 'document', project):
-        if target in {document['id'], document.get('path')}:
-            return document['version'] >= need.get('min_version', 1) and not await still_draft(service, c, project, document)
+        if target in {document['id'], document.get('path')} or same_document(target, document):
+            return (document['version'] >= need.get('min_version', 1) and not await still_draft(service, c, project, document)
+                    and await document_released(service, c, project, document))
     return False
 
 
@@ -128,13 +161,38 @@ DRAFT_KINDS = [('report', r'report|verification|test|qa|验证|测试'), ('contr
                ('design', r'design|style|ui|视觉|设计'), ('requirements', r'prd|requirement|spec|需求')]
 
 
+def document_kind(path: str) -> str:
+    return next((kind for kind, pattern in DRAFT_KINDS if re.search(pattern, str(path), re.I)), 'generic')
+
+
+def document_budget(scale, path) -> int | None:
+    return DOCUMENT_BUDGETS[scale][document_kind(path)] if scale in DOCUMENT_BUDGETS else None
+
+
+def budget_line(scale, paths) -> str:
+    budgets = [(path, document_budget(scale, path)) for path in paths]
+    listed = '; '.join(f'{path} about {budget:,}' for path, budget in budgets if budget)
+    if not listed:
+        return ''
+    return (f'Length budget in characters for this {scale} goal: {listed}. Cover the criteria within it: tables, one '
+            'representative example per pattern and references to other documents instead of enumerating every case or '
+            'repeating them. Every colleague who reads or edits the document pays for its length.')
+
+
+PENDING = ('（待填写）', '(to be written)')
+
+
+def unfilled(content: str) -> bool:
+    """Whether a document still has platform draft placeholders."""
+    return any(f'\n{mark}\n' in content for mark in PENDING)
+
+
 def draft_content(path: str, author: str, chinese: bool) -> str:
     from pathlib import PurePosixPath
-    kind = next((kind for kind, pattern in DRAFT_KINDS if re.search(pattern, path, re.I)), 'generic')
-    sections = DRAFT_SECTIONS[kind][0 if chinese else 1]
+    sections = DRAFT_SECTIONS[document_kind(path)][0 if chinese else 1]
     title = PurePosixPath(path).stem.replace('-', ' ').replace('_', ' ')
     note = f'> 草稿：{author} 正在编写，完成的章节会逐步更新。' if chinese else f'> Draft: {author} is writing this; sections are filled in as work completes.'
-    pending = '（待填写）' if chinese else '(to be written)'
+    pending = PENDING[0] if chinese else PENDING[1]
     return f'# {title}\n\n{note}\n\n' + ''.join(f'## {heading}\n\n{pending}\n\n' for heading in sections)
 
 
@@ -157,7 +215,64 @@ def duplicate_criteria(criteria, others, threshold=.6):
     return found
 
 
+OUTLINE_LIMIT = 150
+
+
+def outline_view(outline) -> list[dict]:
+    """Section IDs and sizes for the next edits, without offsets."""
+    return [{'id': h['id'], 'title': h['title'], 'level': h['level'], 'characters': h.get('characters', 0)}
+            for h in outline[:OUTLINE_LIMIT] if h['id'] != 'root']
+
+
 class PlanningMixin:
+    async def publication_receipt(self, project, revisions, request_id=None) -> dict:
+        """What the author needs for the next edit: the new outline (section IDs change with
+        headings), the length and, for documents its task declares, the length budget."""
+        async with self.reading() as c:
+            request = await self._get(c, 'request', project, request_id, False) if request_id else None
+            goal = await self._get(c, 'goal', project, request['goal_id'], False) if request and request.get('goal_id') else None
+            scale = goal_scale(goal)
+            declared = (request or {}).get('documents') or ()
+            receipt, notices, hints = [], [], []
+            for item in revisions:
+                revision = await self._get(c, 'revision', project, f"{item['document_id']}:{item['version']}")
+                entry = {**item, 'path': revision['path'], 'characters': len(revision['content']),
+                         'outline': outline_view(revision['outline'])}
+                if len(revision['outline']) > OUTLINE_LIMIT + 1:
+                    entry['outline_truncated'] = True
+                budget = document_budget(scale, revision['path']) if any(same_document(d, revision) for d in declared) else None
+                if budget:
+                    entry['budget'] = budget
+                    previous = await self._get(c, 'revision', project, f"{item['document_id']}:{item['version'] - 1}", False)
+                    # Only the publication that crosses the budget says so; repeating it invites shrinking loops.
+                    if len(revision['content']) > budget >= (len(previous['content']) if previous else 0):
+                        notices.append(f"{revision['path']} is now {len(revision['content']):,} characters, over its budget of about "
+                                       f"{budget:,} for this {scale} goal. Do not rewrite or delete finished sections to shrink "
+                                       'it; keep any remaining sections brief and add no detail beyond the criteria.')
+                if await self._get(c, 'ready', project, item['document_id'], False):
+                    entry['ready'] = True
+                elif any(same_document(d, revision) for d in declared) and await self.became_complete(c, project, revision):
+                    # Once, when the last placeholder is filled: tasks waiting on the document
+                    # start on ready=true, not when the author's whole task is delivered.
+                    hints.append(f"{revision['path']} has no unwritten sections left. If it is complete, publish your next "
+                                 'change to it with ready=true (a change with no edits only marks it) so tasks waiting on it '
+                                 'start now; then make at most one read-through pass of fixes.')
+                receipt.append(entry)
+        return {'revisions': receipt, **({'budget_notice': ' '.join(notices)} if notices else {}),
+                **({'ready_hint': ' '.join(hints)} if hints else {})}
+
+    async def became_complete(self, c, project, revision) -> bool:
+        """This revision is the first without draft placeholders: the previous one had some,
+        was the unfilled platform draft, or did not exist."""
+        if unfilled(revision['content']):
+            return False
+        draft = await self._get(c, 'draft', project, revision['id'], False)
+        if draft and revision['version'] <= draft['version']:
+            return False
+        previous = await self._get(c, 'revision', project, f"{revision['id']}:{revision['version'] - 1}", False)
+        return (previous is None or unfilled(previous['content'])
+                or bool(draft and previous['version'] <= draft['version']))
+
     async def create_document_drafts(self, project, request) -> list[dict]:
         """Publish a sectioned placeholder for each declared document that does not exist
         yet, so the assignee fills it progressively instead of writing it all at the end."""
@@ -190,14 +305,27 @@ class PlanningMixin:
         listed = ', '.join(f"{d['path']} (document_id={d['id']}, version={d['version']})" for d in drafts)
         return (f'Draft documents were created for your declared documents: {listed}. Read the outline and fill sections with '
                 'collaboration_publish (replace_section_body) as each part is done, or, if the outline does not fit, replace '
-                'the whole draft once with changes=[{document_id, base_version, summary, content}]; tasks waiting on them '
-                'start after your first update. Delivery requires the drafts to be filled.')
+                'the whole draft once with changes=[{document_id, base_version, summary, content}]. Publishing saves your '
+                'progress; tasks waiting on these documents start when you submit your task, or earlier when you publish a '
+                'change with ready=true once the document is complete enough for them to build on. Delivery requires the '
+                'drafts to be filled.')
 
     async def task_brief(self, project, request) -> str:
         """Deliverable, dependency, scale and verification facts for the assignee."""
         lines = []
         if request.get('documents'):
-            lines.append(f"Documents to publish with collaboration_publish: {request['documents']}.")
+            lines.append(f"Documents to publish with collaboration_publish: {request['documents']}. When every section is "
+                         'written, publish with ready=true so tasks that need a document start without waiting for your '
+                         'whole task; after that, make at most one read-through pass of fixes.')
+            async with self.reading() as c:
+                waiting = [(r, need['document']) for r in await self._list(c, 'request', project)
+                           if r['id'] != request['id'] and r['state'] not in ABANDONED | {'completed', 'review'}
+                           for need in r.get('needs') or () if need.get('document')
+                           and any(deliverable_path(need['document']) == deliverable_path(d) for d in request['documents'])]
+            if waiting:
+                listed = ', '.join(sorted({f"{r['recipient']} ({path})" for r, path in waiting}))
+                lines.append(f'Waiting on your documents: {listed}. They start as soon as you publish a change with '
+                             'ready=true, or when you submit; never mark a document with placeholder sections ready.')
         if request.get('services'):
             lines.append(f"Services to deliver running: {request['services']}. Start each with execute_command(background=true, "
                          "ready_port=<its port>) and deliver while it serves; it is kept running after your task for "
@@ -210,6 +338,8 @@ class PlanningMixin:
                 tasks = [r for r in await self._list(c, 'request', project) if r.get('goal_id') == request['goal_id']]
             if goal_scale(goal):
                 lines.append(SCALE_GUIDANCE[goal_scale(goal)])
+                if request.get('documents'):
+                    lines.append(budget_line(goal_scale(goal), request['documents']))
             owner = next((t for t in tasks if t.get('verification') == 'end_to_end' and t['state'] not in {'cancelled', 'rejected'}), None)
             if request.get('verification') == 'end_to_end':
                 lines.append('You own the end-to-end verification of this goal: verify the integrated result against the goal '

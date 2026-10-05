@@ -1,5 +1,5 @@
 """Whole-document reads in one call, and sectioned drafts of declared documents that
-are filled progressively and only count once their author has updated them."""
+are filled progressively; dependents start on delivery or an explicit ready mark."""
 import asyncio
 
 import pytest
@@ -91,9 +91,11 @@ def test_drafts_are_sectioned_filled_progressively_and_gate_needs_and_delivery(t
         await s.publish(p, 'testing', [{'document_id': document_id, 'base_version': 1, 'summary': 'Scope',
                                         'edits': [{'operation': 'replace_section_body', 'section_id': scope['id'], 'new_text': '接口与页面\n'}]}])
         assert await s.draft_brief(p, report) == ''
-        assert (await s.claim('owner'))[2]['id'] == reader['id']
+        # Filling a section saves progress; the reader waits for the delivered report.
+        assert await s.claim('owner') is None
         delivered = await s.transition(p, report['id'], 'testing', 'review', result='done', expected_instance=job['instance_id'])
         assert delivered['state'] == 'review'
+        assert (await s.claim('owner'))[2]['id'] == reader['id']
         await store.close()
     asyncio.run(run())
 

@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { invoke, isTauri } from '@tauri-apps/api/core';
 import './ExecutionPermissions.css';
+import { setControlToken as setToken, useControlToken } from './controlToken';
 
 const base = (import.meta.env.VITE_API_BASE_URL || 'http://127.0.0.1:17420').replace(/\/$/, '');
 type Permission = { id: string; scope: string; reason: string; agent: string | null; conversation: string | null; operation: Record<string, unknown> };
@@ -9,7 +10,7 @@ type State = { pending: Permission[]; grants: Permission[]; sandbox: { available
 type Job = { id: string; name: string; cwd: string; state: string; exit_code: number | null };
 
 export default function ExecutionPermissions() {
-  const [token, setToken] = useState('');
+  const token = useControlToken();
   const [draft, setDraft] = useState('');
   const [opened, setOpened] = useState(false);
   const [state, setState] = useState<State | null>(null);

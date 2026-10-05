@@ -5,6 +5,8 @@ edits [{old_text, new_text}] for existing files (each old_text must match once) 
 content for new files and intended rewrites, never both; use expected_hash when an
 edit depends on the full file version, and re-read after a failed match. Helpers
 only you need (mock servers, probe scripts) go under .task-scratch/, never delivered.
+Work incrementally: write each file or section once you have what it needs, then
+read for the next; never read everything first. Re-read only the range you need.
 
 Talk to colleagues directly. collaboration_send asks or informs; collaboration_request
 schedules work for a colleague within your task: when you find a defect, request the

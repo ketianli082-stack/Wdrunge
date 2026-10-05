@@ -198,12 +198,14 @@ agent_usage = Table(
     Column("output_tokens", Integer),
     Column("latency_ms", Integer),
     Column("retries", Integer),
+    # Part of output_tokens the model spent reasoning (thinking), when reported.
+    Column("reasoning_tokens", Integer),
 )
 
 USAGE_COLUMNS = {
     "cached_tokens": "INTEGER", "project_id": "VARCHAR(36)", "conversation_id": "VARCHAR(36)",
     "request_id": "VARCHAR(200)", "attempt": "INTEGER", "purpose": "VARCHAR(32)", "model": "VARCHAR(80)",
-    "output_tokens": "INTEGER", "latency_ms": "INTEGER", "retries": "INTEGER",
+    "output_tokens": "INTEGER", "latency_ms": "INTEGER", "retries": "INTEGER", "reasoning_tokens": "INTEGER",
 }
 
 context_compactions = Table(
@@ -221,6 +223,35 @@ context_memory = Table(
     Column("state_json", JSON, nullable=False),
     Column("updated_at", DateTime(timezone=True), nullable=False),
 )
+
+# External services the user connects once (databases, caches, queues...). Secrets
+# live in their own column so no listing can return them by accident; the app
+# database itself is masked from every project process (sandbox.protected_paths).
+resource_connections = Table(
+    "resource_connections", metadata,
+    Column("id", String(36), primary_key=True),
+    Column("name", String(40), nullable=False),
+    Column("data", JSON, nullable=False),
+    Column("secrets", JSON, nullable=False),
+    Column("created_at", DateTime(timezone=True), nullable=False),
+    Column("updated_at", DateTime(timezone=True), nullable=False),
+    UniqueConstraint("name", name="uq_resource_connections_name"),
+)
+
+# What the platform prepared for one project on one connection (its own database
+# and account), with the generated credentials.
+project_resources = Table(
+    "project_resources", metadata,
+    Column("project_id", String(36), primary_key=True),
+    Column("connection_id", String(36), primary_key=True),
+    Column("data", JSON, nullable=False),
+    Column("secrets", JSON, nullable=False),
+    Column("updated_at", DateTime(timezone=True), nullable=False),
+    Index("ix_project_resources_connection_id", "connection_id"),
+)
+
+# Global configuration survives a record reset; what was prepared for projects does not.
+SETTINGS_TABLES = {"resource_connections"}
 
 
 class StorageNotFoundError(LookupError):
@@ -362,7 +393,8 @@ class ChatStore:
                 if name in existing:
                     await connection.execute(text(f'DELETE FROM "{name}"'))
             for table in reversed(metadata.sorted_tables):
-                await connection.execute(delete(table))
+                if table.name not in SETTINGS_TABLES:
+                    await connection.execute(delete(table))
 
     async def close(self) -> None:
         await self.engine.dispose()
@@ -705,7 +737,7 @@ class ChatStore:
 
     async def record_agent_usage(self, agent_id: str, total: int, context: int, cached: int | None = None, *,
                                  project_id=None, conversation_id=None, request_id=None, attempt=None, purpose=None,
-                                 model=None, output_tokens=None, latency_ms=None, retries=None) -> None:
+                                 model=None, output_tokens=None, latency_ms=None, retries=None, reasoning_tokens=None) -> None:
         await self.initialize()
         async with self.write() as connection:
             await connection.execute(insert(agent_usage).values(
@@ -714,6 +746,7 @@ class ChatStore:
                 project_id=project_id, conversation_id=conversation_id, request_id=(request_id or None) and str(request_id)[:200],
                 attempt=attempt, purpose=purpose, model=(model or None) and str(model)[:80], output_tokens=output_tokens,
                 latency_ms=int(latency_ms) if isinstance(latency_ms, (int, float)) else None, retries=retries,
+                reasoning_tokens=reasoning_tokens if isinstance(reasoning_tokens, int) else None,
             ))
 
     async def conversation_tool_counts(self, conversation_id: str) -> dict[str, int]:
@@ -731,6 +764,7 @@ class ChatStore:
         cached_input = func.sum(case((agent_usage.c.cached_tokens.is_not(None), agent_usage.c.context_tokens), else_=0))
         fields = (func.count().label('calls'), func.sum(agent_usage.c.total_tokens).label('total_tokens'),
                   func.sum(agent_usage.c.context_tokens).label('input_tokens'), func.sum(agent_usage.c.output_tokens).label('output_tokens'),
+                  func.sum(agent_usage.c.reasoning_tokens).label('reasoning_tokens'),
                   func.sum(agent_usage.c.cached_tokens).label('cached_tokens'), cached_input.label('cache_input_tokens'),
                   func.avg(agent_usage.c.latency_ms).label('latency_ms'), func.sum(agent_usage.c.retries).label('retries'))
         def shape(row) -> dict:

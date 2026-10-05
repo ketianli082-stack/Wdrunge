@@ -113,6 +113,72 @@ export type Command = {
 };
 
 /**
+ * ConnectionInput
+ */
+export type ConnectionInput = {
+    /**
+     * Name
+     */
+    name: string;
+    /**
+     * Label
+     */
+    label?: string;
+    /**
+     * Type
+     */
+    type: string;
+    /**
+     * Host
+     */
+    host?: string;
+    /**
+     * Port
+     */
+    port?: number | null;
+    /**
+     * Username
+     */
+    username?: string;
+    /**
+     * Password
+     */
+    password?: string | null;
+    /**
+     * Clear Password
+     */
+    clear_password?: boolean;
+    /**
+     * Database
+     */
+    database?: string;
+    /**
+     * Scheme
+     */
+    scheme?: string;
+    /**
+     * Env Prefix
+     */
+    env_prefix?: string;
+    /**
+     * Provision
+     */
+    provision?: boolean;
+    /**
+     * Projects
+     */
+    projects?: Array<string> | null;
+    /**
+     * Extra
+     */
+    extra?: Array<ExtraField>;
+    /**
+     * Note
+     */
+    note?: string;
+};
+
+/**
  * ConversationCreate
  */
 export type ConversationCreate = {
@@ -290,6 +356,20 @@ export type Decision = {
 };
 
 /**
+ * DockerImport
+ */
+export type DockerImport = {
+    /**
+     * Container
+     */
+    container: string;
+    /**
+     * Name
+     */
+    name?: string | null;
+};
+
+/**
  * ExecutionStatusResponse
  */
 export type ExecutionStatusResponse = {
@@ -313,6 +393,24 @@ export type ExecutionStatusResponse = {
      * Active Goals
      */
     active_goals: number;
+};
+
+/**
+ * ExtraField
+ */
+export type ExtraField = {
+    /**
+     * Key
+     */
+    key: string;
+    /**
+     * Value
+     */
+    value?: string | null;
+    /**
+     * Secret
+     */
+    secret?: boolean;
 };
 
 /**
@@ -594,6 +692,16 @@ export type ResetRecordsResponse = {
 };
 
 /**
+ * Restore
+ */
+export type Restore = {
+    /**
+     * Name
+     */
+    name: string;
+};
+
+/**
  * TeamMemberResponse
  */
 export type TeamMemberResponse = {
@@ -659,6 +767,17 @@ export type TeamUsageResponse = {
 };
 
 /**
+ * TestRequest
+ */
+export type TestRequest = {
+    /**
+     * Id
+     */
+    id?: string | null;
+    connection?: ConnectionInput | null;
+};
+
+/**
  * UsageGroup
  */
 export type UsageGroup = {
@@ -682,6 +801,10 @@ export type UsageGroup = {
      * Output Tokens
      */
     output_tokens: number;
+    /**
+     * Reasoning Tokens
+     */
+    reasoning_tokens?: number;
     /**
      * Cached Tokens
      */
@@ -1229,6 +1352,355 @@ export type StopProcessApiExecutionProcessesIdentifierStopPostErrors = {
 export type StopProcessApiExecutionProcessesIdentifierStopPostError = StopProcessApiExecutionProcessesIdentifierStopPostErrors[keyof StopProcessApiExecutionProcessesIdentifierStopPostErrors];
 
 export type StopProcessApiExecutionProcessesIdentifierStopPostResponses = {
+    /**
+     * Successful Response
+     */
+    200: unknown;
+};
+
+export type ListConnectionsApiResourcesGetData = {
+    body?: never;
+    headers?: {
+        /**
+         * Authorization
+         */
+        authorization?: string;
+    };
+    path?: never;
+    query?: never;
+    url: '/api/resources';
+};
+
+export type ListConnectionsApiResourcesGetErrors = {
+    /**
+     * Validation Error
+     */
+    422: HttpValidationError;
+};
+
+export type ListConnectionsApiResourcesGetError = ListConnectionsApiResourcesGetErrors[keyof ListConnectionsApiResourcesGetErrors];
+
+export type ListConnectionsApiResourcesGetResponses = {
+    /**
+     * Successful Response
+     */
+    200: unknown;
+};
+
+export type CreateConnectionApiResourcesPostData = {
+    body: ConnectionInput;
+    headers?: {
+        /**
+         * Authorization
+         */
+        authorization?: string;
+    };
+    path?: never;
+    query?: never;
+    url: '/api/resources';
+};
+
+export type CreateConnectionApiResourcesPostErrors = {
+    /**
+     * Validation Error
+     */
+    422: HttpValidationError;
+};
+
+export type CreateConnectionApiResourcesPostError = CreateConnectionApiResourcesPostErrors[keyof CreateConnectionApiResourcesPostErrors];
+
+export type CreateConnectionApiResourcesPostResponses = {
+    /**
+     * Successful Response
+     */
+    201: unknown;
+};
+
+export type DeleteConnectionApiResourcesIdentifierDeleteData = {
+    body?: never;
+    headers?: {
+        /**
+         * Authorization
+         */
+        authorization?: string;
+    };
+    path: {
+        /**
+         * Identifier
+         */
+        identifier: string;
+    };
+    query?: never;
+    url: '/api/resources/{identifier}';
+};
+
+export type DeleteConnectionApiResourcesIdentifierDeleteErrors = {
+    /**
+     * Validation Error
+     */
+    422: HttpValidationError;
+};
+
+export type DeleteConnectionApiResourcesIdentifierDeleteError = DeleteConnectionApiResourcesIdentifierDeleteErrors[keyof DeleteConnectionApiResourcesIdentifierDeleteErrors];
+
+export type DeleteConnectionApiResourcesIdentifierDeleteResponses = {
+    /**
+     * Successful Response
+     */
+    200: unknown;
+};
+
+export type UpdateConnectionApiResourcesIdentifierPutData = {
+    body: ConnectionInput;
+    headers?: {
+        /**
+         * Authorization
+         */
+        authorization?: string;
+    };
+    path: {
+        /**
+         * Identifier
+         */
+        identifier: string;
+    };
+    query?: never;
+    url: '/api/resources/{identifier}';
+};
+
+export type UpdateConnectionApiResourcesIdentifierPutErrors = {
+    /**
+     * Validation Error
+     */
+    422: HttpValidationError;
+};
+
+export type UpdateConnectionApiResourcesIdentifierPutError = UpdateConnectionApiResourcesIdentifierPutErrors[keyof UpdateConnectionApiResourcesIdentifierPutErrors];
+
+export type UpdateConnectionApiResourcesIdentifierPutResponses = {
+    /**
+     * Successful Response
+     */
+    200: unknown;
+};
+
+export type TestConnectionApiResourcesTestPostData = {
+    body: TestRequest;
+    headers?: {
+        /**
+         * Authorization
+         */
+        authorization?: string;
+    };
+    path?: never;
+    query?: never;
+    url: '/api/resources/test';
+};
+
+export type TestConnectionApiResourcesTestPostErrors = {
+    /**
+     * Validation Error
+     */
+    422: HttpValidationError;
+};
+
+export type TestConnectionApiResourcesTestPostError = TestConnectionApiResourcesTestPostErrors[keyof TestConnectionApiResourcesTestPostErrors];
+
+export type TestConnectionApiResourcesTestPostResponses = {
+    /**
+     * Successful Response
+     */
+    200: unknown;
+};
+
+export type DockerContainersApiResourcesDockerGetData = {
+    body?: never;
+    headers?: {
+        /**
+         * Authorization
+         */
+        authorization?: string;
+    };
+    path?: never;
+    query?: never;
+    url: '/api/resources/docker';
+};
+
+export type DockerContainersApiResourcesDockerGetErrors = {
+    /**
+     * Validation Error
+     */
+    422: HttpValidationError;
+};
+
+export type DockerContainersApiResourcesDockerGetError = DockerContainersApiResourcesDockerGetErrors[keyof DockerContainersApiResourcesDockerGetErrors];
+
+export type DockerContainersApiResourcesDockerGetResponses = {
+    /**
+     * Successful Response
+     */
+    200: unknown;
+};
+
+export type DockerImportApiResourcesDockerImportPostData = {
+    body: DockerImport;
+    headers?: {
+        /**
+         * Authorization
+         */
+        authorization?: string;
+    };
+    path?: never;
+    query?: never;
+    url: '/api/resources/docker/import';
+};
+
+export type DockerImportApiResourcesDockerImportPostErrors = {
+    /**
+     * Validation Error
+     */
+    422: HttpValidationError;
+};
+
+export type DockerImportApiResourcesDockerImportPostError = DockerImportApiResourcesDockerImportPostErrors[keyof DockerImportApiResourcesDockerImportPostErrors];
+
+export type DockerImportApiResourcesDockerImportPostResponses = {
+    /**
+     * Successful Response
+     */
+    201: unknown;
+};
+
+export type ProjectStatusApiResourcesProjectsProjectIdGetData = {
+    body?: never;
+    headers?: {
+        /**
+         * Authorization
+         */
+        authorization?: string;
+    };
+    path: {
+        /**
+         * Project Id
+         */
+        project_id: string;
+    };
+    query?: never;
+    url: '/api/resources/projects/{project_id}';
+};
+
+export type ProjectStatusApiResourcesProjectsProjectIdGetErrors = {
+    /**
+     * Validation Error
+     */
+    422: HttpValidationError;
+};
+
+export type ProjectStatusApiResourcesProjectsProjectIdGetError = ProjectStatusApiResourcesProjectsProjectIdGetErrors[keyof ProjectStatusApiResourcesProjectsProjectIdGetErrors];
+
+export type ProjectStatusApiResourcesProjectsProjectIdGetResponses = {
+    /**
+     * Successful Response
+     */
+    200: unknown;
+};
+
+export type PrepareProjectApiResourcesProjectsProjectIdPreparePostData = {
+    body?: never;
+    headers?: {
+        /**
+         * Authorization
+         */
+        authorization?: string;
+    };
+    path: {
+        /**
+         * Project Id
+         */
+        project_id: string;
+    };
+    query?: never;
+    url: '/api/resources/projects/{project_id}/prepare';
+};
+
+export type PrepareProjectApiResourcesProjectsProjectIdPreparePostErrors = {
+    /**
+     * Validation Error
+     */
+    422: HttpValidationError;
+};
+
+export type PrepareProjectApiResourcesProjectsProjectIdPreparePostError = PrepareProjectApiResourcesProjectsProjectIdPreparePostErrors[keyof PrepareProjectApiResourcesProjectsProjectIdPreparePostErrors];
+
+export type PrepareProjectApiResourcesProjectsProjectIdPreparePostResponses = {
+    /**
+     * Successful Response
+     */
+    200: unknown;
+};
+
+export type BackupProjectApiResourcesProjectsProjectIdBackupsPostData = {
+    body?: never;
+    headers?: {
+        /**
+         * Authorization
+         */
+        authorization?: string;
+    };
+    path: {
+        /**
+         * Project Id
+         */
+        project_id: string;
+    };
+    query?: never;
+    url: '/api/resources/projects/{project_id}/backups';
+};
+
+export type BackupProjectApiResourcesProjectsProjectIdBackupsPostErrors = {
+    /**
+     * Validation Error
+     */
+    422: HttpValidationError;
+};
+
+export type BackupProjectApiResourcesProjectsProjectIdBackupsPostError = BackupProjectApiResourcesProjectsProjectIdBackupsPostErrors[keyof BackupProjectApiResourcesProjectsProjectIdBackupsPostErrors];
+
+export type BackupProjectApiResourcesProjectsProjectIdBackupsPostResponses = {
+    /**
+     * Successful Response
+     */
+    200: unknown;
+};
+
+export type RestoreProjectApiResourcesProjectsProjectIdRestorePostData = {
+    body: Restore;
+    headers?: {
+        /**
+         * Authorization
+         */
+        authorization?: string;
+    };
+    path: {
+        /**
+         * Project Id
+         */
+        project_id: string;
+    };
+    query?: never;
+    url: '/api/resources/projects/{project_id}/restore';
+};
+
+export type RestoreProjectApiResourcesProjectsProjectIdRestorePostErrors = {
+    /**
+     * Validation Error
+     */
+    422: HttpValidationError;
+};
+
+export type RestoreProjectApiResourcesProjectsProjectIdRestorePostError = RestoreProjectApiResourcesProjectsProjectIdRestorePostErrors[keyof RestoreProjectApiResourcesProjectsProjectIdRestorePostErrors];
+
+export type RestoreProjectApiResourcesProjectsProjectIdRestorePostResponses = {
     /**
      * Successful Response
      */

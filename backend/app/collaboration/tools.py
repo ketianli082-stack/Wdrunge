@@ -5,7 +5,7 @@ from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import Literal
 
-from app.agents.tools.validation import tool, validation_failure, exception_result, failure_result
+from app.agents.tools.validation import tool, validation_failure, exception_result, failure_result, EXAMPLE_CALLS
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from app.collaboration.service import Collaboration
@@ -148,7 +148,13 @@ def inspect_view(request: dict, journal: dict, detail: str) -> dict:
 
 
 def transition_receipt(request: dict) -> dict:
-    return {key: request[key] for key in TRANSITION_RECEIPT if key in request}
+    receipt = {key: request[key] for key in TRANSITION_RECEIPT if key in request}
+    if request.get('state') == 'queued':
+        # Whether the assignee's next attempt remembers this one, so the Leader's notes are accurate.
+        receipt['next_attempt'] = ('continue: the assignee resumes its saved context of the earlier attempt'
+                                   if request.get('resume') else
+                                   'fresh: a new context with the task, its work journal and the files on disk')
+    return receipt
 
 
 async def execute_collaboration(action: Literal['catalog', 'read', 'publish', 'subscribe', 'send', 'request', 'inspect_request', 'wait', 'transition', 'snapshot', 'search', 'diff', 'schedule', 'dependencies', 'decision', 'maintenance', 'handoff', 'recover', 'inspect_message', 'history', 'create_goal', 'get_goal', 'update_goal', 'complete_goal', 'create_task', 'submit_task', 'complete_task', 'environment', 'register_service', 'register_command', 'journal', 'check_delivery'], payload: dict) -> dict:
@@ -262,7 +268,7 @@ async def execute_collaboration(action: Literal['catalog', 'read', 'publish', 's
                 except Exception:
                     # Publication already succeeded; the snapshot refreshes on resume.
                     logger.warning('Could not sync published documents into the request workspace', exc_info=True)
-            return {'revisions': revisions}
+            return await s.publication_receipt(p, revisions, ctx.request)
         if action == 'environment':
             return await s.environment(p)
         if action == 'check_delivery':
@@ -346,7 +352,8 @@ ACTION_DESCRIPTIONS = {
     'complete_task': 'Sender or Leader: accept a reviewed goal task. evidence must map every exact task criterion to verification evidence. Use result for the acceptance summary. Inspect artifacts and tests before accepting.',
     'catalog': 'List managed documents with IDs, current versions and external-change flags. Use this before publishing changes to an existing path.',
     'read': 'Read a document: whole=true for full text plus outline; no section_id for the outline; section_id for one section body. Keep the same version.',
-    'publish': 'Publish managed Markdown atomically. New: changes=[{path, base_version:0, summary, content}]. Existing: changes=[{document_id, base_version, summary, edits}] with replace_text, replace_section_body, insert_section or delete_section; content replaces an unfilled draft.',
+    'publish': 'Publish managed Markdown atomically. New: changes=[{path, base_version:0, summary, content}]. Existing: changes=[{document_id, base_version, summary, edits}] with replace_text, replace_section_body, insert_section or delete_section; content replaces an unfilled draft. '
+               'The result carries the new version and outline (section IDs) for your next edit. ready=true releases tasks waiting on the document before you submit.',
     'subscribe': 'Subscribe to changes of a document or a unique heading from its current outline; enabled=false unsubscribes.',
     'send': 'Send a coordination message with a short public summary and full content; key is stable across retries. Not a scheduled job.',
     'request': 'Schedule a colleague task within your scope. Include acceptance criteria in goal, expected artifact paths, based_on document versions and prerequisite request IDs in dependencies. key is required and stable across retries; summary is the short public notice.',
@@ -385,6 +392,9 @@ def _action_tool(action):
 
 
 COLLABORATION_TOOLS = {candidate.name: candidate for candidate in (_action_tool(action) for action in ACTION_PAYLOADS)}
+EXAMPLE_CALLS['collaboration_publish'] = {'changes': [{
+    'document_id': '<document_id>', 'base_version': 3, 'summary': 'Fill the layout section', 'ready': False,
+    'edits': [{'operation': 'replace_section_body', 'section_id': '<section id from the outline>', 'new_text': '<Markdown>'}]}]}
 
 
 def _worker_request_tool():

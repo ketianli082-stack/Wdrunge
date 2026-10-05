@@ -38,9 +38,13 @@ def response_usage(response) -> dict:
     cached = (usage.get('input_token_details') or {}).get('cache_read')
     if cached is None:
         cached = (fallback.get('prompt_tokens_details') or {}).get('cached_tokens')
+    reasoning = (usage.get('output_token_details') or {}).get('reasoning')
+    if reasoning is None:
+        reasoning = (fallback.get('completion_tokens_details') or {}).get('reasoning_tokens')
     return {
         'input_tokens': usage.get('input_tokens', fallback.get('prompt_tokens')),
         'output_tokens': usage.get('output_tokens', fallback.get('completion_tokens')),
+        'reasoning_tokens': reasoning if isinstance(reasoning, int) else None,
         'total_tokens': usage.get('total_tokens', fallback.get('total_tokens')),
         'cached_tokens': cached,
         'model': (metadata.get('model_name') or metadata.get('model')) if isinstance(metadata, dict) else None,
@@ -61,5 +65,5 @@ async def record_call(store, agent_id: str, response, purpose: str) -> None:
         return
     cached = usage['cached_tokens'] if isinstance(usage['cached_tokens'], int) else None
     await store.record_agent_usage(agent_id, usage['total_tokens'], usage['input_tokens'] or 0, cached,
-                                   purpose=purpose, **{k: usage[k] for k in ('output_tokens', 'model', 'latency_ms', 'retries')},
+                                   purpose=purpose, **{k: usage[k] for k in ('output_tokens', 'reasoning_tokens', 'model', 'latency_ms', 'retries')},
                                    **current_scope())

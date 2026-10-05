@@ -18,8 +18,14 @@ from app.storage import StorageConflictError
 # A task's own throwaway helpers (mock servers, probe scripts) live here in its
 # snapshot: usable across its commands, never merged into the project.
 TASK_SCRATCH = '.task-scratch'
+# The project's runtime data (its SQLite database, uploads) lives in DATA_DIR at the
+# project root, shared by every task and never copied into a snapshot or merged.
+DATA_DIR = '.wdrunge-data'
 EXCLUDED = {'.git', '.wdrunge-runs', 'node_modules', '.venv', '__pycache__', '.pytest_cache', 'dist', 'target', '.env', '.aws', '.codex', '.agents',
-            TASK_SCRATCH}
+            TASK_SCRATCH, DATA_DIR}
+# Live database files anywhere in the project: binary state that changes while a
+# service runs, so a three-way merge could only conflict or lose writes.
+RUNTIME_DATA = re.compile(r'\.(db|sqlite3?|db3)(-wal|-shm|-journal)?$', re.I)
 MAX_BYTES = 128 * 1024 * 1024
 MAX_FILES = 10000
 
@@ -62,6 +68,21 @@ def unreferenced_screenshots(changes, source: Path, references: str) -> list[str
             and Path(item['path']).name not in text]
 
 
+def secret_leaks(changes, secrets: dict[str, str]) -> list[tuple[str, str]]:
+    """Delivered files containing a credential value, with the connection it belongs to."""
+    if not secrets:
+        return []
+    needles = [(value.encode(), name) for value, name in secrets.items()]
+    found = []
+    for item in changes:
+        if item['content'] is None:
+            continue
+        name = next((name for needle, name in needles if needle in item['content']), None)
+        if name:
+            found.append((item['path'], name))
+    return found
+
+
 def merge_text(base: str, current: str, proposed: str) -> str:
     if proposed == base:
         return current
@@ -98,7 +119,7 @@ def files(root):
             path = Path(directory)/name
             # Secret .env files never sync; non-secret templates are ordinary project files.
             if (name in EXCLUDED or name.startswith('.env.') and name not in {'.env.example', '.env.sample'}
-                    or path.is_symlink()):
+                    or RUNTIME_DATA.search(name) or path.is_symlink()):
                 continue
             if not path.is_file():
                 continue
@@ -155,6 +176,8 @@ class IsolatedWorkspace:
         working = files(self.work)
         changes = []
         for name in sorted(manifest.keys() | working.keys()):
+            if RUNTIME_DATA.search(name):
+                continue  # recorded by snapshots taken before such files were excluded
             base = (self.base/name).read_bytes() if name in manifest else None
             proposed = working[name].read_bytes() if name in working else None
             if hash_bytes(proposed) == manifest.get(name):

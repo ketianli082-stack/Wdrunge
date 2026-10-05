@@ -184,7 +184,11 @@ class Scheduler:
                 current = await self.service.get_request(project, identifier)
                 if current['state'] == 'running' and current.get('instance_id') == instance:
                     await self.service.transition(project, identifier, request['recipient'], 'failed', result=str(exc)[:1000], expected_instance=instance)
-                    if transient:
+                    # An exception here is the runtime's (provider, context memory, platform),
+                    # not the work's: a retry continues the saved context instead of
+                    # re-reading everything cold. A resumed attempt that fails the same way
+                    # retries fresh, so a context that keeps failing is not replayed.
+                    if transient or not request.get('after_failure'):
                         await self.service.mark_resumable(project, identifier)
         finally:
             try:
@@ -207,7 +211,8 @@ class Scheduler:
             if delivered:
                 # Its delivery is merged: kept services move from the task snapshot to the
                 # project root, so colleagues and the user see the project as merged.
-                processes.background(processes.relaunch_delivered(active_workspace.get(), Path(workspace)),
+                processes.background(processes.relaunch_delivered(active_workspace.get(), Path(workspace),
+                                                                  before=self.service.migrations.pop((project, identifier), None)),
                                      'move kept services to the project root')
             self.team.workers[role].total_tokens += worker.total_tokens
             self.team.workers[role].cache_input_tokens += worker.cache_input_tokens

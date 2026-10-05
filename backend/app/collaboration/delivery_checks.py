@@ -22,7 +22,7 @@ import os
 import re
 from pathlib import Path
 
-SKIP_DIRS = {'node_modules', '.venv', 'vendor', 'dist', 'build', '.git', '__pycache__', 'target', '.wdrunge-runs'}
+SKIP_DIRS = {'node_modules', '.venv', 'vendor', 'dist', 'build', '.git', '__pycache__', 'target', '.wdrunge-runs', '.wdrunge-data'}
 TEXT_SUFFIXES = {'.py', '.js', '.ts', '.tsx', '.jsx', '.vue', '.html', '.css', '.md', '.txt', '.json', '.yaml', '.yml',
                  '.toml', '.sh', '.go', '.rs', '.java', '.kt', '.rb', '.php', '.cfg', '.ini', '.env', '.example', ''}
 SIZE_LINES = {'small': 400, 'medium': 2500, 'large': None}

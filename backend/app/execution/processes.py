@@ -55,6 +55,8 @@ class Job:
     # The platform starting it again from the project root: 'pending' (may wait for
     # review), 'failed' (it keeps running where it was).
     relaunch: str | None = None
+    # Values of connected-service credentials it received, masked in its output.
+    secrets: tuple = ()
 
     @property
     def from_snapshot(self):
@@ -113,6 +115,26 @@ async def kill_group(process):
     await process.wait()
 
 
+async def provided_resources(root):
+    """Connected services for the project at `root` (app.resources); none if the
+    settings are unavailable, so a command never fails for a missing database."""
+    from app.resources import service
+    if service.current is None:
+        return service.Provided()
+    try:
+        return await service.current.provided(root)
+    except Exception:
+        logger.warning('Could not prepare connected services for %s', root, exc_info=True)
+        return service.Provided()
+
+
+def mask(data: bytes, secrets) -> bytes:
+    # Same-length masks keep log offsets stable.
+    for secret in secrets:
+        data = data.replace(secret, b'*' * len(secret))
+    return data
+
+
 class Processes:
     def __init__(self):
         self.jobs: dict[str, Job] = {}
@@ -122,6 +144,8 @@ class Processes:
         # by old process ID: (old job, monotonic start). The old copy stops before the
         # new one serves; in between the service is restarting, not stopped.
         self.moving: dict[str, tuple[Job, float]] = {}
+        # async (job, detail): tells the team a service could not restart (set by the app).
+        self.failure_handler = None
 
     async def start(self, argv, cwd='.', timeout=120, name='command', network=False,
                     reason='', *, extra_reads=(), write_paths=None, browser=False, keep=False, before_spawn=None):
@@ -149,10 +173,15 @@ class Processes:
                 if dependency.is_dir() and not dependency.is_symlink() and (not local.exists() or local.is_symlink() and local.resolve() == dependency.resolve()):
                     reads.append(dependency.resolve())
         extra_reads = tuple(dict.fromkeys(reads))
+        provided = await provided_resources(scope())
         operation = {'kind': 'command', 'argv': list(argv), 'cwd': str(directory), 'network': network,
                      'browser_graphics': browser, **({'keep_running': True} if keep else {}),
                      'read_paths': [str(p) for p in extra_reads], 'timeout': timeout, 'reason': reason,
                      'write_paths': [str(p) for p in write_paths] if write_paths is not None else [str(workspace_root().resolve())]}
+        if provided.names or provided.data_dir:
+            # For the reviewer only (not part of the approval key): what the platform provides.
+            operation['resources'] = {'connected_services': list(provided.names), 'service_ports': list(provided.ports),
+                                      'data_dir': str(provided.data_dir) if provided.data_dir else None}
         await permissions().authorize(operation)
         # Re-resolve after HITL: symlinks may have changed while the dialog was open.
         if resolve_allowed(cwd, ('.',)) != directory:
@@ -176,16 +205,17 @@ class Processes:
             try:
                 fd = lifeline()
                 command = sandbox.command_line(argv, workspace_root().resolve(), directory, scratch,
-                    network=network, read_paths=extra_reads, write_paths=write_paths, browser=browser, lifeline=fd)
+                    network=network, read_paths=extra_reads, write_paths=write_paths, browser=browser, lifeline=fd,
+                    data_paths=[provided.data_dir] if provided.data_dir else (), service_ports=provided.ports)
                 process = await asyncio.create_subprocess_exec(*command, cwd=directory,
-                    env=sandbox.clean_environment(scratch, directory), stdin=asyncio.subprocess.DEVNULL,
+                    env=sandbox.clean_environment(scratch, directory, provided.env), stdin=asyncio.subprocess.DEVNULL,
                     stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT, start_new_session=True,
                     pass_fds=(fd,))
             except BaseException:
                 temporary.cleanup()
                 raise
             job = Job(uuid4().hex, scope(), str(workspace_root().resolve()), name, list(argv), str(directory), process, temporary,
-                      keep=keep, network=network, reason=reason)
+                      keep=keep, network=network, reason=reason, secrets=tuple(value.encode() for value in provided.secrets))
             self.jobs[job.id] = job
             job.reader = asyncio.create_task(self._read(job))
             # A timer rather than wait_for, so keep_service can extend a running lifetime;
@@ -307,17 +337,18 @@ class Processes:
             if changed := self.changed_paths(job, paths):
                 job.stale = list(dict.fromkeys([*job.stale, *changed]))[:20]
 
-    async def relaunch(self, job, root):
+    async def relaunch(self, job, root, changed=()):
         """Start a running kept service again from the project root with the same
         command. A service started in a task snapshot only sees that snapshot; once the
-        task's delivery is merged, colleagues and the user expect the project itself."""
+        task's delivery is merged, colleagues and the user expect the project itself.
+        `changed`: project paths just merged (a changed manifest reinstalls dependencies)."""
         self.moving.setdefault(job.id, (job, time.monotonic()))
         try:
-            return await self._relaunch(job, Path(root).resolve())
+            return await self._relaunch(job, Path(root).resolve(), changed)
         finally:
             self.moving.pop(job.id, None)
 
-    async def _relaunch(self, job, root):
+    async def _relaunch(self, job, root, changed=()):
         try:
             cwd = Path(job.cwd).resolve().relative_to(Path(job.workspace).resolve()).as_posix()
         except ValueError:
@@ -341,6 +372,13 @@ class Processes:
                     await asyncio.sleep(.25)
         tokens = active_workspace.set(root), source_workspace.set(root)
         try:
+            # Checked before the old copy stops: a restart that cannot start must not
+            # take a working service down.
+            problem = await self.prepare_root(job, root, cwd, changed)
+            if problem:
+                job.relaunch = 'failed'
+                await self.report_failure(job, problem)
+                return None
             reason = (f'{job.reason}；' if job.reason else '') + '任务已交付，同一命令改从项目根目录运行'
             new = await self.start(job.argv, cwd, name=job.name, network=job.network, reason=reason, keep=True,
                                    before_spawn=release)
@@ -354,16 +392,95 @@ class Processes:
         # Until it serves, colleagues see it being restarted rather than stopped.
         new.relaunch = 'pending'
         try:
+            ready = True
             for port in ports:
-                await self.wait_ready(new, port, 60)
+                ready = await self.wait_ready(new, port, 60) and ready
         finally:
             new.relaunch = None
-        return new
+        if ready and new.process.returncode is None:
+            return new
+        output = self.logs(new, max(0, new.end - 1500), 1500)['output'].strip()
+        await self.stop(new)
+        restored = await self.restore(job, cwd)
+        await self.report_failure(job, '从项目根目录重启后没有正常提供服务'
+                                  + ('；已恢复交付前的运行副本' if restored else '；服务目前已停止')
+                                  + (f'。最后的日志：\n{output[-1200:]}' if output else ''))
+        return restored
 
-    def relaunch_delivered(self, workspace, root):
+    async def prepare_root(self, job, root, cwd, changed=()) -> str | None:
+        """Make the project root able to run a delivered service: dependency folders are
+        never merged, so install them there from the manifests when the service needs
+        them. Returns why it cannot run, or None."""
+        from app.execution.environment import installation_commands, inspect_environment
+        directory = root / cwd
+        try:
+            runtimes = {item['type'] for item in inspect_environment(directory)['runtimes']}
+        except (OSError, ValueError):
+            runtimes = set()
+        snapshot = Path(job.cwd)
+        manifests = {'python': {'pyproject.toml', 'requirements.txt', 'uv.lock'},
+                     'node': {'package.json', 'package-lock.json', 'pnpm-lock.yaml', 'yarn.lock', 'bun.lock'}}
+        missing = sandbox.resolve_executable(job.argv[0], directory) is None
+        for runtime, folder in (('python', '.venv'), ('node', 'node_modules')):
+            if runtime not in runtimes:
+                continue
+            target = directory / folder
+            had_own = (snapshot / folder).is_dir() and not (snapshot / folder).is_symlink() and snapshot != directory
+            manifest_changed = any(Path(path).name in manifests[runtime] and (Path(path).parent.as_posix() or '.') == cwd
+                                   for path in changed)
+            if not (manifest_changed or (not target.exists() and (had_own or missing))):
+                continue
+            try:
+                commands = installation_commands(directory, runtime)
+            except ValueError as error:
+                return f'无法在项目根目录安装依赖：{error}'
+            for argv in commands:
+                result = await self.run(argv, cwd, 900, name=f'install {runtime} dependencies', network=True,
+                                        reason='任务已交付；依赖目录不随交付合并，平台在项目根目录按清单安装依赖后再重启服务')
+                if result.get('exit_code') != 0 or result.get('timed_out'):
+                    return (f"在项目根目录安装依赖失败（{' '.join(argv[:4])}）：\n"
+                            + str(result.get('output', ''))[-1200:])
+        if sandbox.resolve_executable(job.argv[0], directory) is None:
+            return (f'项目根目录下找不到启动命令 {job.argv[0]}；它可能只存在于任务快照里'
+                    '（依赖和虚拟环境不随交付合并），需要让项目能在根目录安装和启动。')
+        return None
+
+    async def restore(self, job, cwd):
+        """Start the pre-delivery copy again from its task snapshot after a failed move."""
+        workspace = Path(job.workspace)
+        if not job.from_snapshot or not workspace.is_dir():
+            return None
+        tokens = active_workspace.set(workspace), source_workspace.set(Path(job.scope))
+        try:
+            old = await self.start(job.argv, cwd, name=job.name, network=job.network, keep=True,
+                                   reason='从项目根目录重启失败，恢复交付前的运行副本')
+        except Exception:
+            logger.warning('Could not restore service %s', job.service or job.name, exc_info=True)
+            return None
+        finally:
+            source_workspace.reset(tokens[1])
+            active_workspace.reset(tokens[0])
+        old.service, old.started_by, old.request, old.conversation = job.service, job.started_by, job.request, job.conversation
+        old.relaunch = 'failed'
+        for port in job.ports:
+            await self.wait_ready(old, port, 60)
+        return old
+
+    async def report_failure(self, job, detail):
+        logger.warning('Kept service %s could not restart from the project root: %s', job.service or job.name, detail[:300])
+        if self.failure_handler is None:
+            return
+        try:
+            await self.failure_handler(job, detail)
+        except Exception:
+            logger.warning('Could not report the service failure', exc_info=True)
+
+    def relaunch_delivered(self, workspace, root, before=None):
         """Move the kept services a delivered task started in its snapshot to the
         project root, where its delivery was just merged. They count as moving from this
-        call on, before the returned coroutine runs, so dependent tasks wait for them."""
+        call on, before the returned coroutine runs, so dependent tasks wait for them.
+        `before`: the delivery's migration (an awaitable result); if it fails the services
+        stay where they run, on the code and schema they had."""
         workspace = str(Path(workspace).resolve())
         jobs = [job for job in self.jobs.values() if job.workspace == workspace and job.keep
                 and job.process.returncode is None and Path(job.workspace).resolve() != Path(root).resolve()]
@@ -374,6 +491,15 @@ class Processes:
         async def move():
             relaunched = []
             try:
+                if before is not None:
+                    try:
+                        migrated = await before
+                    except Exception:
+                        migrated = False
+                    if not migrated:
+                        for job in jobs:
+                            job.relaunch = 'failed'
+                        return relaunched
                 for job in jobs:
                     try:
                         if new := await self.relaunch(job, root):
@@ -395,7 +521,7 @@ class Processes:
                    and job.keep and not job.from_snapshot and self.changed_paths(job, paths)]
         self.mark_stale(project, workspace, paths)
         for job in restart:
-            self.background(self.relaunch(job, root), f'restart kept service {job.service or job.name}')
+            self.background(self.relaunch(job, root, paths), f'restart kept service {job.service or job.name}')
 
     def background(self, coroutine, label):
         """Run platform-initiated service work without blocking the caller: a restart is
@@ -426,7 +552,7 @@ class Processes:
 
     def logs(self, job, offset=0, limit=10000):
         start = max(offset, job.offset)
-        data = b''.join(job.logs)[start-job.offset:start-job.offset+limit]
+        data = mask(b''.join(job.logs), job.secrets)[start-job.offset:start-job.offset+limit]
         return {'output': data.decode(errors='replace'), 'next_offset': start+len(data),
                 'truncated': offset < job.offset, 'available_from': job.offset}
 

@@ -4,9 +4,13 @@
 
 执行权限设置新增“允许所有操作”（`ApprovalSettings.allow_all`）。开启后命令、联网、外部文件读取和文件移动都不再询问，也不调用审核小模型，开启时等待中的操作会直接放行；记录为 `source=allow_all` 的自动通过。系统沙箱、凭据屏蔽和平台控制面保护不受影响。界面在执行权限按钮上标明“全部允许”，开启前需确认，可随时关闭。
 
+## 沙箱的受保护名称
+
+macOS Seatbelt 不允许命令在项目（工作区和项目数据目录）里新建 `.git`、`.agents`、`.codex`、`.aws`、`.ssh`，避免写入宿主工具会读取的仓库钩子、代理配置或凭据。这条规则只作用于项目树，不作用于 scratch（沙箱自己的 HOME 和包管理器缓存），并且在依赖目录里放行（`node_modules`、`site-packages`、`dist-packages`、`__pypackages__`、`.pnpm-store`、`.yarn`、`.cache`）：这些名称在依赖里只是普通的包内容。Seatbelt 以后出现的规则为准，所以规则顺序是：放行可写目录 → 拦截受保护名称 → 放行依赖目录 → 拦截已存在的受保护路径（`.env`、应用数据库等，始终最后）。原规则匹配任意深度：FastAPI 0.142 的 wheel 自带 `.agents/`，安装后成了空包；`uv` 的缓存里有 `sdists-v9/.git`，无法创建虚拟环境（Blog1、Blog2）。
+
 ## 按会话统计用量
 
-`agent_usage` 每次模型调用记录会话（conversation）、项目、任务、执行次数、用途（work / coordination / summary / review / title）、模型、输入/缓存/输出 token、耗时和重试次数（迁移 `0008_usage_sessions`，旧库启动时自动补列）。归属通过上下文变量 `usage_scope` 传递：Leader 每轮、调度任务执行、标题生成时设置，Worker、上下文摘要和命令审核模型自动继承。审核模型与标题模型的用量也计入。
+`agent_usage` 每次模型调用记录会话（conversation）、项目、任务、执行次数、用途（work / coordination / summary / review / title）、模型、输入/缓存/输出 token、其中的推理 token（`reasoning_tokens`，迁移 `0010_reasoning_tokens`）、耗时和重试次数（迁移 `0008_usage_sessions`，旧库启动时自动补列）。归属通过上下文变量 `usage_scope` 传递：Leader 每轮、调度任务执行、标题生成时设置，Worker、上下文摘要和命令审核模型自动继承。审核模型与标题模型的用量也计入。
 
 `GET /api/conversations/{id}/usage` 返回本会话的总量与缓存命中率，按成员、用途、任务、模型分组，以及人工确认/自动通过次数和工具调用失败数。工作日志顶部显示“本会话”的 tokens 与缓存命中率，展开后看分组明细；所有会话累计只作为附注。
 

@@ -26,6 +26,17 @@ def capability():
 
 
 PROTECTED = {'.git', '.aws', '.ssh', '.codex', '.agents', '.wdrunge-runs'}
+# Names a command may not create in the project: a repository, agent configuration
+# and credentials that host tools would pick up from the project tree.
+GUARDED_NAMES = ('.git', '.aws', '.ssh', '.codex', '.agents')
+# Installed packages and package-manager caches inside the project carry such names
+# as ordinary package contents (a wheel's .agents/, a cached checkout's .git/).
+DEPENDENCY_DIRS = ('node_modules', 'site-packages', 'dist-packages', '__pypackages__', '.pnpm-store', '.yarn', '.cache')
+
+
+def sbpl_regex(path) -> str:
+    """A path as a literal inside a Seatbelt #"..." regular expression."""
+    return ''.join('\\' + ch if ch in '.[]{}()*+?^$|\\"' else ch for ch in str(path))
 
 
 def protected_paths(root):
@@ -58,7 +69,9 @@ def host_path() -> str:
                            if entry and Path(entry).resolve() not in own)
 
 
-def clean_environment(scratch, directory):
+def clean_environment(scratch, directory, provided=None):
+    """`provided`: variables of the services the user connected for this project
+    (app.resources); they are the only credentials a project process ever receives."""
     # Never forward provider credentials, Python injection variables or host HOME.
     environment = {key: os.environ[key] for key in ('PATH', 'LANG', 'LC_ALL', 'SYSTEMROOT', 'WINDIR') if key in os.environ}
     if 'PATH' in environment:
@@ -70,6 +83,7 @@ def clean_environment(scratch, directory):
         GIT_CONFIG_GLOBAL=os.devnull, npm_config_userconfig=os.devnull,
         WDRUNGE_DATABASE_PATH=str(scratch / 'service.db'),
         WDRUNGE_DATABASE_URL=f'sqlite+aiosqlite:///{scratch / "service.db"}')
+    environment.update(provided or {})
     venv = directory / '.venv'
     if venv.is_dir() and not venv.is_symlink():
         environment['VIRTUAL_ENV'] = str(venv)
@@ -77,13 +91,20 @@ def clean_environment(scratch, directory):
     return environment
 
 
+def resolve_executable(name, directory, scratch=Path('/nonexistent')):
+    requested = str(directory / name) if not Path(name).is_absolute() and '/' in name else name
+    return shutil.which(requested, path=clean_environment(scratch, directory).get('PATH'))
+
+
 def command_line(argv, workspace, directory, scratch, *, network=False, read_paths=(), write_paths=None, browser=False,
-                 lifeline=None):
+                 lifeline=None, data_paths=(), service_ports=()):
+    """data_paths: the project's runtime data directory, writable from any snapshot.
+    service_ports: loopback ports of the project's connected services (a database),
+    reachable without general network access."""
     status = capability()
     if not status['available']:
         raise SandboxUnavailable(status['detail'])
-    requested = str(directory / argv[0]) if not Path(argv[0]).is_absolute() and '/' in argv[0] else argv[0]
-    executable = shutil.which(requested, path=clean_environment(scratch, directory).get('PATH'))
+    executable = resolve_executable(argv[0], directory, scratch)
     if not executable:
         raise FileNotFoundError(f'Executable not found: {argv[0]}')
     invocation = str(Path(executable).absolute())
@@ -102,7 +123,7 @@ def command_line(argv, workspace, directory, scratch, *, network=False, read_pat
         else:
             raise SandboxUnavailable('该可执行文件位于未授权的工具链目录；请使用项目或系统安装的运行时')
     reads = list(dict.fromkeys([*runtime, workspace, *read_paths]))
-    writes = [scratch, *(write_paths if write_paths is not None else [workspace])]
+    writes = [scratch, *(write_paths if write_paths is not None else [workspace]), *data_paths]
     protected = protected_paths(workspace)
     launcher = Path(__file__).with_name('limit_exec.py').resolve()
     reads += [launcher, Path(sys.executable).resolve()]
@@ -118,11 +139,19 @@ def command_line(argv, workspace, directory, scratch, *, network=False, read_pat
                  '(allow file-write* (literal "/dev/null") (literal "/dev/tty"))']
         rules += [f'(allow file-read* file-map-executable (subpath {quote(path)}))' for path in reads + writes]
         rules += [f'(allow file-write* (subpath {quote(path)}))' for path in writes]
+        # Seatbelt applies the last matching rule. Guarded names may not be created in the
+        # project or its data directory (scratch is the sandbox's own HOME), except inside
+        # installed dependencies; existing protected paths are denied last of all.
+        names = '|'.join(sbpl_regex(name) for name in GUARDED_NAMES)
+        dependencies = '|'.join(sbpl_regex(name) for name in DEPENDENCY_DIRS)
+        for root in dict.fromkeys(path for path in writes if path != scratch):
+            rules.append(f'(deny file-write* (regex #"^{sbpl_regex(root)}/(.*/)?({names})(/|$)"))')
+            rules.append(f'(allow file-write* (regex #"^{sbpl_regex(root)}/(.*/)?({dependencies})/"))')
         rules += [f'(deny file-read* file-write* (subpath {quote(path)}))' for path in protected]
-        # Prevent newly-created sensitive paths, including credential files.
-        rules += ['(deny file-write* (regex #"/(\\.git|\\.aws|\\.ssh|\\.codex|\\.agents)(/|$)"))']
         if network:
             rules.append('(allow network*)')
+        else:
+            rules += [f'(allow network-outbound (remote ip "localhost:{int(port)}"))' for port in service_ports]
         if browser:
             # Only the fixed browser evidence runner gets graphics-device access
             # and Chromium's IPC service namespace; arbitrary commands do not.

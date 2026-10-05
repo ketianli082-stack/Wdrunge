@@ -362,3 +362,77 @@ def test_using_a_core_tool_keeps_the_tool_list_stable():
         assert names(role, 'manage_file') == before
     # A hidden tool that was used still loads its group.
     assert 'collaboration_catalog' in names('backend', 'collaboration_search')
+
+
+def test_publish_accepts_change_fields_beside_changes_and_errors_show_an_example_call():
+    """Blog2: ready/based_on beside changes, changes nested once and changes sent as a
+    JSON string each failed a publish."""
+    from pydantic import ValidationError
+    from app.agents.tools.validation import exception_result
+    from app.collaboration.payloads import Publish
+    import app.collaboration.tools  # registers the publish example  # noqa: F401
+    payload = Publish.model_validate({'changes': [{'document_id': 'd', 'base_version': 2, 'summary': 's'}], 'ready': True,
+                                      'based_on': [{'document_id': 'r', 'version': 1}]}).model_dump(exclude_none=True)
+    assert payload['changes'][0]['ready'] is True and payload['changes'][0]['based_on'] == [{'document_id': 'r', 'version': 1}]
+    assert 'ready' not in Publish.model_json_schema()['properties']
+    for bad in ({'changes': '[{"document_id": "d"}]'}, {'changes': [{'changes': [{'document_id': 'd'}]}]}):
+        try:
+            Publish.model_validate(bad)
+        except ValidationError as error:
+            details = exception_result(error, tool_name='collaboration_publish')['error_details']
+            assert details['example_call']['changes'][0]['edits'][0]['operation'] == 'replace_section_body'
+        else:
+            raise AssertionError(bad)
+
+
+def test_worker_tool_calls_that_raise_are_logged_as_failures(tmp_path, monkeypatch):
+    """Blog2: arguments rejected by a tool's schema reached the model as a failure but were
+    missing from the tool-call log, so the failure rate was understated."""
+    from app.agents.base import AgentSpec
+    from app.agents.worker import WorkerAgent
+    from app.storage import ChatStore
+    async def scenario():
+        store = ChatStore(f'sqlite+aiosqlite:///{tmp_path / "worker-log.db"}')
+        worker = WorkerAgent(AgentSpec(id='backend', name='Backend', prompt_file='backend.md'))
+        worker._store = store
+        calls = []
+        class Model:
+            def bind_tools(self, available):
+                return self
+            async def ainvoke(self, messages, **kwargs):
+                calls.append(messages)
+                if len(calls) == 1:
+                    return AIMessage(content='', tool_calls=[{'name': 'recall_context', 'id': 'bad-1', 'args': {}},
+                                                             {'name': 'recall_context', 'id': 'bad-2', 'args': {'message_id': 'gone'}}])
+                return AIMessage(content='done')
+        monkeypatch.setattr(worker, 'model', lambda: Model())
+        async for _ in worker.stream('time', conversation_id='conv-w', context_mode='fresh', handoff=''):
+            pass
+        rows = await store.load_tool_calls('conv-w')
+        assert [(r['tool'], r['status']) for r in rows] == [('recall_context', 'error')] * 2
+        codes = sorted(json.loads(r['result'])['error_details']['code'] for r in rows)
+        assert codes[0] == 'invalid_arguments' and len(set(codes)) == 2
+        await store.close()
+    asyncio.run(scenario())
+
+
+def test_the_reviewer_call_does_not_stream_so_its_usage_is_reported(monkeypatch):
+    """Blog2: none of 85 reviews were in agent_usage. Inside a streaming agent graph,
+    ainvoke streams, and the provider reports no usage on a stream without include_usage."""
+    from app.execution import permissions
+    seen = {}
+    class Fake:
+        def __init__(self, **kwargs):
+            seen.update(kwargs)
+        async def ainvoke(self, messages):
+            return AIMessage(content='{"decision": "allow", "confidence": 0.9, "reason": "ok"}',
+                             usage_metadata={'input_tokens': 10, 'output_tokens': 5, 'total_tokens': 15})
+    recorded = []
+    async def record_call(store, agent_id, response, purpose):
+        recorded.append((agent_id, purpose, response.usage_metadata['total_tokens']))
+    monkeypatch.setattr(permissions, 'ChatOpenAI', Fake)
+    monkeypatch.setattr('app.agents.usage.record_call', record_call)
+    monkeypatch.setenv('DASHSCOPE_API_KEY', 'test')
+    verdict = asyncio.run(permissions.review({'operation': {'argv': ['ls']}}))
+    assert verdict.decision == 'allow' and seen['disable_streaming'] is True and seen['stream_usage'] is True
+    assert recorded == [('reviewer', 'review', 15)]

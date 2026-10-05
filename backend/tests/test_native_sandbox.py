@@ -38,6 +38,47 @@ print('sandbox-ok')
     assert (root/'ok.txt').read_text() == 'ok' and not outside.exists()
 
 
+def test_guarded_names_are_blocked_in_the_project_but_not_in_dependencies(tmp_path):
+    """Blog1/Blog2: the .git/.agents rule matched at any depth, so FastAPI 0.142 (a wheel
+    with a .agents/ directory) installed as an empty package and uv could not create its
+    cache (sdists-v9/.git). The rule now guards the project tree, not installed packages."""
+    if not sandbox.capability()['available'] or sandbox.capability()['backend'] != 'seatbelt':
+        pytest.skip('Seatbelt sandbox not available')
+    root = tmp_path/'My Project (1)'
+    root.mkdir()
+    scratch = tmp_path/'scratch'
+    scratch.mkdir()
+    allowed = ['.venv/lib/python3.13/site-packages/fastapi/.agents/skills/x.md', 'frontend/node_modules/pkg/.git/HEAD',
+               '.cache/uv/sdists-v9/.git/x']
+    denied = ['.git/hooks/pre-commit', 'server/.git/config', '.agents/skills/x.md', 'docs/.codex/x', '.ssh/id']
+    code = f'''from pathlib import Path
+root, scratch = Path({str(root)!r}), Path({str(scratch)!r})
+for name in {allowed!r}:
+    (root / name).parent.mkdir(parents=True, exist_ok=True)
+    (root / name).write_text('ok')
+(scratch / 'uv-cache/sdists-v9/.git').mkdir(parents=True)
+for name in {denied!r}:
+    try:
+        (root / name).parent.mkdir(parents=True, exist_ok=True)
+        (root / name).write_text('escape')
+    except (PermissionError, OSError):
+        print('blocked', name)
+    else:
+        raise RuntimeError('Sandbox allowed ' + name)
+print('sandbox-ok')
+'''
+    command = sandbox.command_line([sys.executable, '-c', code], root, root, scratch)
+    async def run():
+        process = await asyncio.create_subprocess_exec(*command, cwd=root, env=sandbox.clean_environment(scratch, root),
+                                                       stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
+        output, _ = await asyncio.wait_for(process.communicate(), 15)
+        return process.returncode, output.decode()
+    status, output = asyncio.run(run())
+    assert status == 0 and 'sandbox-ok' in output, output
+    assert all((root / name).read_text() == 'ok' for name in allowed)
+    assert output.count('blocked') == len(denied)
+
+
 def test_native_browser_interactions_errors_and_screenshot(tmp_path, monkeypatch):
     pytest.importorskip('playwright')
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer

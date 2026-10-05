@@ -214,6 +214,49 @@ def test_a_provider_stall_resumes_the_same_context_instead_of_redoing_work(tmp_p
     asyncio.run(scenario())
 
 
+def test_a_runtime_failure_resumes_the_saved_context_once_on_retry(tmp_path, monkeypatch):
+    """Blog2: a context-memory failure failed the task and the retry started cold. A
+    runtime failure now resumes the saved context; a resume that fails again retries fresh."""
+    from app.agents.team import Team
+    from app.agents.worker import WorkerAgent
+    from app.collaboration.runtime import Scheduler
+    from app.collaboration.tools import transition_receipt
+    calls = []
+
+    class Model:
+        def bind_tools(self, tools):
+            return self
+        async def ainvoke(self, messages):
+            calls.append(messages)
+            if len(calls) == 1:
+                return AIMessage(content='', tool_calls=[{'id': 'write-1', 'name': 'write_project_file',
+                                                          'args': {'path': 'backend/app.py', 'content': 'print(1)\n'}}])
+            raise RuntimeError('context memory broke')
+    monkeypatch.setattr(WorkerAgent, 'model', lambda self: Model())
+
+    async def scenario():
+        store, s, p, workspace = await setup(tmp_path)
+        team = Team()
+        await team.configure_persistence(store, InMemorySaver())
+        scheduler = Scheduler(s, team)
+        r = await s.create_request(p, 'leader', 'backend', 'Implement the API in backend/app.py', 'api')
+        await scheduler.execute(*(await s.claim(scheduler.owner)))
+        assert (await s.get_request(p, r['id']))['state'] == 'failed'
+        retried = await s.transition(p, r['id'], 'leader', 'queued', result='retry')
+        assert transition_receipt(retried)['next_attempt'].startswith('continue')
+        await scheduler.execute(*(await s.claim(scheduler.owner)))
+        resumed = calls[2]
+        assert any(isinstance(m, ToolMessage) and m.tool_call_id == 'write-1' for m in resumed)
+        assert any(isinstance(m, HumanMessage) and 'previous attempt failed' in m.content for m in resumed)
+        # The resumed attempt failed the same way: the next retry starts fresh.
+        retried = await s.transition(p, r['id'], 'leader', 'queued', result='retry again')
+        assert transition_receipt(retried)['next_attempt'].startswith('fresh')
+        journal = await s.journal(p, r['id'])
+        assert [(a['mode'], a['outcome']) for a in journal['attempts']] == [('fresh', 'failed'), ('continue', 'failed')]
+        await store.close()
+    asyncio.run(scenario())
+
+
 def test_inspect_request_previews_long_text_unless_full_detail_is_asked(tmp_path):
     async def run():
         store, s, p, _ = await setup(tmp_path)

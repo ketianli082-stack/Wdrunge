@@ -88,8 +88,11 @@ def test_dependents_start_on_a_published_document_or_verified_service(tmp_path):
         testing = await s.create_request(p, 'leader', 'testing', 'Probe API', 'probe', conversation=conv, needs=[{'service': 'api'}])
         assert (await s.claim('owner'))[2]['id'] == backend['id']
         assert await s.claim('owner') is None  # nothing is published or verified yet
-        await s.publish(p, 'backend', [{'path': 'docs/api.md', 'base_version': 0, 'summary': 'Contract', 'content': '# API\n'}])
-        # The frontend starts while the backend task is still running.
+        [draft] = await s.publish(p, 'backend', [{'path': 'docs/api.md', 'base_version': 0, 'summary': 'Contract', 'content': '# API\n'}])
+        assert await s.claim('owner') is None  # a first publication only saves the author's progress
+        await s.publish(p, 'backend', [{'document_id': draft['document_id'], 'base_version': 1, 'summary': 'Complete', 'ready': True,
+                                        'edits': [{'operation': 'insert_section', 'section_id': 'root', 'new_text': '## GET /hello\n'}]}])
+        # Marked ready, the contract lets the frontend start while the backend task is still running.
         assert (await s.claim('owner'))[2]['id'] == frontend['id']
         assert (await s.get_request(p, backend['id']))['state'] == 'running'
         await s.register_service(p, 'backend', 'api')

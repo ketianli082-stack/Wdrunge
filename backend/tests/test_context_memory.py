@@ -93,17 +93,24 @@ def test_oversized_active_turn_rolls_into_clean_context_and_chunks_inputs():
     asyncio.run(run())
 
 
-def test_summary_failure_leaves_original_history_untouched():
+def test_summary_failure_falls_back_to_the_platform_handoff_without_touching_history():
     async def run():
         member = agent(4000)
         class Empty:
+            calls = 0
             async def ainvoke(self, *args, **kwargs):
+                Empty.calls += 1
                 return AIMessage(content='')
         member.model = lambda: Empty()
-        history = [SystemMessage(content='sys'), HumanMessage(content='original task' * 2000)]
-        with pytest.raises(ContextBudgetError, match='usable handoff'):
-            await ContextMemory(member, 'scope').prepare(history)
+        history = [SystemMessage(content='sys'), HumanMessage(content='original task' * 2000, id='task')]
+        result = await ContextMemory(member, 'scope').prepare(history)
+        # One retry with a smaller target, then no model: the task continues.
+        assert result.stage == 'handoff' and Empty.calls == 2
         assert len(history) == 2 and history[1].content == 'original task' * 2000
+        task = next(m for m in result.messages if m.id == 'task')
+        assert task.content.startswith('original task') and 'recall_context(message_id="task")' in task.content
+        assert 'model summary unavailable' in result.messages[-1].content
+        assert message_tokens(result.messages) <= ContextMemory(member, 'scope').budget
     asyncio.run(run())
 
 
@@ -271,6 +278,7 @@ def test_cache_hits_persist_and_old_databases_gain_the_column(tmp_path):
 
 def test_old_tool_bodies_fold_in_batches_under_budget(monkeypatch):
     monkeypatch.setenv('WDRUNGE_FOLD_TRIGGER_TOKENS', '3000')
+    monkeypatch.setenv('WDRUNGE_FOLD_VERBATIM_TOKENS', '5000')
     class Member:
         spec = SimpleNamespace(id='backend')
         def context_window(self):

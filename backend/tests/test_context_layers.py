@@ -19,6 +19,18 @@ from app.storage import ChatStore
 counter = iter(range(10**6))
 
 
+@pytest.fixture(autouse=True)
+def small_tiers(monkeypatch):
+    """Tiny verbatim tier so a few small turns exercise folding; every older turn is an excerpt."""
+    monkeypatch.setenv('WDRUNGE_FOLD_VERBATIM_TOKENS', '1000')
+    monkeypatch.setenv('WDRUNGE_FOLD_EXCERPT_TOKENS', '1000000')
+
+
+def kept(content):
+    """The facts part of a folded result, without its recall note."""
+    return content.split('\n[Excerpt')[0].split('\n[Folded')[0]
+
+
 def turn(*calls):
     """One model turn: an AI message with tool calls and their results."""
     ids = [f'c{next(counter)}' for _ in calls]
@@ -33,6 +45,11 @@ def turn(*calls):
 
 def read(path, text, **args):
     return ('read_project_file', {'path': path, **args}, text)
+
+
+def filler():
+    """A turn larger than the test verbatim tier: everything before it is folded."""
+    return turn(read('notes.txt', 'n' * 2400))
 
 
 def command(argv, exit_code=0, output='', error=None, **args):
@@ -94,15 +111,15 @@ def test_digests_keep_the_facts_agents_act_on():
     text = turn(('other_tool', {}, 'plain ' * 400))
     body = [HumanMessage(content='task', id='task'), *check, *page, *source, *unknown, *text, *turn(), *turn(), *turn()]
     folded = by_id(fold(body))
-    run = json.loads(folded[check[1].id].content.split('\n[Folded')[0])
+    run = json.loads(kept(folded[check[1].id].content))
     assert run['exit_code'] == 1 and 'ERROR: port 8765 refused' in run['output'] and run['argv'] == 'npm test'
-    browser = json.loads(folded[page[1].id].content.split('\n[Folded')[0])
+    browser = json.loads(kept(folded[page[1].id].content))
     assert browser['passed'] is False and browser['screenshot'] == 'docs/testing/browser-1.png'
     assert browser['actions'] == [{'action': 'assert_text', 'selector': '.state', 'passed': True}] and browser['code'] == 'page_errors'
-    file = json.loads(folded[source[1].id].content.split('\n[Folded')[0])
+    file = json.loads(kept(folded[source[1].id].content))
     assert file['path'] == 'frontend/app.js' and file['sha256'] == 'deadbeef' and file['lines'] == 1501
-    assert json.loads(folded[unknown[1].id].content.split('\n[Folded')[0])['items'][-1] == '…95 more'
-    assert len(folded[text[1].id].content) <= 600 and 'recall_context' in folded[text[1].id].content
+    assert json.loads(kept(folded[unknown[1].id].content))['items'][-1] == '…95 more'
+    assert len(folded[text[1].id].content) <= 1500 and 'recall_context' in folded[text[1].id].content
 
 
 def test_folded_call_arguments_cannot_be_sent_back_as_values():
@@ -127,10 +144,10 @@ def test_ledger_records_files_processes_checks_and_open_failures():
             *turn(command(['curl', 'http://127.0.0.1:8765/api/hello'], 0, '{"message": "Hello World"}')),
             *turn(command(['lsof', '-i'], 1, '', error='Command exited 1')),
             *turn(('browser_verify', {}, {'url': 'http://localhost:5173/', 'passed': True, 'screenshot': 'docs/testing/b.png'})),
-            *turn(), *turn(), *turn()]
+            *filler()]
     folded = fold(body)
     ledger = next(m for m in folded if is_ledger(m))
-    assert folded.index(ledger) == context_fold.round_boundary(body)
+    assert folded.index(ledger) == context_fold.verbatim_boundary(body)
     assert 'backend/app.py wrote sha256 abcdef1234567890' in ledger.content
     assert 'api (svc1) running ports [8765]' in ledger.content
     assert '`curl http://127.0.0.1:8765/api/hello` → exit 0' in ledger.content
@@ -138,7 +155,7 @@ def test_ledger_records_files_processes_checks_and_open_failures():
     # Folding again with nothing new keeps the very same ledger message.
     assert next(m for m in fold(folded) if is_ledger(m)) is ledger
     # A later success of the same check resolves the failure.
-    later = [*folded, *turn(command(['lsof', '-i'], 0, 'node 123')), *turn(), *turn(), *turn()]
+    later = [*folded, *turn(command(['lsof', '-i'], 0, 'node 123')), *filler()]
     assert 'Unresolved tool failures' not in next(m for m in fold(later) if is_ledger(m)).content
 
 
@@ -193,7 +210,7 @@ def test_summary_keeps_the_task_recent_turns_and_ledger_verbatim():
         history = [SystemMessage(content='sys'), HumanMessage(content='Project handoff ' * 300, id='handoff'),
                    HumanMessage(content='Assigned task: build the API', id='task'), *work, *recent]
         # Folding alone fits a larger window (Layer 1 is enough there); this one needs a summary.
-        member = agent(10000)
+        member = agent(6000)
         assert (await ContextMemory(agent(24000), 'scope').prepare(history)).stage == 'fold'
         model = Summarizer()
         member.model = lambda: model
@@ -243,3 +260,32 @@ def test_retry_handoff_carries_the_previous_attempts_facts():
         assert 'docs/testing/s.png' in progress
         assert await worker.previous_progress('unknown') == ''
     asyncio.run(run())
+
+
+def test_the_newest_outline_of_each_document_keeps_every_section_id_when_folded():
+    outline = [{'id': f's{i}', 'title': f'Section {i}', 'level': 2, 'characters': 900} for i in range(40)]
+    older = turn(('collaboration_read', {'document_id': 'design'}, {'document_id': 'design', 'version': 3, 'outline': outline[:30]}))
+    publish = turn(('collaboration_publish', {'changes': [{'document_id': 'design', 'base_version': 3, 'summary': 'x'}]},
+                    {'revisions': [{'document_id': 'design', 'version': 4, 'path': 'docs/design.md', 'characters': 36000,
+                                    'outline': outline, 'budget': 15000}]}))
+    body = [HumanMessage(content='task', id='task'), *older, *publish, *turn(), *turn(), *turn()]
+    folded = by_id(fold(body))
+    outline_kept = json.loads(kept(folded[publish[1].id].content))
+    assert [s["id"] for s in outline_kept["revisions"][0]["outline"]] == [s['id'] for s in outline]
+    assert outline_kept["revisions"][0]["budget"] == 15000
+    # The older outline of the same document is folded to the usual short form.
+    assert len(json.loads(kept(folded[older[1].id].content))['outline']) == 20
+
+
+def test_folded_writes_and_reads_keep_the_file_structure():
+    from app.agents.tools.validation import folded_call_failure
+    source = 'import os\n\n\nclass Store:\n    def get(self, key):\n        return key\n\n\ndef create_app():\n    return 1\n' + '# pad\n' * 200
+    [call] = context_fold.fold_call(AIMessage(content='', tool_calls=[
+        {'id': 'w', 'name': 'write_project_file', 'args': {'path': 'backend/app.py', 'content': source}}])).tool_calls
+    placeholder = call['args']['content']
+    assert 'L4 class Store:' in placeholder and 'L5 def get(self, key):' in placeholder and 'L9 def create_app():' in placeholder
+    assert folded_call_failure(call['args'])['error_details']['code'] == 'folded_placeholder'
+    body = [HumanMessage(content='task', id='task'), *(page := turn(read('backend/app.py', '[sha256=ab12; characters=9]\n' + source))),
+            *filler()]
+    digest = json.loads(kept(by_id(fold(body))[page[1].id].content))
+    assert 'L9 def create_app():' in digest['structure']

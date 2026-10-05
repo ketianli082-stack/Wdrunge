@@ -64,6 +64,8 @@ class DocumentChange(StrictPayload):
     based_on: list[RevisionReference] = Field(default_factory=list)
     allow_merge: bool = False
     external: bool = False
+    ready: bool = Field(False, description='Mark the document complete enough for tasks waiting on it; they start now '
+                                           'instead of when you submit your task')
 
     @model_validator(mode='after')
     def valid_change(self):
@@ -91,14 +93,19 @@ class Publish(StrictPayload):
     @model_validator(mode='before')
     @classmethod
     def change_defaults(cls, data):
-        """Models often put summary/base_version beside changes instead of inside each
-        change; apply them where unambiguous rather than failing the whole call."""
+        """Models often put change fields (summary, base_version, ready, based_on) beside
+        changes instead of inside each change; apply them where unambiguous rather than
+        failing the whole call. ready and based_on are accepted here without being
+        advertised in the schema, which every call resends."""
         if not isinstance(data, dict) or not isinstance(data.get('changes'), list):
             return data
-        summary, version = data.get('summary'), data.get('base_version')
+        data = dict(data)
+        extra = {key: data.pop(key) for key in ('ready', 'based_on') if key in data}
+        version = data.get('base_version')
         if isinstance(version, str) and version.isdigit():
             version = int(version)
-        if summary is None and version is None:
+        defaults = {key: value for key, value in {'summary': data.get('summary'), **extra}.items() if value is not None}
+        if not defaults and version is None:
             return {**data, 'changes': fold_edits(data['changes'])}
         changes = data['changes']
         if version is not None and len(changes) != 1:
@@ -106,9 +113,7 @@ class Publish(StrictPayload):
         folded = []
         for change in changes:
             if isinstance(change, dict):
-                change = dict(change)
-                if summary is not None:
-                    change.setdefault('summary', summary)
+                change = {**defaults, **change}
                 if version is not None:
                     if 'base_version' in change and change['base_version'] != version:
                         raise ValueError('Top-level base_version differs from the change base_version')
@@ -131,6 +136,8 @@ def fold_edits(changes):
                 and bool(change.get('allow_merge')) == bool(first.get('allow_merge'))
                 and isinstance(change.get('edits', []), list) and isinstance(first.get('edits', []), list)):
             first['edits'] = [*first.get('edits', []), *change.get('edits', [])]
+            if change.get('ready'):
+                first['ready'] = True
             summaries = [text for text in (first.get('summary'), change.get('summary')) if text]
             if summaries:
                 first['summary'] = '; '.join(dict.fromkeys(summaries))[:2000]

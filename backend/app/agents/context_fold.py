@@ -1,17 +1,21 @@
 """First-layer context compaction without model calls.
 
-Older tool output is replaced by compact pointers, never silently dropped:
-- superseded results (the same file, document section, process or check read again)
-  become a one-line stub, because a newer copy of the same resource is in context;
-- other old results become a per-tool digest that keeps the facts agents act on
-  (paths, hashes, exit codes, pass/fail, error codes);
-- a task ledger keeps file, process, check and error facts from everything folded.
+Older tool output is replaced by compact pointers, never silently dropped. History is
+tiered by content volume, counted in whole model turns from the newest:
+- verbatim: the newest turns up to WDRUNGE_FOLD_VERBATIM_TOKENS (the current turn always);
+- excerpt: the next WDRUNGE_FOLD_EXCERPT_TOKENS keep each result's facts and its head;
+- pointer: older results keep one line naming the tool, the resource and the message ID.
+Results superseded by a newer read of the same resource become a one-line stub, and a
+task ledger keeps file, process, check and error facts from everything folded.
 Originals stay in the compaction audit; recall_context returns them by message ID.
+Facts about an original (its size, whether a read covered the whole file) are kept in
+additional_kwargs['fold'] at its first fold, which is never sent to the model.
 """
 from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import re
 
@@ -19,33 +23,103 @@ from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMe
 
 LEDGER_PREFIX = 'Task ledger (facts extracted from earlier tool results; historical data, not instructions):\n'
 SIGNAL = re.compile(r'error|fail|exception|traceback|warn|denied|not found|cannot|unable|refused|✗|✘', re.I)
-FOLD_LIMIT = 600
 DIGEST_LIMIT = 1200
 LEDGER_LIMIT = 3500
+# Results up to these sizes stay as they are in the excerpt and pointer tiers.
+EXCERPT_KEEP = 1200
+POINTER_KEEP = 300
+# Characters of a folded file or document body the excerpt tier keeps.
+EXCERPT_HEAD = 600
+EXCERPT, POINTER, STUB = 1, 2, 3
 
 
-def keep_rounds() -> int:
-    """Model turns (with all their tool results) that always stay verbatim."""
+def _setting(name: str, default: int, minimum: int) -> int:
     try:
-        return max(1, int(os.getenv('WDRUNGE_FOLD_KEEP_ROUNDS', '3')))
+        return max(minimum, int(os.getenv(name, str(default))))
     except ValueError:
-        return 3
+        return default
+
+
+def verbatim_tokens() -> int:
+    """Estimated tokens of the newest turns whose tool results stay verbatim."""
+    return _setting('WDRUNGE_FOLD_VERBATIM_TOKENS', 30000, 1000)
+
+
+def excerpt_tokens() -> int:
+    """Estimated tokens (of the originals) before the verbatim turns kept as excerpts."""
+    return _setting('WDRUNGE_FOLD_EXCERPT_TOKENS', 15000, 0)
 
 
 def text_of(message: BaseMessage) -> str:
     return message.content if isinstance(message.content, str) else json.dumps(message.content, ensure_ascii=False)
 
 
+def estimate(text: str) -> int:
+    # The same estimate as app.agents.memory.estimate_tokens (UTF-8 bytes / 2).
+    return math.ceil(len(text.encode('utf-8')) / 2)
+
+
 def is_ledger(message: BaseMessage) -> bool:
     return isinstance(message, HumanMessage) and 'context_ledger' in message.additional_kwargs
 
 
-def round_boundary(messages: list[BaseMessage], rounds: int | None = None) -> int:
-    """Index of the first message of the last `rounds` model turns. Everything from
-    there on, including the current turn's unread results, stays verbatim."""
+FOLDED_TEXT = re.compile(r'^\[(?:Superseded|Stale)|\n\[Folded .* result; recall_context|^\[Folded ', re.S)
+
+
+def facts_of(message: BaseMessage) -> dict:
+    """Facts about the original of a message: recorded at its first fold, else measured
+    now. A message folded before these facts were recorded never counts as complete."""
+    meta = message.additional_kwargs.get('fold')
+    if isinstance(meta, dict):
+        return meta
+    text = text_of(message)
+    tokens = 12 + estimate(text)
+    if isinstance(message, AIMessage) and message.tool_calls:
+        tokens += estimate(json.dumps(message.tool_calls, ensure_ascii=False))
+    legacy = isinstance(message, ToolMessage) and bool(FOLDED_TEXT.search(text))
+    return {'level': STUB if legacy else 0, 'tokens': tokens, 'characters': len(text),
+            'complete': not legacy and '[truncated; next_offset=' not in text}
+
+
+def with_facts(message: BaseMessage, level: int, **update) -> BaseMessage:
+    meta = {**facts_of(message), 'level': level}
+    return message.model_copy(update={**update, 'additional_kwargs': {**message.additional_kwargs, 'fold': meta}})
+
+
+def tier_bounds(messages: list[BaseMessage], budget: int | None = None) -> tuple[int, int]:
+    """(excerpt_start, verbatim_start): indexes of the first message of the excerpt and
+    verbatim tiers. Turns are counted whole, by the size of their originals; the current
+    turn, including results the model has not read yet, is always verbatim.
+    verbatim_start is 0 when every turn fits verbatim (nothing to fold). With a context
+    budget, the tiers take at most a third and a sixth of it (small context windows)."""
+    verbatim_limit, excerpt_limit = verbatim_tokens(), excerpt_tokens()
+    if budget:
+        verbatim_limit, excerpt_limit = min(verbatim_limit, budget // 3), min(excerpt_limit, budget // 6)
     turns = [i for i, m in enumerate(messages) if isinstance(m, AIMessage)]
-    rounds = rounds or keep_rounds()
-    return turns[-rounds] if len(turns) >= rounds else 0
+    if not turns:
+        return 0, 0
+
+    def size(k):
+        end = turns[k + 1] if k + 1 < len(turns) else len(messages)
+        return sum(facts_of(m)['tokens'] for m in messages[turns[k]:end] if isinstance(m, (AIMessage, ToolMessage)))
+
+    k, used = len(turns) - 1, size(len(turns) - 1)
+    while k > 0 and used + size(k - 1) <= verbatim_limit:
+        k -= 1
+        used += size(k)
+    if k == 0:
+        return 0, 0
+    verbatim = turns[k]
+    used = 0
+    while k > 0 and used + size(k - 1) <= excerpt_limit:
+        k -= 1
+        used += size(k)
+    return turns[k], verbatim
+
+
+def verbatim_boundary(messages: list[BaseMessage], budget: int | None = None) -> int:
+    """Index of the first message of the verbatim tier; 0 when nothing is folded."""
+    return tier_bounds(messages, budget)[1]
 
 
 def calls_by_id(messages: list[BaseMessage]) -> dict[str, dict]:
@@ -106,8 +180,10 @@ def resource_key(name: str, args: dict) -> tuple | None:
     return None
 
 
-def full_read(args: dict, text: str) -> bool:
-    return not args.get('offset') and '[truncated; next_offset=' not in text
+def full_read(args: dict, message: BaseMessage) -> bool:
+    """Whether a read covered the whole file, judged on the original result: a folded
+    partial read no longer carries its truncation marker."""
+    return not args.get('offset') and bool(facts_of(message).get('complete'))
 
 
 def supersession(messages: list[BaseMessage], until: int) -> dict[int, str]:
@@ -132,7 +208,7 @@ def supersession(messages: list[BaseMessage], until: int) -> dict[int, str]:
         key = resource_key(name, args)
         if key is None:
             continue
-        if name == 'read_project_file' and ok and full_read(args, text_of(message)):
+        if name == 'read_project_file' and ok and full_read(args, message):
             # A complete read replaces every earlier range of the same file.
             for older in reads.pop(args.get('path'), []):
                 if older < until:
@@ -148,6 +224,37 @@ def supersession(messages: list[BaseMessage], until: int) -> dict[int, str]:
 
 
 # --- per-tool digests ---------------------------------------------------------
+
+STRUCTURE_LIMIT = 1500
+STRUCTURE = [
+    (re.compile(r'\.(py|pyi)$'), re.compile(r'^(?:\s{0,4})(?:async\s+def|def|class)\s+\w+.*|^[A-Z][A-Z0-9_]{2,}\s*[:=].*')),
+    (re.compile(r'\.(js|jsx|ts|tsx|mjs|cjs|vue|svelte)$'),
+     re.compile(r'^\s*(?:export\s+)?(?:default\s+)?(?:async\s+)?(?:function\*?|class|interface|type|enum)\s+\w+.*'
+                r'|^(?:export\s+)?(?:const|let)\s+\w+\s*=.*|^\s*<(?:template|script|style)\b.*|^\s*(?:app|router)\.\w+\(.*')),
+    (re.compile(r'\.(md|markdown)$'), re.compile(r'^#{1,4}\s+\S.*')),
+    (re.compile(r'\.(go|rs|java|kt|rb|php|cs|swift)$'),
+     re.compile(r'^\s*(?:pub\s+)?(?:func|fn|def|class|struct|interface|enum|impl|type|public|private|protected)\b.*')),
+    (re.compile(r'\.(css|scss|less)$'), re.compile(r'^[^\s{}][^{}]*\{\s*$|^:root.*')),
+]
+
+
+def structure(path, text: str, first_line=1) -> str:
+    """Line-numbered declarations (or headings) of a source file, so an author whose
+    written or read file was folded still knows what it contains and where."""
+    pattern = next((p for match, p in STRUCTURE if match.search(str(path or ''))), None)
+    if pattern is None:
+        return ''
+    found = [f'L{first_line + number} {clip(line.strip(), 100)}' for number, line in enumerate(text.splitlines())
+             if pattern.match(line)]
+    rendered, used = [], 0
+    for item in found:
+        if used + len(item) + 3 > STRUCTURE_LIMIT:
+            rendered.append(f'…(+{len(found) - len(rendered)} more)')
+            break
+        rendered.append(item)
+        used += len(item) + 3
+    return ' | '.join(rendered)
+
 
 def output_digest(output: str) -> list[str]:
     lines = [line.strip() for line in str(output).splitlines() if line.strip()]
@@ -179,8 +286,10 @@ def failure_digest(data: dict) -> dict:
                  'category': details.get('category')}, 'error', 'code', 'category')
 
 
-def digest(name: str, args: dict, text: str) -> str | None:
-    """A compact rendering that keeps decision-relevant facts, or None to fall back."""
+def digest(name: str, args: dict, text: str, keep_outline=False, head=EXCERPT_HEAD) -> str | None:
+    """A compact rendering that keeps decision-relevant facts, or None to fall back.
+    keep_outline keeps every section ID of the newest outline of a document; head is
+    how much of a file or document body is kept."""
     data = parse(text)
     if name == 'read_project_file' and data is None:
         header = re.match(r'\[sha256=(\w+); characters=(\d+)\]\n', text)
@@ -192,7 +301,10 @@ def digest(name: str, args: dict, text: str) -> str | None:
         more = re.search(r'\[truncated; next_offset=(\d+)\]', body)
         if more:
             facts['next_offset'] = int(more.group(1))
-        return json.dumps({**facts, 'head': clip(body[:160], 160)}, ensure_ascii=False)
+        shape = structure(args.get('path'), body, 1) if not args.get('offset') else ''
+        if shape:
+            facts['structure'] = shape
+        return json.dumps({**facts, **({'head': clip(body[:head], head)} if head else {})}, ensure_ascii=False)
     if not isinstance(data, dict):
         return None
     if name in {'execute_command', 'manage_process'}:
@@ -216,14 +328,25 @@ def digest(name: str, args: dict, text: str) -> str | None:
         if data.get('text'):
             facts['text'] = clip(data['text'], 300)
         return json.dumps({**facts, **failure_digest(data)}, ensure_ascii=False)
+    if name == 'collaboration_publish' and isinstance(data.get('revisions'), list):
+        revisions = []
+        for item in data['revisions']:
+            if not isinstance(item, dict):
+                continue
+            entry = pick(item, 'document_id', 'version', 'path', 'characters', 'budget', 'ready')
+            if keep_outline and item.get('outline'):
+                entry['outline'] = [pick(s, 'id', 'title') for s in item['outline'] if isinstance(s, dict)]
+            revisions.append(entry)
+        return json.dumps({'revisions': revisions, **pick(data, 'budget_notice', 'ready_hint'), **failure_digest(data)}, ensure_ascii=False)
     if name == 'collaboration_read':
         facts = pick(data, 'document_id', 'version', 'next_offset')
         if isinstance(data.get('section'), dict):
             facts['section'] = pick(data['section'], 'id', 'title')
         if data.get('outline'):
-            facts['outline'] = [pick(s, 'id', 'title') if isinstance(s, dict) else clip(s, 80) for s in data['outline'][:20]]
-        if data.get('content'):
-            facts['content'] = clip(data['content'], 300)
+            facts['outline'] = [pick(s, 'id', 'title') if isinstance(s, dict) else clip(s, 80)
+                                for s in data['outline'][:None if keep_outline else 20]]
+        if data.get('content') and head:
+            facts['content'] = clip(data['content'], head)
         return json.dumps({**facts, **failure_digest(data)}, ensure_ascii=False)
     if name == 'search_code':
         hits = [f"{m.get('path')}:{m.get('line')}: {clip(m.get('text', ''), 100)}" for m in data.get('matches', [])[:15]]
@@ -240,15 +363,71 @@ def fold_marker(name: str, message_id: str) -> str:
     return f'\n[Folded {name} result; recall_context(message_id="{message_id}") returns the original.]'
 
 
-def fold_result(message: ToolMessage, name: str, args: dict) -> ToolMessage:
-    text = text_of(message)
-    if len(text) <= FOLD_LIMIT:
+TARGET_ARGS = ('path', 'document_id', 'section_id', 'offset', 'limit', 'query', 'process_id', 'action', 'url',
+               'message_id', 'identifier', 'name')
+
+
+def pointer_facts(name: str, args: dict, text: str) -> dict:
+    """What a one-line pointer keeps: the call's target, the result's size and status."""
+    facts = {key: clip(args[key], 80) for key in TARGET_ARGS if args.get(key) not in (None, '', [], {})}
+    if name == 'execute_command':
+        facts['argv'] = clip(' '.join(map(str, [args.get('command', ''), *(args.get('arguments') or [])])), 120)
+    facts['characters'] = len(text)
+    data = parse(text)
+    if isinstance(data, dict):
+        facts.update({key: data[key] for key in ('version', 'exit_code', 'state', 'passed', 'next_offset', 'id')
+                      if isinstance(data.get(key), (str, int, float, bool)) and data.get(key) != ''})
+        if isinstance(data.get('revisions'), list):
+            facts['revisions'] = [pick(r, 'document_id', 'version', 'ready') for r in data['revisions'][:5] if isinstance(r, dict)]
+        if data.get('error'):
+            facts.update(failure_digest(data))
+            facts['error'] = clip(data['error'], 160)
+    else:
+        header = re.match(r'\[sha256=(\w+); characters=(\d+)\]', text)
+        if header:
+            facts['sha256'] = header.group(1)[:16]
+        more = re.search(r'\[truncated; next_offset=(\d+)\]', text)
+        if more:
+            facts['next_offset'] = int(more.group(1))
+    return facts
+
+
+def pointer_message(message: ToolMessage, name: str, facts: dict) -> ToolMessage:
+    pointer = json.dumps(facts.get('pointer') or {'characters': facts.get('characters')}, ensure_ascii=False)
+    content = f'[Folded {name} result {pointer}; recall_context(message_id="{message.id}") returns it.]'
+    meta = {key: value for key, value in facts.items() if key != 'outline'}
+    return message.model_copy(update={'content': content, 'artifact': None,
+                                      'additional_kwargs': {**message.additional_kwargs, 'fold': {**meta, 'level': POINTER}}})
+
+
+def fold_result(message: ToolMessage, name: str, args: dict, level=EXCERPT, keep_outline=False) -> ToolMessage:
+    """The message at the given tier. Excerpt: facts and the head of a body. Pointer:
+    one line. The newest outline of a document keeps its section IDs at any tier until
+    a newer outline replaces it. A message already folded that far is unchanged."""
+    facts = facts_of(message)
+    if facts.get('outline'):
+        return message if keep_outline else pointer_message(message, name, facts)
+    if facts['level'] >= level:
         return message
-    marker = fold_marker(name, message.id)
+    text = text_of(message)
+    if facts['level'] == 0 and len(text) <= (EXCERPT_KEEP if level == EXCERPT else POINTER_KEEP):
+        return message
+    if facts['level'] == 0:
+        # Recorded once, from the original, so a later pointer does not need it.
+        facts = {**facts, 'pointer': pointer_facts(name, args, text)}
+        if keep_outline and (rendered := digest(name, args, text, keep_outline=True, head=EXCERPT_HEAD if level == EXCERPT else 0)):
+            return message.model_copy(update={'content': rendered + fold_marker(name, message.id), 'artifact': None,
+                                              'additional_kwargs': {**message.additional_kwargs,
+                                                                    'fold': {**facts, 'level': level, 'outline': True}}})
+    message = message.model_copy(update={'additional_kwargs': {**message.additional_kwargs, 'fold': facts}})
+    if level == POINTER:
+        return pointer_message(message, name, facts)
     rendered = digest(name, args, text)
-    if rendered is None or len(rendered) + len(marker) >= len(text):
-        rendered = text[:FOLD_LIMIT - len(marker)]
-    return message.model_copy(update={'content': rendered + marker, 'artifact': None})
+    if rendered is None or len(rendered) + 200 >= len(text):
+        rendered = text[:EXCERPT_KEEP]
+    note = (f'\n[Excerpt: {len(rendered):,} of {facts["characters"]:,} characters kept; recall_context(message_id='
+            f'"{message.id}") returns the original, or read the source again for its current text.]')
+    return with_facts(message, EXCERPT, content=rendered + note, artifact=None)
 
 
 # Folded call arguments stay in history in the place of the real ones, so a model can
@@ -268,27 +447,53 @@ def folded_argument(value, path='') -> str | None:
     return None
 
 
-def shrink(value, limit=400):
+def shrink(value, limit=400, keep=200):
+    """Strings longer than limit keep their first `keep` characters and a placeholder."""
     if isinstance(value, str) and len(value) > limit:
-        return value[:limit // 2] + f' …[{len(value) - limit // 2} characters folded; not the value]'
+        return value[:keep] + f' …[{len(value) - keep} characters folded; not the value]'
     if isinstance(value, list):
-        return [shrink(item, limit) for item in value]
+        return [shrink(item, limit, keep) for item in value]
     if isinstance(value, dict):
-        return {key: shrink(item, limit) for key, item in value.items()}
+        return {key: shrink(item, limit, keep) for key, item in value.items()}
     return value
 
 
-def fold_call(message: AIMessage) -> AIMessage:
-    """Large arguments (written file bodies, long commands) are on disk or in the audit."""
+CALL_LIMIT = 1500
+
+
+def shrink_args(args: dict, level: int):
+    """Excerpt: long strings keep a short head, unless the call stays large (a publish
+    with many edits); pointer: long strings keep no text, only the arguments' shape."""
+    if level == EXCERPT:
+        shrunk = shrink(args, 400, 120)
+        if len(json.dumps(shrunk, ensure_ascii=False)) <= CALL_LIMIT:
+            return shrunk
+    return shrink(args, 160, 0)
+
+
+def fold_call(message: AIMessage, level=EXCERPT) -> AIMessage:
+    """Large arguments (written file bodies, document edits, long commands) are on disk,
+    in the published revision or in the audit."""
+    if facts_of(message)['level'] >= level:
+        return message
     calls = []
     for call in message.tool_calls:
         args = call.get('args') or {}
-        if call['name'] == 'write_project_file' and isinstance(args.get('content'), str) and len(args['content']) > 400:
+        if (call['name'] == 'write_project_file' and isinstance(args.get('content'), str) and len(args['content']) > 400
+                and not FOLDED_VALUE.search(args['content'])):  # not a placeholder folded earlier
             body = args['content']
-            args = {**args, 'content': f'<{len(body)} characters written to {args.get("path")}; '
-                                       f'sha256 {hashlib.sha256(body.encode()).hexdigest()[:16]}…; the file is on disk, not this text>'}
-        calls.append({**call, 'args': shrink(args)})
-    return message if calls == message.tool_calls else message.model_copy(update={'tool_calls': calls})
+            shape = structure(args.get('path'), body)
+            placeholder = (f'<{len(body)} characters written to {args.get("path")}; '
+                           f'sha256 {hashlib.sha256(body.encode()).hexdigest()[:16]}…; '
+                           + (f'structure: {shape}; ' if shape else '') + 'the file is on disk, not this text>')
+            # The placeholder is already compact; shrinking would cut the structure.
+            calls.append({**call, 'args': {**shrink_args({k: v for k, v in args.items() if k != 'content'}, level),
+                                           'content': placeholder}})
+            continue
+        calls.append({**call, 'args': shrink_args(args, level)})
+    if calls == message.tool_calls:
+        return message
+    return with_facts(message, level, tool_calls=calls)
 
 
 # --- task ledger --------------------------------------------------------------
@@ -341,7 +546,7 @@ def record_facts(ledger: dict, messages: list[BaseMessage], calls: dict | None =
                 ledger['files'][args['path']] = {'op': 'read', 'message': message.id,
                                                  **({'sha256': header.group(1)[:16]} if header else {})}
         elif name in {'collaboration_publish', 'collaboration_read'} or (name == 'collaborate' and args.get('action') in {'publish', 'read'}):
-            items = raw if isinstance(raw, list) else (data.get('results') or data.get('documents') or [data])
+            items = raw if isinstance(raw, list) else (data.get('revisions') or data.get('results') or data.get('documents') or [data])
             for item in items:
                 if isinstance(item, dict) and item.get('document_id'):
                     ledger['documents'][item['document_id']] = {
@@ -407,16 +612,39 @@ def ledger_message(ledger: dict) -> HumanMessage | None:
     return HumanMessage(content=LEDGER_PREFIX + text, additional_kwargs={'context_ledger': ledger})
 
 
-def fold(body: list[BaseMessage]) -> list[BaseMessage]:
-    """Fold everything before the kept turns, supersede stale results except in the
-    current turn, and place an updated ledger at the fold boundary."""
-    boundary = round_boundary(body)
+def latest_outlines(body: list[BaseMessage], calls: dict) -> set[int]:
+    """Indexes of the newest result carrying each document's outline (a publish receipt
+    or an outline read), whose section IDs survive folding: authors edit by those IDs,
+    and losing them made agents reload the outline before every edit."""
+    latest: dict[str, int] = {}
+    for index, message in enumerate(body):
+        if not isinstance(message, ToolMessage) or failed(message):
+            continue
+        name = tool_name(message, calls)
+        data = parse(text_of(message))
+        if not isinstance(data, dict):
+            continue
+        if name == 'collaboration_publish':
+            for item in data.get('revisions') or ():
+                if isinstance(item, dict) and item.get('outline') and item.get('document_id'):
+                    latest[item['document_id']] = index
+        elif name == 'collaboration_read' and data.get('outline') and data.get('document_id'):
+            latest[data['document_id']] = index
+    return set(latest.values())
+
+
+def fold(body: list[BaseMessage], budget: int | None = None) -> list[BaseMessage]:
+    """Fold everything before the verbatim tier (excerpts, then pointers), supersede
+    stale results except in the current turn, and place an updated ledger at the
+    verbatim boundary."""
+    excerpt_start, boundary = tier_bounds(body, budget)
     if not boundary:
         return list(body)
     turns = [i for i, m in enumerate(body) if isinstance(m, AIMessage)]
     current = turns[-1] if turns else len(body)
     calls = calls_by_id(body)
     stubs = supersession(body, current)
+    outlines = latest_outlines(body, calls)
     ledger = record_facts(ledger_of(body), [m for m in body[:boundary] if not is_ledger(m)], calls)
     entry = ledger_message(ledger)
     previous = next((m for m in body if is_ledger(m)), None)
@@ -431,14 +659,17 @@ def fold(body: list[BaseMessage]) -> list[BaseMessage]:
             message = message.model_copy(update={'content': '[Superseded goal reminder; a newer one follows.]'})
         if index == boundary and entry is not None:
             folded.append(entry)
+        level = EXCERPT if index >= excerpt_start else POINTER
         if isinstance(message, ToolMessage):
             name = tool_name(message, calls)
             if index in stubs:
                 stub = stubs[index] + f' recall_context(message_id="{message.id}") returns this older result.'
-                message = message.model_copy(update={'content': stub, 'artifact': None})
+                if text_of(message) != stub:
+                    message = with_facts(message, STUB, content=stub, artifact=None)
             elif index < boundary:
-                message = fold_result(message, name, (calls.get(message.tool_call_id) or {}).get('args') or {})
+                message = fold_result(message, name, (calls.get(message.tool_call_id) or {}).get('args') or {},
+                                      level, keep_outline=index in outlines)
         elif isinstance(message, AIMessage) and message.tool_calls and index < boundary:
-            message = fold_call(message)
+            message = fold_call(message, level)
         folded.append(message)
     return folded

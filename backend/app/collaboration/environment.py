@@ -19,6 +19,7 @@ from pathlib import Path
 from app.execution.ports import port_open
 
 SERVICE_NAME = re.compile(r'^[a-z0-9][a-z0-9_.-]{0,39}$')
+MIGRATION = re.compile(r'migrat|迁移', re.I)
 KINDS = ('http', 'tcp', 'other')
 # Ports the Wdrunge platform itself serves or is used from (its API and UI dev server).
 # Learned from live requests, so no number is hard-coded; WDRUNGE_RESERVED_PORTS adds more.
@@ -83,7 +84,7 @@ def trusted(service: dict) -> bool:
 
 # --- manifest discovery -------------------------------------------------------
 
-SKIP = {'node_modules', '.venv', '.git', 'dist', 'build', 'target', '.wdrunge-runs', '__pycache__'}
+SKIP = {'node_modules', '.venv', '.git', 'dist', 'build', 'target', '.wdrunge-runs', '.wdrunge-data', '__pycache__'}
 
 
 def _candidates(root: Path, depth=2):
@@ -188,6 +189,19 @@ def runtime_label(runtime: dict) -> str:
     return label + ')'
 
 
+async def connected_brief(project) -> dict | None:
+    """Connected services and the project database, for every agent handoff."""
+    from app.resources import service
+    if service.current is None:
+        return None
+    try:
+        return await service.current.brief(project) or None
+    except Exception:
+        import logging
+        logging.getLogger(__name__).warning('Could not describe connected services', exc_info=True)
+        return None
+
+
 class EnvironmentMixin:
     """Methods of Collaboration; records live in collaboration_records."""
 
@@ -213,10 +227,95 @@ class EnvironmentMixin:
         commands = [{'name': c['name'], 'run': ' '.join(c['argv']), 'cwd': c.get('cwd', '.'), 'status': c.get('status')}
                     for c in data['commands'][:15]]
         return {'host': data['host'], 'reserved_ports': data['reserved_ports'], 'services': services, 'commands': commands,
+                **({'connected': connected} if (connected := await connected_brief(project)) else {}),
                 'rule': 'Use these service ports and commands. Never use reserved ports. Register a new service with '
                         'collaboration_register_service to get a free port; refer to services by name. A running '
                         'service is already serving the project: use it instead of starting another copy; restart '
                         'it (keep_running=true) only when you changed its code or it is marked stale.'}
+
+    async def connected_service(self, project, name=None, port=None) -> str | None:
+        """The connected service (app.resources) a service name or loopback port refers
+        to: the platform provides it, so it is never registered, declared or started."""
+        from app.resources import kinds, service
+        if service.current is None:
+            return None
+        try:
+            names = await service.current.names(project)
+        except Exception:
+            return None
+        if name in names:
+            return name
+        return next((key for key, item in names.items() if port and item['port'] == port and kinds.loopback(item['host'])), None)
+
+    async def migration_for(self, project, paths) -> dict | None:
+        """The registered migration command a merge of `paths` calls for: the command
+        named "migrate" (or whose purpose is migrating), when a merged path is under its
+        directory."""
+        async with self.reading() as c:
+            commands = await self._list(c, 'command', project)
+        command = next((c for c in commands if c['name'] == 'migrate'), None) or next(
+            (c for c in commands if MIGRATION.search(c.get('purpose') or '')), None)
+        if command is None:
+            return None
+        base = (command.get('cwd') or '.').strip('/')
+        if base in {'', '.'} or any(path == base or path.startswith(base + '/') for path in paths):
+            return command
+        return None
+
+    async def apply_migration(self, project, request_id, root, work, command, conversation='') -> bool:
+        """Run the project's migration command at the project root after a merge, with a
+        backup of the project database first. False (and the Leader is told) when it fails:
+        services then keep running the code they had."""
+        from types import SimpleNamespace
+        from app.agents.tools._workspace import active_workspace, source_workspace
+        from app.execution import sandbox
+        from app.execution.processes import processes
+        from app.resources import kinds, service
+        root, cwd = Path(root).resolve(), command.get('cwd') or '.'
+        note = ''
+        if service.current is not None:
+            try:
+                made = await service.current.backup_project(project)
+                note = f"迁移前已备份数据库（{made['name']}），可在「服务连接」中恢复。" if made else ''
+            except Exception as error:
+                note = f'迁移前没能备份数据库：{kinds.friendly(error)}。'
+        tokens = active_workspace.set(root), source_workspace.set(root)
+        try:
+            problem = await processes.prepare_root(SimpleNamespace(argv=command['argv'], cwd=str(Path(work) / cwd)), root, cwd)
+            result = {'exit_code': None, 'output': problem} if problem else await processes.run(
+                command['argv'], cwd, 600, name='migrate', network=sandbox.capability().get('backend') != 'seatbelt',
+                reason='任务交付已合并：平台在项目根目录对项目数据库执行登记的迁移命令')
+        except Exception as error:
+            result = {'exit_code': None, 'output': str(error)}
+        finally:
+            source_workspace.reset(tokens[1])
+            active_workspace.reset(tokens[0])
+        if result.get('exit_code') == 0 and not result.get('timed_out'):
+            await self.register_command(project, 'platform', command['name'], command['argv'], cwd, command.get('purpose'), verified=True)
+            return True
+        output = str(result.get('output') or '')[-1500:]
+        async with self.transaction() as c:
+            await self._event(c, project, 'leader', {
+                'type': 'migration_failed', 'request_id': request_id,
+                'summary': (f"任务 {request_id} 的交付已合并，但迁移命令 {' '.join(command['argv'])} 在项目根目录执行失败：\n{output}\n"
+                            f'{note}服务没有切换到新代码。请让后端修复迁移并重新交付。')}, conversation)
+        return False
+
+    async def report_service_failure(self, job, detail):
+        """A kept service could not restart from the project root after a delivery:
+        the Leader hears about it instead of finding the service silently gone."""
+        from sqlalchemy import text
+        async with self.reading() as c:
+            row = (await c.execute(text('SELECT id FROM projects WHERE workspace_path=:w'), {'w': job.scope})).first()
+        if not row:
+            return
+        name = job.service or job.name
+        async with self.transaction() as c:
+            await self._event(c, row[0], 'leader', {
+                'type': 'service_attention', 'service': name, 'request_id': job.request,
+                'summary': (f'服务 {name} 在交付后没能从项目根目录重新启动：{detail[:800]}\n'
+                            '请让负责的成员修复，使项目在根目录可以安装依赖并启动；不要让成员手动复制依赖目录。')},
+                job.conversation or '')
 
     async def trusted_ports(self, project) -> dict[int, str]:
         async with self.reading() as c:
@@ -239,6 +338,10 @@ class EnvironmentMixin:
             raise ValueError('Service name must be 1-40 lowercase letters, digits, ".", "_" or "-"')
         if kind not in KINDS:
             raise ValueError(f'kind must be one of {KINDS}')
+        if connected := await self.connected_service(project, name, port):
+            raise ValueError(f'{connected} is a service the platform connects for this project (see environment.connected): '
+                             'it is already running and its settings reach every command as environment variables. Do not '
+                             'register, start or declare it; just use it.')
         async with self.reading() as c:
             await self._project(c, project)
             services = await self._list(c, 'service', project)
@@ -302,7 +405,7 @@ class EnvironmentMixin:
         or record an observed one, together with the command that started it."""
         async with self.reading() as c:
             services = await self._list(c, 'service', project)
-        if port in platform_ports():
+        if port in platform_ports() or await self.connected_service(project, port=port):
             return None
         service = next((s for s in services if s.get('port') == port), None)
         if service is None:

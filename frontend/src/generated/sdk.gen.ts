@@ -2,7 +2,7 @@
 
 import type { Client, Options as Options2, TDataShape } from './client';
 import { client } from './client.gen';
-import type { CapabilitiesApiExecutionCapabilitiesGetData, CapabilitiesApiExecutionCapabilitiesGetResponses, ChatStreamApiChatStreamPostData, ChatStreamApiChatStreamPostErrors, ChatStreamApiChatStreamPostResponse, ChatStreamApiChatStreamPostResponses, CommandApiProjectsProjectIdCollaborationCommandsPostData, CommandApiProjectsProjectIdCollaborationCommandsPostErrors, CommandApiProjectsProjectIdCollaborationCommandsPostResponses, ConfigureApprovalsApiExecutionSettingsPostData, ConfigureApprovalsApiExecutionSettingsPostErrors, ConfigureApprovalsApiExecutionSettingsPostResponses, ConversationDetailApiConversationsConversationIdGetData, ConversationDetailApiConversationsConversationIdGetErrors, ConversationDetailApiConversationsConversationIdGetResponses, ConversationEventsApiConversationsConversationIdEventsGetData, ConversationEventsApiConversationsConversationIdEventsGetErrors, ConversationEventsApiConversationsConversationIdEventsGetResponses, ConversationExecutionApiConversationsConversationIdExecutionGetData, ConversationExecutionApiConversationsConversationIdExecutionGetErrors, ConversationExecutionApiConversationsConversationIdExecutionGetResponses, ConversationMessageStreamApiConversationsConversationIdMessagesStreamPostData, ConversationMessageStreamApiConversationsConversationIdMessagesStreamPostErrors, ConversationMessageStreamApiConversationsConversationIdMessagesStreamPostResponse, ConversationMessageStreamApiConversationsConversationIdMessagesStreamPostResponses, ConversationUsageApiConversationsConversationIdUsageGetData, ConversationUsageApiConversationsConversationIdUsageGetErrors, ConversationUsageApiConversationsConversationIdUsageGetResponses, CreateConversationApiProjectsProjectIdConversationsPostData, CreateConversationApiProjectsProjectIdConversationsPostErrors, CreateConversationApiProjectsProjectIdConversationsPostResponses, CreateProjectApiProjectsPostData, CreateProjectApiProjectsPostErrors, CreateProjectApiProjectsPostResponses, DecideApiExecutionPermissionsIdentifierPostData, DecideApiExecutionPermissionsIdentifierPostErrors, DecideApiExecutionPermissionsIdentifierPostResponses, EventsApiProjectsProjectIdDeliveryEventsGetData, EventsApiProjectsProjectIdDeliveryEventsGetErrors, EventsApiProjectsProjectIdDeliveryEventsGetResponses, ExportJournalApiProjectsProjectIdCollaborationRequestsRequestIdJournalGetData, ExportJournalApiProjectsProjectIdCollaborationRequestsRequestIdJournalGetErrors, ExportJournalApiProjectsProjectIdCollaborationRequestsRequestIdJournalGetResponses, HealthApiHealthGetData, HealthApiHealthGetResponses, ListProcessesApiExecutionProcessesGetData, ListProcessesApiExecutionProcessesGetErrors, ListProcessesApiExecutionProcessesGetResponses, ListProjectsApiProjectsGetData, ListProjectsApiProjectsGetResponses, PauseApiProjectsProjectIdCollaborationPausePostData, PauseApiProjectsProjectIdCollaborationPausePostErrors, PauseApiProjectsProjectIdCollaborationPausePostResponses, PausePreviousExecutionApiExecutionPausePostData, PausePreviousExecutionApiExecutionPausePostResponses, PermissionStateApiExecutionPermissionsGetData, PermissionStateApiExecutionPermissionsGetErrors, PermissionStateApiExecutionPermissionsGetResponses, ReadFileApiProjectsProjectIdDeliveryFileGetData, ReadFileApiProjectsProjectIdDeliveryFileGetErrors, ReadFileApiProjectsProjectIdDeliveryFileGetResponses, ReadPreviewApiProjectsProjectIdDeliveryPreviewGetData, ReadPreviewApiProjectsProjectIdDeliveryPreviewGetErrors, ReadPreviewApiProjectsProjectIdDeliveryPreviewGetResponses, ResetRecordsApiDebugRecordsResetPostData, ResetRecordsApiDebugRecordsResetPostErrors, ResetRecordsApiDebugRecordsResetPostResponses, ResumeConversationApiConversationsConversationIdExecutionResumePostData, ResumeConversationApiConversationsConversationIdExecutionResumePostErrors, ResumeConversationApiConversationsConversationIdExecutionResumePostResponses, RevokeApiExecutionGrantsIdentifierRevokePostData, RevokeApiExecutionGrantsIdentifierRevokePostErrors, RevokeApiExecutionGrantsIdentifierRevokePostResponses, SnapshotApiProjectsProjectIdCollaborationGetData, SnapshotApiProjectsProjectIdCollaborationGetErrors, SnapshotApiProjectsProjectIdCollaborationGetResponses, StopConversationApiConversationsConversationIdExecutionStopPostData, StopConversationApiConversationsConversationIdExecutionStopPostErrors, StopConversationApiConversationsConversationIdExecutionStopPostResponses, StopProcessApiExecutionProcessesIdentifierStopPostData, StopProcessApiExecutionProcessesIdentifierStopPostErrors, StopProcessApiExecutionProcessesIdentifierStopPostResponses, StopServiceApiProjectsProjectIdCollaborationServicesNameStopPostData, StopServiceApiProjectsProjectIdCollaborationServicesNameStopPostErrors, StopServiceApiProjectsProjectIdCollaborationServicesNameStopPostResponses, TeamStatusApiTeamGetData, TeamStatusApiTeamGetResponses, TreeApiProjectsProjectIdDeliveryTreeGetData, TreeApiProjectsProjectIdDeliveryTreeGetErrors, TreeApiProjectsProjectIdDeliveryTreeGetResponses, ValidateWorkspaceApiWorkspacesValidatePostData, ValidateWorkspaceApiWorkspacesValidatePostErrors, ValidateWorkspaceApiWorkspacesValidatePostResponses } from './types.gen';
+import type { BackupProjectApiResourcesProjectsProjectIdBackupsPostData, BackupProjectApiResourcesProjectsProjectIdBackupsPostErrors, BackupProjectApiResourcesProjectsProjectIdBackupsPostResponses, CapabilitiesApiExecutionCapabilitiesGetData, CapabilitiesApiExecutionCapabilitiesGetResponses, ChatStreamApiChatStreamPostData, ChatStreamApiChatStreamPostErrors, ChatStreamApiChatStreamPostResponse, ChatStreamApiChatStreamPostResponses, CommandApiProjectsProjectIdCollaborationCommandsPostData, CommandApiProjectsProjectIdCollaborationCommandsPostErrors, CommandApiProjectsProjectIdCollaborationCommandsPostResponses, ConfigureApprovalsApiExecutionSettingsPostData, ConfigureApprovalsApiExecutionSettingsPostErrors, ConfigureApprovalsApiExecutionSettingsPostResponses, ConversationDetailApiConversationsConversationIdGetData, ConversationDetailApiConversationsConversationIdGetErrors, ConversationDetailApiConversationsConversationIdGetResponses, ConversationEventsApiConversationsConversationIdEventsGetData, ConversationEventsApiConversationsConversationIdEventsGetErrors, ConversationEventsApiConversationsConversationIdEventsGetResponses, ConversationExecutionApiConversationsConversationIdExecutionGetData, ConversationExecutionApiConversationsConversationIdExecutionGetErrors, ConversationExecutionApiConversationsConversationIdExecutionGetResponses, ConversationMessageStreamApiConversationsConversationIdMessagesStreamPostData, ConversationMessageStreamApiConversationsConversationIdMessagesStreamPostErrors, ConversationMessageStreamApiConversationsConversationIdMessagesStreamPostResponse, ConversationMessageStreamApiConversationsConversationIdMessagesStreamPostResponses, ConversationUsageApiConversationsConversationIdUsageGetData, ConversationUsageApiConversationsConversationIdUsageGetErrors, ConversationUsageApiConversationsConversationIdUsageGetResponses, CreateConnectionApiResourcesPostData, CreateConnectionApiResourcesPostErrors, CreateConnectionApiResourcesPostResponses, CreateConversationApiProjectsProjectIdConversationsPostData, CreateConversationApiProjectsProjectIdConversationsPostErrors, CreateConversationApiProjectsProjectIdConversationsPostResponses, CreateProjectApiProjectsPostData, CreateProjectApiProjectsPostErrors, CreateProjectApiProjectsPostResponses, DecideApiExecutionPermissionsIdentifierPostData, DecideApiExecutionPermissionsIdentifierPostErrors, DecideApiExecutionPermissionsIdentifierPostResponses, DeleteConnectionApiResourcesIdentifierDeleteData, DeleteConnectionApiResourcesIdentifierDeleteErrors, DeleteConnectionApiResourcesIdentifierDeleteResponses, DockerContainersApiResourcesDockerGetData, DockerContainersApiResourcesDockerGetErrors, DockerContainersApiResourcesDockerGetResponses, DockerImportApiResourcesDockerImportPostData, DockerImportApiResourcesDockerImportPostErrors, DockerImportApiResourcesDockerImportPostResponses, EventsApiProjectsProjectIdDeliveryEventsGetData, EventsApiProjectsProjectIdDeliveryEventsGetErrors, EventsApiProjectsProjectIdDeliveryEventsGetResponses, ExportJournalApiProjectsProjectIdCollaborationRequestsRequestIdJournalGetData, ExportJournalApiProjectsProjectIdCollaborationRequestsRequestIdJournalGetErrors, ExportJournalApiProjectsProjectIdCollaborationRequestsRequestIdJournalGetResponses, HealthApiHealthGetData, HealthApiHealthGetResponses, ListConnectionsApiResourcesGetData, ListConnectionsApiResourcesGetErrors, ListConnectionsApiResourcesGetResponses, ListProcessesApiExecutionProcessesGetData, ListProcessesApiExecutionProcessesGetErrors, ListProcessesApiExecutionProcessesGetResponses, ListProjectsApiProjectsGetData, ListProjectsApiProjectsGetResponses, PauseApiProjectsProjectIdCollaborationPausePostData, PauseApiProjectsProjectIdCollaborationPausePostErrors, PauseApiProjectsProjectIdCollaborationPausePostResponses, PausePreviousExecutionApiExecutionPausePostData, PausePreviousExecutionApiExecutionPausePostResponses, PermissionStateApiExecutionPermissionsGetData, PermissionStateApiExecutionPermissionsGetErrors, PermissionStateApiExecutionPermissionsGetResponses, PrepareProjectApiResourcesProjectsProjectIdPreparePostData, PrepareProjectApiResourcesProjectsProjectIdPreparePostErrors, PrepareProjectApiResourcesProjectsProjectIdPreparePostResponses, ProjectStatusApiResourcesProjectsProjectIdGetData, ProjectStatusApiResourcesProjectsProjectIdGetErrors, ProjectStatusApiResourcesProjectsProjectIdGetResponses, ReadFileApiProjectsProjectIdDeliveryFileGetData, ReadFileApiProjectsProjectIdDeliveryFileGetErrors, ReadFileApiProjectsProjectIdDeliveryFileGetResponses, ReadPreviewApiProjectsProjectIdDeliveryPreviewGetData, ReadPreviewApiProjectsProjectIdDeliveryPreviewGetErrors, ReadPreviewApiProjectsProjectIdDeliveryPreviewGetResponses, ResetRecordsApiDebugRecordsResetPostData, ResetRecordsApiDebugRecordsResetPostErrors, ResetRecordsApiDebugRecordsResetPostResponses, RestoreProjectApiResourcesProjectsProjectIdRestorePostData, RestoreProjectApiResourcesProjectsProjectIdRestorePostErrors, RestoreProjectApiResourcesProjectsProjectIdRestorePostResponses, ResumeConversationApiConversationsConversationIdExecutionResumePostData, ResumeConversationApiConversationsConversationIdExecutionResumePostErrors, ResumeConversationApiConversationsConversationIdExecutionResumePostResponses, RevokeApiExecutionGrantsIdentifierRevokePostData, RevokeApiExecutionGrantsIdentifierRevokePostErrors, RevokeApiExecutionGrantsIdentifierRevokePostResponses, SnapshotApiProjectsProjectIdCollaborationGetData, SnapshotApiProjectsProjectIdCollaborationGetErrors, SnapshotApiProjectsProjectIdCollaborationGetResponses, StopConversationApiConversationsConversationIdExecutionStopPostData, StopConversationApiConversationsConversationIdExecutionStopPostErrors, StopConversationApiConversationsConversationIdExecutionStopPostResponses, StopProcessApiExecutionProcessesIdentifierStopPostData, StopProcessApiExecutionProcessesIdentifierStopPostErrors, StopProcessApiExecutionProcessesIdentifierStopPostResponses, StopServiceApiProjectsProjectIdCollaborationServicesNameStopPostData, StopServiceApiProjectsProjectIdCollaborationServicesNameStopPostErrors, StopServiceApiProjectsProjectIdCollaborationServicesNameStopPostResponses, TeamStatusApiTeamGetData, TeamStatusApiTeamGetResponses, TestConnectionApiResourcesTestPostData, TestConnectionApiResourcesTestPostErrors, TestConnectionApiResourcesTestPostResponses, TreeApiProjectsProjectIdDeliveryTreeGetData, TreeApiProjectsProjectIdDeliveryTreeGetErrors, TreeApiProjectsProjectIdDeliveryTreeGetResponses, UpdateConnectionApiResourcesIdentifierPutData, UpdateConnectionApiResourcesIdentifierPutErrors, UpdateConnectionApiResourcesIdentifierPutResponses, ValidateWorkspaceApiWorkspacesValidatePostData, ValidateWorkspaceApiWorkspacesValidatePostErrors, ValidateWorkspaceApiWorkspacesValidatePostResponses } from './types.gen';
 
 export type Options<TData extends TDataShape = TDataShape, ThrowOnError extends boolean = boolean, TResponse = unknown> = Options2<TData, ThrowOnError, TResponse> & {
     /**
@@ -129,6 +129,98 @@ export const listProcessesApiExecutionProcessesGet = <ThrowOnError extends boole
  * Stop Process
  */
 export const stopProcessApiExecutionProcessesIdentifierStopPost = <ThrowOnError extends boolean = false>(options: Options<StopProcessApiExecutionProcessesIdentifierStopPostData, ThrowOnError>) => (options.client ?? client).post<StopProcessApiExecutionProcessesIdentifierStopPostResponses, StopProcessApiExecutionProcessesIdentifierStopPostErrors, ThrowOnError>({ url: '/api/execution/processes/{identifier}/stop', ...options });
+
+/**
+ * List Connections
+ */
+export const listConnectionsApiResourcesGet = <ThrowOnError extends boolean = false>(options?: Options<ListConnectionsApiResourcesGetData, ThrowOnError>) => (options?.client ?? client).get<ListConnectionsApiResourcesGetResponses, ListConnectionsApiResourcesGetErrors, ThrowOnError>({ url: '/api/resources', ...options });
+
+/**
+ * Create Connection
+ */
+export const createConnectionApiResourcesPost = <ThrowOnError extends boolean = false>(options: Options<CreateConnectionApiResourcesPostData, ThrowOnError>) => (options.client ?? client).post<CreateConnectionApiResourcesPostResponses, CreateConnectionApiResourcesPostErrors, ThrowOnError>({
+    url: '/api/resources',
+    ...options,
+    headers: {
+        'Content-Type': 'application/json',
+        ...options.headers
+    }
+});
+
+/**
+ * Delete Connection
+ */
+export const deleteConnectionApiResourcesIdentifierDelete = <ThrowOnError extends boolean = false>(options: Options<DeleteConnectionApiResourcesIdentifierDeleteData, ThrowOnError>) => (options.client ?? client).delete<DeleteConnectionApiResourcesIdentifierDeleteResponses, DeleteConnectionApiResourcesIdentifierDeleteErrors, ThrowOnError>({ url: '/api/resources/{identifier}', ...options });
+
+/**
+ * Update Connection
+ */
+export const updateConnectionApiResourcesIdentifierPut = <ThrowOnError extends boolean = false>(options: Options<UpdateConnectionApiResourcesIdentifierPutData, ThrowOnError>) => (options.client ?? client).put<UpdateConnectionApiResourcesIdentifierPutResponses, UpdateConnectionApiResourcesIdentifierPutErrors, ThrowOnError>({
+    url: '/api/resources/{identifier}',
+    ...options,
+    headers: {
+        'Content-Type': 'application/json',
+        ...options.headers
+    }
+});
+
+/**
+ * Test Connection
+ */
+export const testConnectionApiResourcesTestPost = <ThrowOnError extends boolean = false>(options: Options<TestConnectionApiResourcesTestPostData, ThrowOnError>) => (options.client ?? client).post<TestConnectionApiResourcesTestPostResponses, TestConnectionApiResourcesTestPostErrors, ThrowOnError>({
+    url: '/api/resources/test',
+    ...options,
+    headers: {
+        'Content-Type': 'application/json',
+        ...options.headers
+    }
+});
+
+/**
+ * Docker Containers
+ */
+export const dockerContainersApiResourcesDockerGet = <ThrowOnError extends boolean = false>(options?: Options<DockerContainersApiResourcesDockerGetData, ThrowOnError>) => (options?.client ?? client).get<DockerContainersApiResourcesDockerGetResponses, DockerContainersApiResourcesDockerGetErrors, ThrowOnError>({ url: '/api/resources/docker', ...options });
+
+/**
+ * Docker Import
+ */
+export const dockerImportApiResourcesDockerImportPost = <ThrowOnError extends boolean = false>(options: Options<DockerImportApiResourcesDockerImportPostData, ThrowOnError>) => (options.client ?? client).post<DockerImportApiResourcesDockerImportPostResponses, DockerImportApiResourcesDockerImportPostErrors, ThrowOnError>({
+    url: '/api/resources/docker/import',
+    ...options,
+    headers: {
+        'Content-Type': 'application/json',
+        ...options.headers
+    }
+});
+
+/**
+ * Project Status
+ */
+export const projectStatusApiResourcesProjectsProjectIdGet = <ThrowOnError extends boolean = false>(options: Options<ProjectStatusApiResourcesProjectsProjectIdGetData, ThrowOnError>) => (options.client ?? client).get<ProjectStatusApiResourcesProjectsProjectIdGetResponses, ProjectStatusApiResourcesProjectsProjectIdGetErrors, ThrowOnError>({ url: '/api/resources/projects/{project_id}', ...options });
+
+/**
+ * Prepare Project
+ *
+ * Try again now to create the project's database (e.g. after starting MySQL).
+ */
+export const prepareProjectApiResourcesProjectsProjectIdPreparePost = <ThrowOnError extends boolean = false>(options: Options<PrepareProjectApiResourcesProjectsProjectIdPreparePostData, ThrowOnError>) => (options.client ?? client).post<PrepareProjectApiResourcesProjectsProjectIdPreparePostResponses, PrepareProjectApiResourcesProjectsProjectIdPreparePostErrors, ThrowOnError>({ url: '/api/resources/projects/{project_id}/prepare', ...options });
+
+/**
+ * Backup Project
+ */
+export const backupProjectApiResourcesProjectsProjectIdBackupsPost = <ThrowOnError extends boolean = false>(options: Options<BackupProjectApiResourcesProjectsProjectIdBackupsPostData, ThrowOnError>) => (options.client ?? client).post<BackupProjectApiResourcesProjectsProjectIdBackupsPostResponses, BackupProjectApiResourcesProjectsProjectIdBackupsPostErrors, ThrowOnError>({ url: '/api/resources/projects/{project_id}/backups', ...options });
+
+/**
+ * Restore Project
+ */
+export const restoreProjectApiResourcesProjectsProjectIdRestorePost = <ThrowOnError extends boolean = false>(options: Options<RestoreProjectApiResourcesProjectsProjectIdRestorePostData, ThrowOnError>) => (options.client ?? client).post<RestoreProjectApiResourcesProjectsProjectIdRestorePostResponses, RestoreProjectApiResourcesProjectsProjectIdRestorePostErrors, ThrowOnError>({
+    url: '/api/resources/projects/{project_id}/restore',
+    ...options,
+    headers: {
+        'Content-Type': 'application/json',
+        ...options.headers
+    }
+});
 
 /**
  * Conversation Usage

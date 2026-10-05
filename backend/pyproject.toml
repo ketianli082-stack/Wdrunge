@@ -7,6 +7,7 @@ requires-python = ">=3.11"
 dependencies = [
     "aiosqlite>=0.20,<1",
     "alembic>=1.14,<2",
+    "cryptography>=42",
     "fastapi>=0.115,<1",
     "langchain>=1,<2",
     "langchain-openai>=1,<2",
@@ -14,6 +15,8 @@ dependencies = [
     "langgraph-checkpoint-sqlite>=2,<4",
     "markdown-it-py>=3,<5",
     "platformdirs>=4,<5",
+    "psycopg[binary]>=3.2,<4",
+    "pymysql>=1.1,<2",
     "python-dotenv>=1,<2",
     "sqlalchemy[asyncio]>=2,<3",
     "uvicorn[standard]>=0.34,<1",

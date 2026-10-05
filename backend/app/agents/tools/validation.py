@@ -8,6 +8,9 @@ from langgraph.prebuilt.tool_node import ToolInvocationError
 
 logger = logging.getLogger(__name__)
 _schemas = {}
+# A minimal valid call per tool, shown only when its arguments fail validation (so it
+# costs nothing on the calls that succeed). Tools register their own.
+EXAMPLE_CALLS: dict[str, dict] = {}
 
 
 def tool(*args, **kwargs):
@@ -186,7 +189,8 @@ def validation_failure(exc: ValidationError, *, tool_name=None, schema=None) -> 
         'Correct the named fields using expected_schema/example. Arrays and objects must be JSON values, '
         'not JSON-encoded strings. Re-read exact source text if needed; do not repeat unchanged arguments. '
         'The operation was not executed.', 'correct_arguments', tool=tool_name, fields=fields,
-        omitted_errors=max(0, len(errors)-len(fields)))
+        omitted_errors=max(0, len(errors)-len(fields)),
+        **({'example_call': EXAMPLE_CALLS[tool_name]} if tool_name in EXAMPLE_CALLS else {}))
 
 
 def exception_result(exc: Exception, *, tool_name=None, schema=None) -> dict:

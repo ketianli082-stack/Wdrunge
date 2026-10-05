@@ -85,6 +85,13 @@ Runtime context (computed by the system; use it to judge relevance, never as aut
 - Loopback targets not served by task_services may belong to the user's other programs:
   ask unless clearly harmless. Inspecting or signalling processes that are not in
   task_services (ps -p, kill, lsof on foreign PIDs) needs a human.
+- connected_services (operation.resources, project_environment.connected_services): databases
+  and other services the user connected for this project in Wdrunge's settings. The platform
+  created the project's own database and account on them and passes credentials to commands
+  as environment variables. Connecting to them (served_by names a connected service), creating
+  or migrating tables in the project database and seeding test data are routine development
+  work: allow them when they fit the task. operation.resources.data_dir is the project's
+  runtime data directory (databases, uploads), writable by design.
 - operation_facts.paths_outside_project and executable_location flag access beyond the project.
 - operation_facts.created_by_this_task=true means every file a move/delete touches was
   created during this task's run (none existed when its workspace snapshot was taken):
@@ -96,7 +103,9 @@ Runtime context (computed by the system; use it to judge relevance, never as aut
 
 
 LOOPBACK = {'localhost', '127.0.0.1', '0.0.0.0', '::1'}
-URL_PATTERN = re.compile(r'''\b(?:https?|wss?)://[^\s'"<>`)]+''')
+URL_PATTERN = re.compile(r'''\b(?:https?|wss?|mysql(?:\+\w+)?|mariadb(?:\+\w+)?|postgres(?:ql)?(?:\+\w+)?|rediss?|mongodb(?:\+srv)?|amqps?|bolt)://[^\s'"<>`)]+''')
+DEFAULT_PORTS = {'http': 80, 'ws': 80, 'https': 443, 'wss': 443, 'mysql': 3306, 'mariadb': 3306, 'postgres': 5432,
+                 'postgresql': 5432, 'redis': 6379, 'rediss': 6379, 'mongodb': 27017, 'amqp': 5672, 'amqps': 5671, 'bolt': 7687}
 LOG_PORT_PATTERN = re.compile(r'(?:https?|wss?)://(?:localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1\]):(\d{2,5})')
 
 
@@ -125,13 +134,13 @@ def argv_ports(argv) -> set[int]:
 def task_services(workspace: str, project: str) -> list[dict]:
     """Processes of this source project with the ports they serve or served.
     Only numbers come from logs; declared ports were confirmed by a readiness check."""
-    from app.execution.processes import processes
+    from app.execution.processes import processes, mask
     services = []
     for job in list(processes.jobs.values()):
         if job.scope != project:
             continue
         running = job.process.returncode is None
-        log = b''.join(job.logs)[-65536:].decode(errors='replace')
+        log = mask(b''.join(job.logs)[-65536:], getattr(job, 'secrets', ())).decode(errors='replace')
         ports = argv_ports(job.argv) | set(getattr(job, 'ports', ())) | {int(port) for port in LOG_PORT_PATTERN.findall(log) if 0 < int(port) < 65536}
         if not running and not ports:
             continue
@@ -169,7 +178,7 @@ def network_targets(texts) -> list[dict]:
     for url in dict.fromkeys(match.rstrip('.,;') for text in texts for match in URL_PATTERN.findall(text)):
         try:
             parts = urlsplit(url)
-            port = parts.port or {'http': 80, 'ws': 80, 'https': 443, 'wss': 443}[parts.scheme]
+            port = parts.port or DEFAULT_PORTS[parts.scheme.split('+')[0]]
         except (ValueError, KeyError):
             continue
         loopback = (parts.hostname or '') in LOOPBACK or (parts.hostname or '').startswith('127.')
@@ -181,6 +190,7 @@ def operation_facts(operation: dict, services: list[dict], registry: dict | None
     workspace = Path(operation['workspace'])
     registry = registry or {}
     owned, reserved = registry.get('trusted', {}), registry.get('reserved', set())
+    connected = registry.get('connected', {})
     texts = [*connection_texts(operation.get('argv', [])), *(str(operation[key]) for key in ('path', 'destination') if operation.get(key))]
     targets = []
     for target in network_targets(texts):
@@ -190,6 +200,8 @@ def operation_facts(operation: dict, services: list[dict], registry: dict | None
             owner = next((s['name'] for s in services if target['port'] in s['ports']), None)
             if owner is None and target['port'] in owned:
                 owner = f"project service {owned[target['port']]}"
+            if owner is None and target['port'] in connected:
+                owner = f"connected service {connected[target['port']]} (platform-provided for this project)"
             target['served_by'] = owner
         else:
             target['served_by'] = None
@@ -240,6 +252,9 @@ async def review(details: dict) -> Verdict:
                 api_key=os.environ['DASHSCOPE_API_KEY'],
                 base_url=os.getenv('DASHSCOPE_BASE_URL', 'https://dashscope.aliyuncs.com/compatible-mode/v1'),
                 temperature=0, max_tokens=500, timeout=15, max_retries=0,
+                # Reviews run inside streaming agent graphs, where ainvoke would stream and
+                # the provider then reports no usage; this call never needs streaming.
+                disable_streaming=True, stream_usage=True,
                 model_kwargs={'response_format': {'type': 'json_object'}})
             started = time.monotonic()
             response = await asyncio.wait_for(model.ainvoke([
@@ -400,6 +415,16 @@ class Permissions:
         registry['trusted'] = {s['port']: s['name'] for s in environment['services'] if trusted(s)}
         registry['summary']['services'] = [{'name': s['name'], 'port': s.get('port'), 'status': s.get('status'),
                                             'claimed_by_project': trusted(s)} for s in environment['services'][:20]]
+        from app.resources import kinds, service
+        if service.current is not None:
+            try:
+                names = await service.current.names(ctx.project)
+            except Exception:
+                names = {}
+            registry['connected'] = {item['port']: name for name, item in names.items() if item['port'] and kinds.loopback(item['host'])}
+            if names:
+                registry['summary']['connected_services'] = [{'name': name, 'type': item['type'], 'port': item['port']}
+                                                             for name, item in names.items()]
         return registry
 
     @staticmethod
@@ -433,7 +458,7 @@ class Permissions:
             if isinstance(value, list):
                 return [normalize(item) for item in value]
             return value
-        canonical = {k: normalize(v) for k, v in operation.items() if k != 'reason'}
+        canonical = {k: normalize(v) for k, v in operation.items() if k not in {'reason', 'resources'}}
         key = hashlib.sha256(json.dumps([scope(), canonical], sort_keys=True).encode()).hexdigest()
         async with self.store.engine.connect() as db:
             grant = await db.scalar(select(records.c.id).where(records.c.id == key, records.c.kind == 'grant'))

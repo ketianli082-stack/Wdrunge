@@ -94,7 +94,7 @@ class Agent:
             await store.record_agent_usage(
                 self.spec.id, self.total_tokens - before, self.context_tokens, self.last_cached_tokens,
                 purpose=purpose or ('coordination' if self.spec.id == 'leader' else 'work'),
-                **{key: details[key] for key in ('output_tokens', 'model', 'latency_ms', 'retries')}, **current_scope())
+                **{key: details[key] for key in ('output_tokens', 'reasoning_tokens', 'model', 'latency_ms', 'retries')}, **current_scope())
         return True
 
     def usage_snapshot(self) -> dict:
@@ -159,7 +159,12 @@ class Agent:
     def model(self, purpose: str = "work", variant: str | None = None, scale: str | None = None) -> ChatOpenAI | None:
         """variant: None (normal streaming), 'non_streaming' (after repeated stream stalls)
         or 'fallback' (QWEN_FALLBACK_MODEL; None when not configured)."""
-        options = {}
+        # Usage must be reported on streamed calls too: inside a streaming graph even
+        # ainvoke streams, and without include_usage the provider returns no usage.
+        options = {"stream_usage": True}
+        if purpose == "summary" and os.getenv("WDRUNGE_SUMMARY_THINKING", "").strip().lower() not in {"1", "true"}:
+            # Summaries need no reasoning, and reasoning tokens count against max_tokens.
+            options["extra_body"] = {"enable_thinking": False}
         timeout = os.getenv("QWEN_STREAM_CHUNK_TIMEOUT")
         if timeout:
             # Seconds without a streamed chunk before the call is abandoned and retried.

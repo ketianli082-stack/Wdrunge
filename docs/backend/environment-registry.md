@@ -34,6 +34,8 @@
 - 管理：`manage_process` 可按服务名查看/读取日志/停止项目中运行的服务（含其他任务保留的）；协作面板“项目环境”提供“停止”，对应 `POST /api/projects/{project_id}/collaboration/services/{name}/stop`。
 - 交付检查：任务声明的服务在提交时必须正在运行，仅“曾验证”不够。
 
+数据库、缓存等由用户在设置中连接的服务不进入这份登记：它们由平台提供，见 [服务连接与项目数据库](connected-services.md)。handoff 的 `environment.connected` 列出它们；成员不能把它们登记为项目服务或在任务中声明。
+
 ## 使用
 
 - 每个成员和 Leader 的 handoff 都带 `environment` 摘要（主机、保留端口、服务及启动命令、项目命令）。保存的阶段交接记录不包含这部分实时数据。

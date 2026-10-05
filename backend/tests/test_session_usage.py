@@ -128,3 +128,27 @@ def test_session_usage_endpoint_reports_tokens_cache_approvals_and_failures(tmp_
         assert data['tool_calls'] == {'total': 2, 'failed': 1}
         assert set(data['approvals']) == {'human', 'automatic', 'allow_all', 'pending'}
         assert client.get('/api/conversations/missing/usage').status_code == 404
+
+
+def test_reasoning_tokens_are_recorded_separately(tmp_path):
+    """Reasoning (thinking) tokens count toward output tokens and max_tokens; Blog2 could
+    not tell them apart from the visible output."""
+    async def run():
+        store = ChatStore(f'sqlite+aiosqlite:///{tmp_path}/reasoning.db')
+        project = (await store.create_project('Usage', str(tmp_path)))['id']
+        conversation = (await store.create_conversation(project))['id']
+        backend = Agent(AgentSpec(id='backend', name='Backend', prompt_file='backend.md'))
+        backend._store = store
+        thinking = reply(1000, 0, output=251)
+        thinking.usage_metadata['output_token_details'] = {'reasoning': 246}
+        token = usage_scope.set({'conversation_id': conversation})
+        try:
+            await backend.record_usage_durable(thinking)
+            await record_call(store, 'reviewer', reply(100, 0), 'review')
+        finally:
+            usage_scope.reset(token)
+        usage = await store.conversation_usage(conversation)
+        assert usage['totals']['output_tokens'] == 261 and usage['totals']['reasoning_tokens'] == 246
+        assert {g['key']: g['reasoning_tokens'] for g in usage['by_agent']} == {'backend': 246, 'reviewer': 0}
+        await store.close()
+    asyncio.run(run())
