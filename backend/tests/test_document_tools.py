@@ -213,7 +213,7 @@ def test_leader_checkpoint_does_not_suppress_bodies_removed_from_context(tmp_pat
         calls = []
         async def respond(messages, **kwargs):
             step = len(calls)
-            calls.append(active.get().read_context)
+            calls.append(step)
             if step in (0, 2):
                 return AIMessage(content='', tool_calls=[{'id': f'read-{step}', 'name': 'collaboration_read', 'args': {'document_id': doc, 'version': 1, 'section_id': 'root'}}])
             result = [m for m in messages if isinstance(m, ToolMessage)][-1]
@@ -222,11 +222,11 @@ def test_leader_checkpoint_does_not_suppress_bodies_removed_from_context(tmp_pat
                 return AIMessage(content='', tool_calls=[{'id': 'checkpoint', 'name': 'checkpoint_context', 'args': {'goal': 'Continue'}}])
             return AIMessage(content='Done')
         monkeypatch.setattr(team.leader, 'next_message', respond)
-        token = active.set(Context(service, project['id'], 'leader', '', 'ctx', read_context='before'))
+        token = active.set(Context(service, project['id'], 'leader', '', 'ctx'))
         try:
             events = [e async for e in team._run([HumanMessage(content='Work')], 'leader')]
-            assert calls[0] == calls[1] == 'before'
-            assert calls[2] == calls[3] != 'before'
+            # After the checkpoint the earlier result left the context, so the read returns the body again.
+            assert calls == [0, 1, 2, 3]
             assert any(e[0] == 'delta' and e[1]['content'] == 'Done' for e in events)
         finally:
             active.reset(token)

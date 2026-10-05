@@ -6,6 +6,7 @@ from urllib.error import HTTPError, URLError
 from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener
 
 from app.agents.tools.validation import tool, failure_result, command_failure
+from app.agents.context_policy import RECOMPUTABLE
 from app.agents.tools._workspace import resolve_allowed
 from app.execution.processes import processes
 from app.execution.environment import verification_python
@@ -74,7 +75,7 @@ async def check_service(service, path, timeout=20):
             'stopped': True, 'scope': 'sandboxed temporary HTTP smoke check; not browser verification'}
 
 
-@tool
+@tool(context_policy=RECOMPUTABLE)
 async def run_service_check(service: Literal['backend', 'frontend'], path: str = '/') -> dict:
     """Temporarily start standard FastAPI/Vite on an isolated localhost port, GET path,
     report HTTP status/body/startup logs, and stop only this tool's process group.

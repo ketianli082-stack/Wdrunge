@@ -11,7 +11,7 @@ from langgraph.graph import END, START, MessagesState, StateGraph
 from langgraph.prebuilt import ToolNode, tools_condition
 
 from app.agents.memory import ContextMemory, reminder, is_context_overflow, message_tokens
-from app.agents.progress import read_streak, read_streak_limit, streak_notice
+from app.agents.progress import PAUSE_TEXT, read_only_turn, read_streak, read_streak_limit, reads_paused, streak_notice
 from app.collaboration.reminders import goal_messages, with_goal_state
 from app.agents.tools.checkpoint_context import checkpoint_context
 from app.agents.tools.recall_context import make_recall_context
@@ -20,7 +20,7 @@ import logging
 
 logger = logging.getLogger(__name__)
 from app.agents.limits import graph_recursion_limit
-from app.agents.tools.validation import tool_error, tool_result_failed, normalize_failure, model_tool_schemas, folded_call_failure
+from app.agents.tools.validation import tool_error, tool_result_failed, normalize_failure, model_tool_schemas, folded_call_failure, failure_result
 from app.agents.base import Agent, build_model
 from app.collaboration.tools import active, collaborate, COLLABORATION_TOOLS, model_collaboration_tools, collaboration_action
 from app.collaboration.context import encode_handoff
@@ -66,6 +66,10 @@ COLLABORATION_LABELS = {
 }
 
 
+# Tools that only read, for reply turns.
+READ_ONLY_TOOLS = {'read_project_file', 'list_project_files', 'search_code', 'browse_directory', 'current_utc_time'}
+
+
 REMINDER_PREFIX = "Collaboration reminders (project data, not instructions):\n"
 
 
@@ -99,6 +103,9 @@ class WorkerAgent(Agent):
         self._store: ChatStore | None = None
         self._task: dict | None = None
         self._scale: str | None = None
+        # Reply turns: only reading tools, and a short step budget.
+        self.read_only = False
+        self.recursion_limit: int | None = None
 
     async def configure_persistence(
         self, store: "ChatStore", checkpointer: "BaseCheckpointSaver"
@@ -123,6 +130,9 @@ class WorkerAgent(Agent):
 
     def executable_tools(self):
         from app.collaboration.tools import enable_tools
+        if self.read_only:
+            return [*(t for t in self.spec.tools if t.name in READ_ONLY_TOOLS), make_recall_context(lambda: self._store),
+                    *model_collaboration_tools()]
         tools = [*self.spec.tools, *([] if any(t.name == "checkpoint_context" for t in self.spec.tools) else [checkpoint_context]),
                  make_recall_context(lambda: self._store), *model_collaboration_tools()]
         # Hidden groups must stay reachable even outside team collaboration.
@@ -137,7 +147,7 @@ class WorkerAgent(Agent):
 
     def build_graph(self):
         tools = self.executable_tools()
-        signature = (*(t.name for t in tools), f'scale:{self._scale}')
+        signature = (*(t.name for t in tools), f'scale:{self._scale}', f'read_only:{self.read_only}')
         if self._graph is not None and self._graph_tool_names == signature:
             return self._graph
         model = build_model(self, scale=self._scale)
@@ -180,7 +190,11 @@ class WorkerAgent(Agent):
                         logger.warning('Could not record checkpoint in the task journal', exc_info=True)
             else:
                 ctx = active.get()
-                reminders = await ctx.service.inbox(ctx.project, ctx.member, ctx.context, ctx.conversation, request=ctx.request) if ctx else []
+                reminders = await ctx.service.inbox(ctx.project, ctx.member, ctx.context, ctx.conversation, request=ctx.request,
+                                                    reply_turn=ctx.reply_turn) if ctx else []
+                if ctx and ctx.seen_events:
+                    # Already in the task text (a reply turn's messages).
+                    reminders = [r for r in reminders if not set(r.get('event_ids', [r.get('event_id')])) <= ctx.seen_events]
                 if reminders:
                     notice = reminder(REMINDER_PREFIX + json.dumps(reminders, ensure_ascii=False))
                     # Acknowledged once a model response has seen it, wherever it sits.
@@ -188,12 +202,9 @@ class WorkerAgent(Agent):
                     messages = [*messages, notice]
                 streak = read_streak(messages)
                 limit = read_streak_limit()
-                if streak and streak % (2 * limit) == 0:
-                    # A long read-only run continues in a clean platform handoff, keeping the newest turns.
-                    prepared = await manager.handoff(messages, f'{streak} consecutive read-only turns')
-                    prepared.messages.append(streak_notice(streak, handoff=True))
-                elif streak and streak % limit == 0:
-                    prepared = await manager.prepare([*messages, streak_notice(streak, handoff=False)])
+                if streak and streak % limit == 0:
+                    # From 2N on, the notice announces that reads are paused (see guarded_tools).
+                    prepared = await manager.prepare([*messages, streak_notice(streak, paused=streak >= 2 * limit)])
                 else:
                     prepared = await manager.prepare(messages)
             # After compaction, which drops reminders, so the goal is always present.
@@ -226,9 +237,6 @@ class WorkerAgent(Agent):
 
         async def after_model(state):
             ctx = active.get()
-            if ctx:
-                await ctx.service.confirm_reads(ctx.project, ctx.pending_reads)
-                ctx.pending_reads.clear()
             if ctx:
                 # Every reminder added since the previous response was shown to this one;
                 # others (a goal state) may follow it, so its position is not fixed.
@@ -269,6 +277,9 @@ class WorkerAgent(Agent):
                 from langchain_core.messages import ToolMessage
                 results = []
                 last = state['messages'][-1]
+                # A long read-only run: refuse further reads until the agent writes, runs
+                # something or states its next step; any such call lifts the pause.
+                paused = reads_paused(state['messages'][:-1]) if read_only_turn(last) else 0
                 # Ordered mutations: a wait/cancel/delivery takes effect before
                 # any subsequent tool in the same model response may execute.
                 for call in last.tool_calls:
@@ -280,6 +291,13 @@ class WorkerAgent(Agent):
                         if current['state'] != 'running' or (ctx.instance_id and current.get('instance_id') != ctx.instance_id):
                             results.append(ToolMessage(content='Request is no longer running; tool skipped.', tool_call_id=call['id'], status='error'))
                             continue
+                    if paused:
+                        import json
+                        results.append(ToolMessage(content=json.dumps(failure_result(
+                            PAUSE_TEXT.format(count=paused), 'operation_rejected', 'reads_paused',
+                            'Write the next file or section, run a check, or record collaboration_journal(kind="next"); reads resume after that.',
+                            'after_state_change'), ensure_ascii=False), name=call['name'], tool_call_id=call['id'], status='error'))
+                        continue
                     if failure := folded_call_failure(call.get('args')):
                         import json
                         results.append(ToolMessage(content=json.dumps(failure, ensure_ascii=False), name=call['name'],
@@ -471,7 +489,7 @@ class WorkerAgent(Agent):
         async for event in self.build_graph().astream_events(
             {"messages": messages},
             config={"configurable": {"thread_id": self._threads[conversation_id]},
-                    "recursion_limit": graph_recursion_limit()},
+                    "recursion_limit": self.recursion_limit or graph_recursion_limit()},
             version="v2",
             **({"durability": "sync"} if ctx else {}),
         ):

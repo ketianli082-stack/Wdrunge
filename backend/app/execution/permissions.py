@@ -20,6 +20,9 @@ from app.storage import execution_permissions as records
 from app.agents.tools._workspace import source_workspace, workspace_root
 
 logger = logging.getLogger(__name__)
+# How long a request for the user's decision stays open.
+APPROVAL_SECONDS = 600
+
 
 class Verdict(BaseModel):
     model_config = ConfigDict(extra='forbid', strict=True)
@@ -326,12 +329,12 @@ class Permissions:
             return 'Git 状态查看白名单'
         return None
 
-    async def record_auto_approval(self, operation, source, reason, verdict=None):
+    async def record_auto_approval(self, operation, source, reason, verdict=None, actor=None):
         data = {'operation': operation, 'source': source, 'reason': reason, 'created_at': time.time()}
         from app.collaboration.tools import active
         ctx = active.get()
         if ctx:
-            data.update(conversation=ctx.conversation or None, agent=ctx.member)
+            data.update(conversation=ctx.conversation or None, agent=actor or ctx.member)
         else:
             from app.agents.usage import current_scope
             if current_scope().get('conversation_id'):
@@ -445,7 +448,12 @@ class Permissions:
             rows = (await db.execute(select(records).where(records.c.kind == kind))).mappings().all()
         return [{**row['data'], 'id': row['id'], 'scope': row['scope'], 'state': row['state']} for row in rows]
 
-    async def authorize(self, operation: dict, *, human=False):
+    async def authorize(self, operation: dict, *, human=False, platform=None):
+        """`platform`: why the platform itself runs this operation. Only for commands the
+        platform generates (dependency installation from manifests) or replays after they
+        were authorized in a task (a kept service moving to the project root, a verified
+        migration): no model chose them, so neither the reviewer nor the user is asked
+        again. They still run inside the sandbox and are audited as `platform`."""
         from app.collaboration.tools import active
         ctx = active.get()
         operation = {**operation, 'workspace': str(workspace_root().resolve())}
@@ -463,6 +471,9 @@ class Permissions:
         async with self.store.engine.connect() as db:
             grant = await db.scalar(select(records.c.id).where(records.c.id == key, records.c.kind == 'grant'))
         if grant:
+            return
+        if platform:
+            await self.record_auto_approval(operation, 'platform', platform, actor='platform')
             return
         if self.settings.allow_all:
             await self.record_auto_approval(operation, 'allow_all', '用户已开启“允许所有操作”')
@@ -512,13 +523,17 @@ class Permissions:
         data = {'operation': operation, 'reason': verdict.reason, 'review': verdict.decision,
                 'confidence': verdict.confidence, 'uncertain': verdict.uncertain,
                 'conversation': ctx.conversation if ctx else None, 'agent': ctx.member if ctx else None,
-                'created_at': time.time(), 'expires_at': time.time() + 600, 'key': key}
+                'created_at': time.time(), 'expires_at': time.time() + APPROVAL_SECONDS, 'key': key}
         future = asyncio.get_running_loop().create_future()
         self.pending[identifier] = future
         try:
             async with self.store.write() as db:
                 await db.execute(insert(records).values(id=identifier, kind='approval', scope=scope(), state='pending', data=data))
-            decision = await asyncio.wait_for(future, 600)
+            try:
+                decision = await asyncio.wait_for(future, APPROVAL_SECONDS)
+            except asyncio.TimeoutError:
+                # A bare TimeoutError has no message; callers report this text as the cause.
+                raise PermissionError('等待人工审批超时（10 分钟内无人处理），操作没有执行。') from None
             if decision == 'deny':
                 raise PermissionError('用户拒绝了本次操作；不要重复请求同一操作。')
         finally:

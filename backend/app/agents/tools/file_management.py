@@ -7,6 +7,7 @@ from typing import Annotated, Literal
 
 from pydantic import Field
 from app.agents.tools.validation import tool
+from app.agents.context_policy import RECOMPUTABLE
 from app.agents.tools._workspace import resolve_allowed, workspace_root, effective_roots, is_control_path, control_paths, published_documents, published_hint
 from app.execution.permissions import permissions
 from app.execution.file_ops import read_regular, move_no_replace
@@ -37,7 +38,7 @@ def make_file_management(read_roots, write_roots):
         paths = effective_roots(read_roots) if path == '.' else (path,)
         return [resolve_allowed(value, read_roots) for value in paths]
 
-    @tool
+    @tool(context_policy=RECOMPUTABLE)
     def browse_directory(path: str = '.', offset: Annotated[int, Field(ge=0)] = 0,
                           limit: Annotated[int, Field(ge=1, le=200)] = 100) -> dict:
         """Page immediate children of a project directory (including folders).
@@ -66,7 +67,7 @@ def make_file_management(read_roots, write_roots):
         entries.sort(key=lambda item: (item['type'] != 'directory', item['name']))
         return {'entries': entries[offset:offset+limit], 'next_offset': offset+limit if len(entries) > offset+limit else None}
 
-    @tool
+    @tool(context_policy=RECOMPUTABLE)
     def search_code(query: Annotated[str, Field(min_length=1, max_length=500)], path: str = '.',
                     offset: Annotated[int, Field(ge=0)] = 0,
                     limit: Annotated[int, Field(ge=1, le=200)] = 50) -> dict:
@@ -101,7 +102,7 @@ def make_file_management(read_roots, write_roots):
                         return {'matches': hits[:limit], 'next_offset': offset+limit, 'incomplete': False}
         return {'matches': hits, 'next_offset': None, 'incomplete': False}
 
-    @tool
+    @tool(context_policy=RECOMPUTABLE)
     async def read_external_file(path: str, reason: str,
                                   offset: Annotated[int, Field(ge=0)] = 0,
                                   limit: Annotated[int, Field(ge=1, le=30000)] = 10000) -> dict:

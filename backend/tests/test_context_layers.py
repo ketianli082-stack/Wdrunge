@@ -79,7 +79,7 @@ def test_current_turn_is_never_folded_even_with_many_parallel_results():
 
 
 def test_superseded_results_become_stubs_but_the_current_turn_stays():
-    first = turn(read('app.py', 'v1 ' * 400))
+    first = turn(read('app.py', 'v0 ' * 400))
     partial = turn(read('app.py', 'part ' * 200, offset=200, limit=1000))
     full = turn(read('app.py', 'v1 ' * 400))
     probe_fail = turn(command(['curl', 'http://127.0.0.1:8765/'], 7, 'curl: (7) Failed to connect', error='Command exited 7'))
@@ -91,7 +91,7 @@ def test_superseded_results_become_stubs_but_the_current_turn_stays():
     index = {m.id: i for i, m in enumerate(body)}
     assert 'newer full read of app.py' in stubs[index[first[1].id]] and index[partial[1].id] in stubs
     assert 'rewritten by message' in stubs[index[full[1].id]]
-    assert 'Superseded by newer execute_command' in stubs[index[probe_fail[1].id]]
+    assert 'the same execute_command call succeeded later' in stubs[index[probe_fail[1].id]]
     assert index[probe_ok[1].id] not in stubs and index[reread[1].id] not in stubs
     # The newest result can never be stubbed by an even newer one in the same turn.
     assert supersession(body, index[reread[0].id]).get(index[reread[1].id]) is None
@@ -118,8 +118,8 @@ def test_digests_keep_the_facts_agents_act_on():
     assert browser['actions'] == [{'action': 'assert_text', 'selector': '.state', 'passed': True}] and browser['code'] == 'page_errors'
     file = json.loads(kept(folded[source[1].id].content))
     assert file['path'] == 'frontend/app.js' and file['sha256'] == 'deadbeef' and file['lines'] == 1501
-    assert json.loads(kept(folded[unknown[1].id].content))['items'][-1] == '…95 more'
-    assert len(folded[text[1].id].content) <= 1500 and 'recall_context' in folded[text[1].id].content
+    # Tools that declare no context policy are durable: never cut mechanically.
+    assert folded[unknown[1].id].content == unknown[1].content and folded[text[1].id].content == text[1].content
 
 
 def test_folded_call_arguments_cannot_be_sent_back_as_values():
@@ -165,12 +165,18 @@ def test_fold_waits_for_a_large_batch_and_records_only_changed_messages(tmp_path
         member = agent()
         member._store = store
         memory = ContextMemory(member, 'thread-1')
+        # Folding a.py saves little next to the cached history it would make the next call resend.
         small = [SystemMessage(content='sys'), HumanMessage(content='task', id='task'),
-                 *turn(read('a.py', 'a' * 4000)), *turn(), *turn(), *turn()]
+                 *turn(read('a.py', 'a' * 4000)), *turn(('future_tool', {}, 'd' * 24000)), *turn(), *turn(), *turn()]
         assert not (await memory.prepare(small)).changed
         big = [*small, *[m for i in range(6) for m in turn(read(f'f{i}.py', 'b' * 8000))], *turn(), *turn(), *turn()]
-        prepared = await memory.prepare(big)
-        assert prepared.stage == 'fold'
+        # Each call that keeps the foldable bodies pays for them; once that has cost as much as
+        # the rewrite would (rent-or-buy), the whole batch folds in one rewrite.
+        for calls in range(1, 10):
+            prepared = await memory.prepare(big)
+            if prepared.changed:
+                break
+        assert prepared.stage == 'fold' and calls <= 5
         record = (await store.load_compactions('thread-1'))[-1]
         changed = {m['data']['id'] for m in record['source']}
         assert 'task' not in changed and big[3].id in changed and len(changed) == 7
@@ -201,11 +207,15 @@ class Summarizer:
                          usage_metadata={'input_tokens': 30, 'output_tokens': 10, 'total_tokens': 40})
 
 
-def test_summary_keeps_the_task_recent_turns_and_ledger_verbatim():
+def test_summary_keeps_the_task_recent_turns_and_ledger_verbatim(monkeypatch):
+    from app.agents import memory as memory_module
+    # Without work-segment summaries (L3), the whole-history summary (L4) is what fits.
+    monkeypatch.setattr(memory_module, 'SEGMENT_STAGE', 10)
+    monkeypatch.setattr(memory_module, 'SEGMENT_COMMIT', 10)
     async def run():
         work = [m for i in range(12) for m in turn(
             ('write_project_file', {'path': f'src/m{i}.py', 'content': 'w' * 2400}, f'Wrote src/m{i}.py (2400 characters; sha256=ab{i:02d}).'),
-            ('future_tool', {'q': i}, 'r' * 2400))]
+            ('read_project_file', {'path': f'src/r{i}.py'}, 'r' * 2400))]
         recent = [*turn(command(['pytest'], 0, '3 passed')), *turn(), *turn()]
         history = [SystemMessage(content='sys'), HumanMessage(content='Project handoff ' * 300, id='handoff'),
                    HumanMessage(content='Assigned task: build the API', id='task'), *work, *recent]

@@ -3,8 +3,7 @@ Shared Markdown under docs/ is managed: read and change it with collaboration_re
 and collaboration_publish, never with file writes. collaboration_read(whole=true)
 returns a whole document and its outline in one call; without whole it returns the
 outline, and with section_id one direct section body (parent bodies exclude children).
-Use IDs and versions exactly as returned. An already_in_context reply means you read
-it in this context; force=true reads it again. Publishing returns the new outline;
+Use IDs and versions exactly as returned. Publishing returns the new outline;
 edit from it. Dependents start when you submit, or on publish with ready=true.
 Publish a new document with changes=[{path, base_version:0, summary, content}]; change
 an existing one with changes=[{document_id, base_version, summary, edits}] where edits

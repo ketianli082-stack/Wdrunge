@@ -1350,6 +1350,118 @@
         }
       }
     },
+    "/api/conversations/{conversation_id}/agent-contexts": {
+      "get": {
+        "tags": [
+          "Conversations"
+        ],
+        "summary": "Agent Contexts",
+        "description": "The Leader, direct and task contexts of a session's agents.",
+        "operationId": "agent_contexts_api_conversations__conversation_id__agent_contexts_get",
+        "parameters": [
+          {
+            "name": "conversation_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Conversation Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AgentContextListResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/conversations/{conversation_id}/agent-context": {
+      "get": {
+        "tags": [
+          "Conversations"
+        ],
+        "summary": "Agent Context",
+        "description": "The model-facing messages of one context, as its next model call would see them.",
+        "operationId": "agent_context_api_conversations__conversation_id__agent_context_get",
+        "parameters": [
+          {
+            "name": "conversation_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Conversation Id"
+            }
+          },
+          {
+            "name": "key",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 1,
+              "title": "Key"
+            }
+          },
+          {
+            "name": "revision",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Revision"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AgentContextResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/debug/records/reset": {
       "post": {
         "tags": [
@@ -1956,6 +2068,210 @@
   },
   "components": {
     "schemas": {
+      "AgentContextListResponse": {
+        "properties": {
+          "contexts": {
+            "items": {
+              "$ref": "#/components/schemas/AgentContextSummary"
+            },
+            "type": "array",
+            "title": "Contexts"
+          }
+        },
+        "type": "object",
+        "required": [
+          "contexts"
+        ],
+        "title": "AgentContextListResponse"
+      },
+      "AgentContextMessage": {
+        "properties": {
+          "id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Id"
+          },
+          "type": {
+            "type": "string",
+            "title": "Type"
+          },
+          "content": {
+            "type": "string",
+            "title": "Content"
+          },
+          "reasoning": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reasoning"
+          },
+          "tool_calls": {
+            "items": {
+              "$ref": "#/components/schemas/AgentContextToolCall"
+            },
+            "type": "array",
+            "title": "Tool Calls"
+          },
+          "tool_call_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Tool Call Id"
+          },
+          "name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Name"
+          },
+          "status": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Status"
+          }
+        },
+        "type": "object",
+        "required": [
+          "type",
+          "content"
+        ],
+        "title": "AgentContextMessage"
+      },
+      "AgentContextResponse": {
+        "properties": {
+          "key": {
+            "type": "string",
+            "title": "Key"
+          },
+          "agent": {
+            "type": "string",
+            "title": "Agent"
+          },
+          "revision": {
+            "type": "string",
+            "title": "Revision"
+          },
+          "unchanged": {
+            "type": "boolean",
+            "title": "Unchanged",
+            "default": false
+          },
+          "messages": {
+            "items": {
+              "$ref": "#/components/schemas/AgentContextMessage"
+            },
+            "type": "array",
+            "title": "Messages"
+          }
+        },
+        "type": "object",
+        "required": [
+          "key",
+          "agent",
+          "revision"
+        ],
+        "title": "AgentContextResponse"
+      },
+      "AgentContextSummary": {
+        "properties": {
+          "key": {
+            "type": "string",
+            "title": "Key"
+          },
+          "agent": {
+            "type": "string",
+            "title": "Agent"
+          },
+          "label": {
+            "type": "string",
+            "title": "Label"
+          },
+          "running": {
+            "type": "boolean",
+            "title": "Running"
+          },
+          "updated": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Updated"
+          }
+        },
+        "type": "object",
+        "required": [
+          "key",
+          "agent",
+          "label",
+          "running"
+        ],
+        "title": "AgentContextSummary"
+      },
+      "AgentContextToolCall": {
+        "properties": {
+          "id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Id"
+          },
+          "name": {
+            "type": "string",
+            "title": "Name"
+          },
+          "arguments": {
+            "type": "string",
+            "title": "Arguments"
+          },
+          "invalid": {
+            "type": "boolean",
+            "title": "Invalid",
+            "default": false
+          }
+        },
+        "type": "object",
+        "required": [
+          "name",
+          "arguments"
+        ],
+        "title": "AgentContextToolCall"
+      },
       "AgentUsageResponse": {
         "properties": {
           "id": {

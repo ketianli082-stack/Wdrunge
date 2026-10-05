@@ -28,7 +28,9 @@ class Scheduler:
         self.team.scheduler = self
         self.last_maintenance = 0
         from app.collaboration.coordinator import LeaderCoordinator
+        from app.collaboration.reply_turns import ReplyTurns
         self.coordinator = LeaderCoordinator(service, team)
+        self.replies = ReplyTurns(self)
 
     async def start(self, *, pause_existing=False):
         await self.service.initialize()
@@ -55,6 +57,7 @@ class Scheduler:
                     task.cancel()
                 tasks.append(task)
         await asyncio.gather(*tasks, return_exceptions=True)
+        await self.replies.cancel_conversation(project, conversation)
 
     async def run(self):
         while True:
@@ -86,6 +89,8 @@ class Scheduler:
                     self.executions[task] = (job[0], job[2]['id'])
                     task.add_done_callback(self.jobs.discard)
                     task.add_done_callback(lambda t: self.executions.pop(t, None))
+                # Members with no task in progress answer messages in the slots left.
+                await self.replies.tick()
             except Exception:
                 logger.exception('Collaboration scheduler tick failed')
             await asyncio.sleep(.25)

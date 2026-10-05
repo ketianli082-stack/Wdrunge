@@ -3,9 +3,12 @@
 A turn is read-only when every tool call in it only reads or inspects (files,
 documents, search, directory listings, recalled context, process logs, and shell
 commands made only of read utilities). Writing, publishing, delivering, running a
-build, test or service and browser checks all move work forward. After many read-only
-turns in a row the runtime reminds the agent to produce output, and after twice as many
-it continues the task in a clean platform handoff (see app.agents.worker).
+build, test or service and browser checks all move work forward, and so does a journal
+note (a stated plan). After many read-only turns in a row the runtime reminds the agent
+to produce output; after twice as many, reads are paused (refused with an explanation)
+until the agent writes, runs something or records its next step (see app.agents.worker).
+The context is kept: a long read run usually means the working set is large, and
+clearing it only made the agent read the same files again.
 """
 from __future__ import annotations
 
@@ -61,25 +64,60 @@ def read_only_argv(argv: list[str]) -> bool:
     return True
 
 
+# Shell grammar around commands: grouping, and keywords that open or close a loop or
+# condition (the command after `do`, `then`, ... is judged on its own).
+GROUPING = {'(', ')', '{', '}'}
+OPENERS = {'do', 'then', 'else', 'elif', 'if', 'while', 'until', '!'}
+CLOSERS = {'done', 'fi'}
+HARMLESS = {'cd', 'printf', 'true', 'test', '['}
+# Redirection targets that write nothing: discarding output or merging streams.
+DISCARD = {'/dev/null'}
+
+
 def read_only_script(script: str) -> bool:
-    """A shell script made only of read utilities, without output redirection."""
-    if '>' in script or '`' in script or '$(' in script:
+    """A shell script made only of read utilities, writing nothing (output may go to
+    /dev/null or be merged into stdout). Quoted text is data: `awk 'NR>=460'` reads."""
+    if '`' in script or '$(' in script:
         return False
+    lexer = shlex.shlex(script, posix=True, punctuation_chars=True)
+    lexer.whitespace_split = True
     try:
-        tokens = shlex.split(script, posix=True)
+        tokens = list(lexer)
     except ValueError:
         return False
     command: list[str] = []
-    for token in [*tokens, ';']:
-        if token in SEPARATORS or token.endswith(';'):
-            if token.endswith(';') and token != ';':
-                command.append(token[:-1])
-            if command and not read_only_argv(command):
+    index = 0
+    while index <= len(tokens):
+        token = tokens[index] if index < len(tokens) else ';'
+        if token in SEPARATORS or token in GROUPING or set(token) <= set(';&|') or token == '\n':
+            if command and not read_only_command(command):
                 return False
             command = []
+        elif '>' in token and set(token) <= set('<>&|'):
+            target = tokens[index + 1] if index + 1 < len(tokens) else ''
+            if not (target in DISCARD or token.endswith('&') and target.isdigit()):
+                return False
+            if command and command[-1].isdigit():
+                command.pop()  # the file descriptor of `2>&1`
+            index += 1
+        elif token.startswith('<'):
+            index += 1  # reading input from a file or here-string
         else:
             command.append(token)
+        index += 1
     return True
+
+
+def read_only_command(command: list[str]) -> bool:
+    while command and command[0] in OPENERS:
+        command = command[1:]
+    if not command or command[0] in CLOSERS:
+        return True
+    if command[0] == 'for':
+        return True  # `for name in words`: the body follows `do`
+    if PurePosixPath(command[0]).name in HARMLESS:
+        return True
+    return read_only_argv(command)
 
 
 def read_only_call(call: dict) -> bool:
@@ -115,11 +153,25 @@ def read_streak(messages: list[BaseMessage]) -> int:
     return count
 
 
-def streak_notice(count: int, handoff: bool) -> HumanMessage:
+PAUSE_TEXT = ('读取已暂停：你已连续 {count} 轮只做读取。用已知信息推进：写出下一个文件或下一段（可以先写骨架），'
+              '或运行一次检查；不确定下一步时，先用 collaboration_journal(kind="next") 写下要写什么、'
+              '已确认的名称和签名、还缺哪一个具体事实。任何写入、运行或 journal 记录之后读取立即恢复。'
+              '任务台账的代码索引列出了你写过或整读过的文件里的声明和行号。')
+
+
+def reads_paused(history: list[BaseMessage]) -> int:
+    """The read-only streak before the newest response when reads are paused, else 0."""
+    streak = read_streak(history)
+    return streak if streak >= 2 * read_streak_limit() else 0
+
+
+def streak_notice(count: int, paused: bool) -> HumanMessage:
     text = (f'平台提示：你已连续 {count} 轮只做读取（读文件、读文档、搜索、查看），没有写入、发布或运行。'
             '现在用已有信息写出下一个文件或下一节（可以先写骨架），缺的细节写完后再按需读取单个章节或片段；'
             '不要为了一次写完而继续读全部材料。确实被阻塞时用 collaboration_journal 记录 blocked 并说明原因。')
-    if handoff:
-        text += '平台已把上下文换成干净交接（最近的原文仍保留），下一步必须写入或发布。'
+    if paused:
+        text = PAUSE_TEXT.format(count=count)
+    else:
+        text += f'连续 {2 * read_streak_limit()} 轮只读后，读取会暂停，直到你写入、运行或用 journal 写下下一步。'
     # A reminder, so summaries drop it and it is never taken for the task input.
     return HumanMessage(content=text, additional_kwargs={STREAK_KEY: count, 'reissuable_reminder': True})

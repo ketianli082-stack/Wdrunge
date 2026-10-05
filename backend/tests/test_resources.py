@@ -536,8 +536,11 @@ def migration_setup(tmp_path, monkeypatch):
     class Approve:
         store = SimpleNamespace(sqlite_path=None)
 
-        async def authorize(self, *args, **kwargs):
-            pass
+        def __init__(self):
+            self.calls = []
+
+        async def authorize(self, operation, **kwargs):
+            self.calls.append((operation['argv'], kwargs.get('platform')))
     monkeypatch.setattr(policy, 'current', Approve())
     monkeypatch.setattr(sandbox, 'capability', lambda: {'available': True, 'backend': 'seatbelt'})
     monkeypatch.setattr(sandbox, 'command_line', lambda argv, *args, **kwargs: argv)
@@ -572,11 +575,15 @@ def test_a_merged_migration_runs_at_the_root_after_a_backup(tmp_path, monkeypatc
         assert (await collaboration.environment(p))['commands'][0]['status'] == 'verified'
 
         (workspace / 'backend' / 'migrate.py').write_text('raise SystemExit("column title already exists")\n')
+        command = await collaboration.migration_for(p, ['backend/models.py'])
         assert not await collaboration.apply_migration(p, 'backend:2', workspace, workspace, command, 'conv')
         async with collaboration.reading() as c:
             from sqlalchemy import text
             [event] = [json.loads(row) for row in await c.scalars(text("SELECT data FROM collaboration_events WHERE recipient='leader'"))]
         assert event['type'] == 'migration_failed' and 'column title already exists' in event['summary'] and '已备份' in event['summary']
+        assert event['cause'] == '命令退出码 1' and event['cwd'] == str(workspace.resolve() / 'backend')
+        # Once verified in a task, the platform replays the command without a new review.
+        assert policy.current.calls[0][1] is None and policy.current.calls[-1][1]
         await manager.close()
         await store.close()
     asyncio.run(run())
@@ -702,3 +709,50 @@ def test_mysql_provisioning_statements_survive_parameter_formatting(monkeypatch)
     assert "CREATE USER IF NOT EXISTS 'wd_blog_abc123'@'%' IDENTIFIED BY 'p@ss%word'" in executed
     assert "ALTER USER 'wd_blog_abc123'@'%' IDENTIFIED BY 'p@ss%word'" in executed
     assert "GRANT ALL PRIVILEGES ON `wd_blog_abc123`.* TO 'wd_blog_abc123'@'%'" in executed
+
+
+def test_a_migration_that_never_ran_reports_the_cause(tmp_path, monkeypatch):
+    manager = migration_setup(tmp_path, monkeypatch)
+
+    async def expired(operation, **kwargs):
+        raise PermissionError('等待人工审批超时（10 分钟内无人处理），操作没有执行。')
+    monkeypatch.setattr(policy.current, 'authorize', expired)
+
+    async def run():
+        store, resources, project, workspace = await setup(tmp_path)
+        collaboration = Collaboration(store)
+        await collaboration.initialize()
+        p = project['id']
+        (workspace / 'backend').mkdir()
+        (workspace / 'backend' / 'migrate.py').write_text('pass\n')
+        command = await collaboration.register_command(p, 'backend', 'migrate', [sys.executable, 'migrate.py'], 'backend')
+        assert not await collaboration.apply_migration(p, 'backend:1', workspace, workspace, command, 'conv')
+        async with collaboration.reading() as c:
+            from sqlalchemy import text
+            [event] = [json.loads(row) for row in await c.scalars(text("SELECT data FROM collaboration_events WHERE recipient='leader'"))]
+        assert '等待人工审批超时' in event['cause'] and '等待人工审批超时' in event['summary']
+        await manager.close()
+        await store.close()
+    asyncio.run(run())
+
+
+def test_a_command_with_its_own_interpreter_needs_no_root_venv(tmp_path, manager, monkeypatch):
+    project_root = tmp_path / 'project'
+    snapshot = project_root / '.wdrunge-runs' / 'backend' / 'work'
+    (snapshot / 'api' / '.venv').mkdir(parents=True)
+    (project_root / 'api').mkdir(parents=True)
+    (project_root / 'api' / 'requirements.txt').write_text('fastapi\n')
+    installs = []
+
+    async def run(argv, cwd, *args, **kwargs):
+        installs.append(argv)
+        return {'exit_code': 0, 'timed_out': False, 'output': ''}
+    monkeypatch.setattr(manager, 'run', run)
+    outside = Path(getattr(sys, '_base_executable', sys.executable))
+    job = SimpleNamespace(argv=[str(outside), 'migrate.py'], cwd=str(snapshot / 'api'))
+    assert asyncio.run(manager.prepare_root(job, project_root, 'api')) is None
+    assert installs == []
+    # A bare interpreter name runs through the project .venv, so that one is installed.
+    job = SimpleNamespace(argv=['python', 'migrate.py'], cwd=str(snapshot / 'api'))
+    asyncio.run(manager.prepare_root(job, project_root, 'api'))
+    assert installs and installs[0][1:3] == ['-m', 'venv']

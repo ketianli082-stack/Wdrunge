@@ -40,7 +40,7 @@ class GoalMixin:
                 raise StorageConflictError('当前对话已停止，发送新消息后继续')
             if not control or control['state'] == 'idle':
                 from uuid import uuid4
-                await self._put(c, 'conversation_run', project, conversation, dict(state='active', generation=uuid4().hex))
+                await self._put(c, 'conversation_run', project, conversation, dict(state='active', generation=uuid4().hex, activated=time.time()))
             identifier = f'{conversation}:{key}'
             spec = dict(objective=objective, criteria=criteria, conversation=conversation, reminder_seconds=reminder_seconds, scale=scale)
             old = await self._get(c, 'goal', project, identifier, False)

@@ -6,6 +6,8 @@ from dataclasses import dataclass, field
 from typing import Literal
 
 from app.agents.tools.validation import tool, validation_failure, exception_result, failure_result, EXAMPLE_CALLS
+from app.agents.context_policy import DURABLE, RECOMPUTABLE
+from app.agents.progress import READ_ACTIONS
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from app.collaboration.service import Collaboration
@@ -24,12 +26,17 @@ class Context:
     context: str
     request: str | None = None
     instance_id: str | None = None
-    read_context: str | None = None
     seen_events: set[int] = field(default_factory=set)
-    pending_reads: list[str] = field(default_factory=list)
+    # A reply turn (app.collaboration.reply_turns): reads and answers, changes nothing.
+    reply_turn: bool = False
+    replied: set[str] = field(default_factory=set)
 
 
 active: ContextVar[Context | None] = ContextVar('collaboration_context', default=None)
+
+# What a reply turn may do: read the project state and answer with messages.
+REPLY_ACTIONS = {'catalog', 'read', 'search', 'diff', 'history', 'inspect_message', 'inspect_request', 'send',
+                 'snapshot', 'dependencies', 'environment', 'get_goal'}
 
 
 async def own_delivery_findings(s, project, request_id, artifacts=None):
@@ -186,6 +193,9 @@ async def execute_collaboration(action: Literal['catalog', 'read', 'publish', 's
         return {'error': 'Collaboration requires a persisted project conversation'}
     s, p = ctx.service, ctx.project
     try:
+        if ctx.reply_turn and action not in REPLY_ACTIONS:
+            raise ValueError('A reply turn only reads and answers; it cannot change files, documents or tasks. Say in '
+                             'your reply what work is needed and send the Leader a short message so it can schedule a task.')
         payload = validate_payload(action, payload)
         if ctx.request and action in ({'publish','send','request','wait','transition','decision','register_service','register_command'} | GOAL_ACTIONS - {'get_goal'}):
             import time
@@ -223,10 +233,9 @@ async def execute_collaboration(action: Literal['catalog', 'read', 'publish', 's
         if action == 'catalog':
             return {'documents': await s.catalog(p)}
         if action == 'read':
-            result, key = await s.read_cached(p, ctx.member, ctx.read_context or ctx.context, **payload)
-            if key:
-                ctx.pending_reads.append(key)
-            return result
+            # force only matters to context memory: a result still shown verbatim is not repeated.
+            payload.pop('force', None)
+            return await s.read(p, **payload)
         if action == 'decision':
             return await s.record_decision(p, ctx.member, **payload)
         if action == 'maintenance':
@@ -290,7 +299,9 @@ async def execute_collaboration(action: Literal['catalog', 'read', 'publish', 's
         if action == 'subscribe':
             return await s.subscribe(p, ctx.member, **payload)
         if action == 'send':
-            return await s.send(p, ctx.member, conversation=ctx.conversation, **payload)
+            result = await s.send(p, ctx.member, conversation=ctx.conversation, wake=not ctx.reply_turn, **payload)
+            ctx.replied.add(payload['recipient'])
+            return result
         if action == 'request':
             if 'origin_message' in payload:
                 raise ValueError('origin_message is supplied only by the coordinator')
@@ -318,7 +329,7 @@ async def execute_collaboration(action: Literal['catalog', 'read', 'publish', 's
                         await s._dependencies(c, p, payload['based_on'])
                         r['based_on'] = payload['based_on']
                         await s._put(c, 'request', p, ctx.request, r)
-                await s.publish_artifacts(p, ctx.request, ctx.instance_id, references='\n'.join([
+                await s.publish_artifacts(p, ctx.request, ctx.instance_id, delivered=payload.get('artifacts'), references='\n'.join([
                     payload.get('result') or '', json.dumps(payload.get('evidence') or [], ensure_ascii=False), *(payload.get('artifacts') or [])]))
             result = await s.transition(p, actor=ctx.member, expected_instance=ctx.instance_id if ctx.request == payload.get('identifier') else None, **payload)
             receipt = transition_receipt(result)
@@ -388,7 +399,10 @@ def _action_tool(action):
         return await execute_collaboration(action, payload)
 
     invoke.__doc__ = ACTION_DESCRIPTIONS[action]
-    return tool(action if action in GOAL_ACTIONS else f'collaboration_{action}', args_schema=schema)(invoke)
+    # Reads and inspections can be repeated; everything else records state or a decision.
+    policy = RECOMPUTABLE if action in READ_ACTIONS or action == 'get_goal' else DURABLE
+    return tool(action if action in GOAL_ACTIONS else f'collaboration_{action}', args_schema=schema,
+                context_policy=policy)(invoke)
 
 
 COLLABORATION_TOOLS = {candidate.name: candidate for candidate in (_action_tool(action) for action in ACTION_PAYLOADS)}
@@ -448,6 +462,8 @@ def model_collaboration_tools():
              and (name not in {'collaboration_wait', 'collaboration_journal'} or ctx.request)]
     if ctx.member != 'leader':
         tools = [WORKER_REQUEST if t.name == 'collaboration_request' else t for t in tools]
+    if ctx.reply_turn:
+        tools = [t for t in tools if collaboration_action(t.name, {}) in REPLY_ACTIONS]
     return [*tools, enable_tools]
 
 

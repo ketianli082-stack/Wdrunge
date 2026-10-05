@@ -64,6 +64,35 @@ def test_exact_grants_once_denial_revocation_restart_scope(tmp_path, monkeypatch
     asyncio.run(scenario())
 
 
+def test_platform_operations_skip_review_and_expired_approvals_say_why(tmp_path, monkeypatch):
+    reviewed = []
+    async def ask(details):
+        reviewed.append(details)
+        return policy.Verdict(decision='ask', reason='Needs review')
+    monkeypatch.setattr(policy, 'review', ask)
+    monkeypatch.setattr(policy, 'APPROVAL_SECONDS', .2)
+    async def scenario():
+        store = ChatStore(f'sqlite+aiosqlite:///{tmp_path}/permissions.db')
+        await store.initialize()
+        manager = policy.Permissions(store)
+        await manager.initialize()
+        token = active_workspace.set(tmp_path)
+        try:
+            install = {'kind': 'command', 'argv': ['python3', '-m', 'venv', str(tmp_path / '.venv')], 'network': True}
+            await asyncio.wait_for(manager.authorize(install, platform='install from manifests'), 2)
+            [audit] = await manager.rows('review')
+            assert reviewed == [] and audit['source'] == 'platform'
+            assert not [r for r in await manager.rows('approval')]
+            # Nobody answers: the error names the cause instead of an empty TimeoutError.
+            with pytest.raises(PermissionError, match='等待人工审批超时'):
+                await manager.authorize({'kind': 'command', 'argv': ['echo', 'agent']})
+            assert (await manager.rows('approval'))[0]['state'] == 'expired'
+        finally:
+            active_workspace.reset(token)
+            await store.close()
+    asyncio.run(scenario())
+
+
 def test_cancelled_approval_cannot_be_accepted(tmp_path):
     async def scenario():
         store = ChatStore(f'sqlite+aiosqlite:///{tmp_path}/permissions.db')
@@ -120,6 +149,8 @@ def test_environment_installs_are_local_and_shared_links_refused(tmp_path):
     (tmp_path/'requirements.txt').write_text('fastapi')
     commands = installation_commands(tmp_path, 'python')
     assert commands[0][-1] == str(tmp_path/'.venv')
+    # The platform's own virtual environment never becomes the project's base Python.
+    assert not Path(commands[0][0]).resolve().is_relative_to(Path(sys.prefix).resolve()) or sys.prefix == sys.base_prefix
     assert commands[1][0] == str(tmp_path/'.venv/bin/python')
     assert '--user' not in commands[1]
 
@@ -333,3 +364,21 @@ def test_commands_do_not_run_with_the_platform_virtualenv(tmp_path, monkeypatch)
     (project_venv / 'bin').mkdir(parents=True)
     # A project's own .venv still comes first.
     assert sandbox.clean_environment(tmp_path, tmp_path)['PATH'] == f'{project_venv / "bin"}:{host_bin}:/usr/bin'
+
+
+def test_project_venv_uses_the_task_interpreter_and_absolute_interpreters_need_none(tmp_path):
+    from app.execution.environment import base_python
+    from app.execution.processes import brings_own_python, snapshot_python
+    base = Path(getattr(sys, '_base_executable', sys.executable))
+    venv = tmp_path / 'snapshot' / '.venv'
+    venv.mkdir(parents=True)
+    (venv / 'pyvenv.cfg').write_text(f'home = {base.parent}\nexecutable = {base}\nversion = 3.12.4\n')
+    assert snapshot_python(venv) == str(base)
+    assert snapshot_python(tmp_path / 'none') is None
+    assert base_python(tmp_path, str(base)) == str(base)
+    project = tmp_path / 'project'
+    (project / '.venv' / 'bin').mkdir(parents=True)
+    # A command run by an interpreter outside the project .venv never loads that .venv.
+    assert brings_own_python(str(base), project)
+    assert not brings_own_python('python3', project)
+    assert not brings_own_python(str(project / '.venv' / 'bin' / 'python'), project)

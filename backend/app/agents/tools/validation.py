@@ -13,11 +13,16 @@ _schemas = {}
 EXAMPLE_CALLS: dict[str, dict] = {}
 
 
-def tool(*args, **kwargs):
+def tool(*args, context_policy=None, **kwargs):
+    """A strict tool; context_policy declares how its results may be compacted
+    (app.agents.context_policy; undeclared tools are durable)."""
     def strict(result):
         result.args_schema.model_config = ConfigDict(**{**result.args_schema.model_config, 'strict': True, 'extra': 'forbid'})
         result.args_schema.model_rebuild(force=True)
         _schemas[result.name] = result.args_schema
+        if context_policy:
+            from app.agents.context_policy import declare
+            declare(result, context_policy)
         return result
     result = langchain_tool(*args, **kwargs)
     if hasattr(result, 'args_schema'):

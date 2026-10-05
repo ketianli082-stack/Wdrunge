@@ -11,6 +11,7 @@ import os
 import re
 import shutil
 import tempfile
+import threading
 from pathlib import Path
 
 from app.storage import StorageConflictError
@@ -18,6 +19,8 @@ from app.storage import StorageConflictError
 # A task's own throwaway helpers (mock servers, probe scripts) live here in its
 # snapshot: usable across its commands, never merged into the project.
 TASK_SCRATCH = '.task-scratch'
+# Where sync() leaves the project's version of a file the task also changed.
+MERGED_COPIES = f'{TASK_SCRATCH}/project-versions'
 # The project's runtime data (its SQLite database, uploads) lives in DATA_DIR at the
 # project root, shared by every task and never copied into a snapshot or merged.
 DATA_DIR = '.wdrunge-data'
@@ -27,6 +30,9 @@ EXCLUDED = {'.git', '.wdrunge-runs', 'node_modules', '.venv', '__pycache__', '.p
 # service runs, so a three-way merge could only conflict or lose writes.
 RUNTIME_DATA = re.compile(r'\.(db|sqlite3?|db3)(-wal|-shm|-journal)?$', re.I)
 MAX_BYTES = 128 * 1024 * 1024
+# A snapshot's manifest is updated by its own task (rebase, refresh) and by colleagues'
+# merges (sync) from different threads; one read-modify-write at a time.
+MANIFEST_LOCK = threading.Lock()
 MAX_FILES = 10000
 
 
@@ -108,6 +114,23 @@ def merge_text(base: str, current: str, proposed: str) -> str:
     for a,b,replacement in sorted(unique, key=lambda change: (change[0],change[1]), reverse=True):
         original[a:b] = replacement
     return ''.join(original)
+
+
+def unmerged_reason(path: str) -> str | None:
+    """Why a snapshot path never reaches the project, or None for an ordinary project file."""
+    parts = Path(path).parts
+    name = parts[-1] if parts else ''
+    if TASK_SCRATCH in parts:
+        return f'{TASK_SCRATCH}/ holds task-private helpers that are never merged'
+    if DATA_DIR in parts:
+        return f'{DATA_DIR}/ is project runtime data that is never merged'
+    if hidden := next((part for part in parts if part in EXCLUDED), None):
+        return f'{hidden} is never merged (dependencies, build output, caches and secrets are excluded)'
+    if name.startswith('.env.') and name not in {'.env.example', '.env.sample'}:
+        return 'secret .env files are never merged; deliver a .env.example template instead'
+    if RUNTIME_DATA.search(name):
+        return 'live database files are runtime data that is never merged'
+    return None
 
 
 def files(root):
@@ -210,6 +233,27 @@ class IsolatedWorkspace:
         save_json(journal, encoded)
         self.recover_merge()
 
+    def rebase(self, changes):
+        """Record merged content as this snapshot's base, so a later delivery from the
+        same snapshot merges only what changed after this merge."""
+        with MANIFEST_LOCK:
+            self._rebase(changes)
+
+    def _rebase(self, changes):
+        manifest = json.loads(self.manifest_path.read_text())
+        for item in changes:
+            for target in (self.base/item['path'], self.work/item['path']):
+                if item['content'] is None:
+                    target.unlink(missing_ok=True)
+                else:
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    target.write_bytes(item['content'])
+            if item['content'] is None:
+                manifest.pop(item['path'], None)
+            else:
+                manifest[item['path']] = hash_bytes(item['content'])
+        save_json(self.manifest_path, manifest)
+
     def recover_merge(self):
         import base64
         journal = self.root/'merge.json'
@@ -246,27 +290,56 @@ class IsolatedWorkspace:
         journal.unlink()
 
     def sync(self, names):
-        """Copy just-published shared documents into this snapshot as unchanged
-        base files, so file tools see them and plan() does not treat them as edits."""
+        """Bring files the project just received (a colleague's merged delivery, shared
+        documents just published) into this snapshot as unchanged base files, so the
+        task sees them and plan() does not treat them as its own edits. A path this task
+        changed itself is never overwritten: it is returned under 'kept', and merging the
+        task's version later will meet the project's."""
+        result = {'pulled': [], 'kept': []}
         if not self.manifest_path.exists():
-            return
-        manifest = json.loads(self.manifest_path.read_text())
-        for name in names:
-            source = self.source/name
-            if source.is_symlink() or not source.is_file() or not source.resolve().is_relative_to(self.source):
-                continue
-            local = self.work/name
-            if hash_bytes(local.read_bytes() if local.is_file() else None) != manifest.get(name):
-                continue  # Never overwrite this request's own edits.
-            data = source.read_bytes()
-            for target in (self.base/name, local):
-                target.parent.mkdir(parents=True, exist_ok=True)
-                target.write_bytes(data)
-            manifest[name] = hash_bytes(data)
-        save_json(self.manifest_path, manifest)
+            return result
+        with MANIFEST_LOCK:
+            manifest = json.loads(self.manifest_path.read_text())
+            for name in dict.fromkeys(names):
+                source = self.source/name
+                if (unmerged_reason(name) or source.is_symlink() or not source.resolve().is_relative_to(self.source)
+                        or source.exists() and not source.is_file()):
+                    continue
+                data = source.read_bytes() if source.is_file() else None
+                if hash_bytes(data) == manifest.get(name):
+                    continue
+                local = self.work/name
+                local_data = local.read_bytes() if local.is_file() else None
+                if hash_bytes(local_data) != manifest.get(name) and local_data != data:
+                    # Never overwrite this request's own edits; the project's version is
+                    # left beside them in the task scratch area for comparison.
+                    result['kept'].append(name)
+                    if data is not None:
+                        copy = self.work/MERGED_COPIES/name
+                        copy.parent.mkdir(parents=True, exist_ok=True)
+                        copy.write_bytes(data)
+                    continue
+                for target in (self.base/name, local):
+                    if data is None:
+                        target.unlink(missing_ok=True)
+                    else:
+                        target.parent.mkdir(parents=True, exist_ok=True)
+                        target.write_bytes(data)
+                if data is None:
+                    manifest.pop(name, None)
+                else:
+                    manifest[name] = hash_bytes(data)
+                if local_data != data:
+                    result['pulled'].append(name)
+            save_json(self.manifest_path, manifest)
+        return result
 
     def refresh(self):
         """Pull new dependency artifacts without overwriting this request's edits."""
+        with MANIFEST_LOCK:
+            self._refresh()
+
+    def _refresh(self):
         manifest = json.loads(self.manifest_path.read_text())
         source_files = files(self.source)
         for name in sorted(manifest.keys() | source_files.keys()):

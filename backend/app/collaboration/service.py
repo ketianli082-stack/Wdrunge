@@ -21,7 +21,7 @@ from sqlalchemy import text
 from app.collaboration.documents import digest, outline, section, edit_document, page
 from app.collaboration.schema import DDL
 from app.collaboration.payloads import TransitionPayload
-from app.collaboration.workspaces import merge_text, IsolatedWorkspace, unreferenced_screenshots, secret_leaks
+from app.collaboration.workspaces import MERGED_COPIES, merge_text, IsolatedWorkspace, unreferenced_screenshots, secret_leaks, unmerged_reason
 from app.storage import ChatStore, StorageConflictError, StorageNotFoundError, write_transaction
 
 ROLES = {'leader', 'product', 'backend', 'frontend', 'designer', 'testing'}
@@ -36,13 +36,14 @@ from app.collaboration.runs import ConversationRuns
 
 from app.collaboration.environment import EnvironmentMixin
 from app.collaboration.journal import JournalMixin
+from app.collaboration.replies import ReplyMixin
 from app.collaboration.planning import (PlanningMixin, check_criteria_budget, check_deliverables, goal_scale,
                                         need_satisfied, normalize_needs, project_relative, serial_dependency, still_draft)
 
 logger = logging.getLogger(__name__)
 
 
-class Collaboration(GoalMixin, ConversationRuns, EnvironmentMixin, JournalMixin, PlanningMixin):
+class Collaboration(GoalMixin, ConversationRuns, EnvironmentMixin, JournalMixin, PlanningMixin, ReplyMixin):
     def __init__(self, store: ChatStore):
         self.store = store
         self._lock = asyncio.Lock()
@@ -373,7 +374,9 @@ class Collaboration(GoalMixin, ConversationRuns, EnvironmentMixin, JournalMixin,
         })
         return identifier
 
-    async def send(self, project, sender, recipient, content, key, conversation='', reply_to=None, request_id=None, summary=None):
+    async def send(self, project, sender, recipient, content, key, conversation='', reply_to=None, request_id=None, summary=None, wake=True):
+        """wake=False (messages sent from a reply turn) never wakes an idle recipient,
+        so two members cannot keep waking each other."""
         if not key or len(key) > 160 or sender not in ROLES or recipient not in ROLES or not content.strip() or len(content) > 4000:
             raise ValueError('Invalid message')
         summary = self._summary(summary, '有一条协作消息，请查看详细记录。')
@@ -388,6 +391,8 @@ class Collaboration(GoalMixin, ConversationRuns, EnvironmentMixin, JournalMixin,
                     raise ValueError('Message request target must match recipient and conversation')
             identifier = f'{sender}:{key}'
             message = dict(id=identifier, sender=sender, recipient=recipient, content=content, conversation=conversation, reply_to=reply_to, target_request=request_id, summary=summary)
+            if not wake:
+                message['no_wake'] = True
             old = await self._get(c, 'message', project, identifier, False)
             if old:
                 old.setdefault('summary', '有一条协作消息，请查看详细记录。')
@@ -397,20 +402,26 @@ class Collaboration(GoalMixin, ConversationRuns, EnvironmentMixin, JournalMixin,
                 message['chat_message_id'] = await self._group_message(c, project, conversation, sender, recipient, summary, 'message:'+identifier)
                 await self._put(c, 'message', project, identifier, message)
                 await self._event(c, project, recipient, {'type': 'message', **message}, conversation)
-            return old or message
+            return {**(old or message), **await self.delivery(c, project, conversation, recipient, wake)}
 
-    async def inbox(self, project, member, context, conversation='', limit=6000, request=None):
+    async def inbox(self, project, member, context, conversation='', limit=6000, request=None, reply_turn=False):
+        """Unread events for this context. Receipts are per context, so a fresh task
+        context sees what earlier contexts read; a reply turn instead sees only
+        messages no context of this member has read."""
         async with self.reading() as c:
             rows = (await c.execute(text('''SELECT e.seq,e.data FROM collaboration_events e
               LEFT JOIN collaboration_receipts r ON r.project=e.project AND r.context=:ctx AND r.seq=e.seq
               WHERE e.project=:p AND e.recipient=:m AND (e.conversation='' OR e.conversation=:v)
               AND (json_extract(e.data,'$.target_request') IS NULL OR json_extract(e.data,'$.target_request')=:request)
               AND r.seq IS NULL
+              AND (:reply=0 OR (json_extract(e.data,'$.type')='message' AND NOT EXISTS (
+                SELECT 1 FROM collaboration_receipts o WHERE o.project=e.project AND o.seq=e.seq AND o.context LIKE :member_contexts)))
               AND (COALESCE(json_extract(e.data,'$.type'),'') != 'goal_reminder' OR EXISTS (
                 SELECT 1 FROM collaboration_records g WHERE g.kind='goal' AND g.project=e.project
                 AND g.id=json_extract(e.data,'$.goal_id') AND g.state='active'
                 AND COALESCE(json_extract(g.data,'$.reminder_epoch'),0)=COALESCE(json_extract(e.data,'$.goal_epoch'),0)))
-              ORDER BY e.seq LIMIT 200'''), dict(ctx=f'{member}:{context}', p=project, m=member, v=conversation, request=request))).mappings().all()
+              ORDER BY e.seq LIMIT 200'''), dict(ctx=f'{member}:{context}', p=project, m=member, v=conversation, request=request,
+                                                 reply=int(reply_turn), member_contexts=f'{member}:%'))).mappings().all()
             items = []
             size = 0
             for row in rows:
@@ -622,7 +633,8 @@ class Collaboration(GoalMixin, ConversationRuns, EnvironmentMixin, JournalMixin,
                 delivered = artifacts if artifacts is not None else r['delivered']
                 for path in set(delivered + r['artifacts']):
                     if not self._artifact_exists(self._path(p['workspace_path'], path)):
-                        raise ValueError(f'Artifact does not exist: {path} (a directory needs at least one file)')
+                        raise ValueError(f'Artifact does not exist in the project after merging your task workspace: {path} '
+                                         '(a directory needs at least one file)')
                 if any(d['state'] != 'completed' for d in [await self._get(c, 'request', project, dep) for dep in r['dependencies']]):
                     raise StorageConflictError('Dependencies are not completed')
                 r['delivered'] = delivered
@@ -815,20 +827,6 @@ class Collaboration(GoalMixin, ConversationRuns, EnvironmentMixin, JournalMixin,
             return {'matches': matches, 'next_offset': offset+limit if len(rows)>limit else None}
 
 
-    async def read_cached(self, project, member, context, force=False, **payload):
-        result = await self.read(project, **payload)
-        key = digest(json.dumps([member, context, payload, result.get('version')], sort_keys=True))
-        async with self.reading() as c:
-            cached = await self._get(c, 'read', project, key, False)
-        if cached and not force:
-            return {'already_in_context': True, 'document_id': payload['document_id'], 'version': result['version'], 'section_id': payload.get('section_id'), 'hint': 'Use force=true to read again.'}, None
-        return result, key
-
-    async def confirm_reads(self, project, keys):
-        async with self.transaction() as c:
-            for key in keys:
-                await self._put(c, 'read', project, key, {'confirmed': True})
-
 
     async def _cancel_dependents(self, c, project, identifier):
         requests = await self._list(c, 'request', project)
@@ -1019,31 +1017,40 @@ class Collaboration(GoalMixin, ConversationRuns, EnvironmentMixin, JournalMixin,
             await asyncio.to_thread(workspace.refresh)
             return workspace
 
-    async def publish_artifacts(self, project, identifier, instance_id, references=''):
-        """Merge the task snapshot into the project. `references` is the delivery text
-        (result, evidence, artifact paths) used to keep only screenshots it cites."""
+    async def publish_artifacts(self, project, identifier, instance_id, references='', delivered=None):
+        """Merge what the task snapshot changed since its last merge into the project.
+        Every artifact the task declares or this delivery lists (`delivered`) is checked
+        in the snapshot first, so a rejected delivery merges nothing and a corrected one
+        merges everything. `references` is the delivery text (result, evidence, artifact
+        paths) used to keep only screenshots it cites."""
         credentials = await self._known_secrets(project)
         async with self.transaction() as c:
             r = await self._get(c, 'request', project, identifier)
             if r.get('instance_id') != instance_id or r['state'] not in {'running', 'review'} or r.get('lease_until',0) <= time.time():
                 raise StorageConflictError('Request execution lease is no longer valid')
-            if r.get('workspace_published'):
-                return
             await self._dependencies(c, project, r['based_on'])
             if any(dep['state'] != 'completed' for dep in [await self._get(c, 'request', project, identifier) for identifier in r['dependencies']]):
                 raise StorageConflictError('Accept dependency deliveries before publishing artifacts')
             p = await self._project(c, project)
             workspace = IsolatedWorkspace(p['workspace_path'], r['workspace_id'])
             managed = {d['path'] for d in await self._list(c, 'document', project)}
-            for path in r['artifacts']:
+            for path in dict.fromkeys([*r['artifacts'], *(delivered or [])]):
+                declared = path in r['artifacts']
+                if reason := unmerged_reason(path):
+                    raise ValueError(f'{path} cannot be a deliverable: {reason}. List only project files that colleagues '
+                                     'and the user will use; nothing was merged, deliver again without it.')
                 # Shared documents are published to the project, not the request snapshot.
                 root = p['workspace_path'] if str(Path(path)) in managed else str(workspace.work)
                 if not self._artifact_exists(self._path(root, path)):
-                    raise ValueError(f'Expected artifact is missing: {path}. The request declares this path; '
-                                     'create it (a directory needs at least one file) or ask the sender to change the task.')
+                    where = 'the project documents' if root == p['workspace_path'] else 'your task workspace'
+                    raise ValueError(f'Artifact is missing from {where}: {path} (a directory needs at least one file). '
+                                     + ('The request declares this path; create it or ask the sender to change the task.'
+                                        if declared else 'Create it or remove it from artifacts; nothing was merged.'))
             await asyncio.to_thread(workspace.recover_merge)
             # Finish an interrupted merge before considering a new plan.
             changes = await asyncio.to_thread(workspace.plan, managed)
+            if r.get('workspace_published') and not changes:
+                return
             documents = [Path(p['workspace_path'], path).read_text(errors='replace') for path in managed
                          if Path(p['workspace_path'], path).is_file()]
             skipped = unreferenced_screenshots(changes, workspace.source, '\n'.join(
@@ -1057,12 +1064,18 @@ class Collaboration(GoalMixin, ConversationRuns, EnvironmentMixin, JournalMixin,
                                  'environment.connected) and keep only placeholders such as .env.example in files; '
                                  'then deliver again.')
             await asyncio.to_thread(workspace.publish, changes)
+            await asyncio.to_thread(workspace.rebase, changes)
             r['workspace_published'] = True
             r['merged_paths'] = [item['path'] for item in changes]
             if skipped:
                 r['unmerged_screenshots'] = skipped
             await self._put(c, 'request', project, identifier, r)
         if r['merged_paths']:
+            try:
+                await self.share_merged(project, r, r['merged_paths'])
+            except Exception:
+                # The merge stands; running tasks pick the files up when they next start.
+                logger.warning('Could not bring merged files into running task snapshots', exc_info=True)
             # Kept services serving the project restart to load the merged files; those
             # still running in another task's snapshot are flagged stale.
             from app.execution.processes import processes
@@ -1074,6 +1087,33 @@ class Collaboration(GoalMixin, ConversationRuns, EnvironmentMixin, JournalMixin,
                 self.migrations[(project, identifier)] = processes.background(self._migrate_then_refresh(
                     project, identifier, p['workspace_path'], workspace.work.resolve(), r['merged_paths'], command,
                     r.get('conversation') or ''), 'apply the project migration')
+
+    async def share_merged(self, project, delivered, paths):
+        """Bring the files a delivery just merged into the snapshots of tasks running now.
+        A snapshot is otherwise refreshed only when an attempt starts, so a task that
+        started early (on a ready document) never saw files merged after it, rebuilt
+        them itself and met a conflict at its own delivery. Paths a task changed itself
+        are left alone and named in its notice."""
+        from app.agents.identity import member_name
+        async with self.reading() as c:
+            root = (await self._project(c, project))['workspace_path']
+            running = [r for r in await self._list(c, 'request', project)
+                       if r['state'] == 'running' and r['id'] != delivered['id'] and r.get('workspace_id')
+                       and r['workspace_id'] != delivered.get('workspace_id')]
+        for other in running:
+            result = await asyncio.to_thread(IsolatedWorkspace(root, other['workspace_id']).sync, paths)
+            if not result['pulled'] and not result['kept']:
+                continue
+            summary = f"{member_name(delivered['recipient'])} 的交付已合并进项目"
+            if result['pulled']:
+                summary += f"，{len(result['pulled'])} 个文件已同步到你的工作区"
+            if result['kept']:
+                summary += (f"；{len(result['kept'])} 个文件你也改过，保留了你的版本，项目里的版本放在 {MERGED_COPIES}/ 下同名路径："
+                            '交付时两者会冲突，请对照后改用项目版本、把你的修改合并进去，或删掉你的副本')
+            async with self.transaction() as c:
+                await self._event(c, project, other['recipient'], {
+                    'type': 'project_files_merged', 'target_request': other['id'], 'from_request': delivered['id'],
+                    'summary': summary, 'pulled': result['pulled'][:40], 'kept': result['kept'][:40]}, other['conversation'])
 
     async def _migrate_then_refresh(self, project, identifier, root, work, paths, command, conversation):
         from app.execution.processes import processes

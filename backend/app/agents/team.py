@@ -156,6 +156,9 @@ class Team:
         self.collaboration = None
         self._pending_leader_receipts = {}
         self._context_memories = {}
+        # The Leader's current model-facing messages per conversation, for inspection;
+        # the same list the running turn mutates, kept after the turn ends.
+        self.leader_contexts: dict[str, list[BaseMessage]] = {}
 
     async def configure_persistence(
         self, store: "ChatStore", checkpointer: "BaseCheckpointSaver"
@@ -170,6 +173,7 @@ class Team:
             agent.cache_input_tokens, agent.cached_tokens = cache.get(agent.spec.id, (0, 0))
         self._leader_checkpoints.clear()
         self._context_memories.clear()
+        self.leader_contexts.clear()
         for row in await store.load_leader_checkpoints():
             self._leader_checkpoints[row["conversation_id"]] = LeaderCheckpoint(
                 handoff=ContextCheckpoint.model_validate(row["handoff_json"]),
@@ -182,6 +186,7 @@ class Team:
         """Called only after all coordinator and scheduler tasks have stopped."""
         self._leader_checkpoints.clear()
         self._context_memories.clear()
+        self.leader_contexts.clear()
         self._pending_leader_receipts.clear()
         for agent in (self.leader, *self.workers.values()):
             agent.total_tokens = 0
@@ -276,7 +281,6 @@ class Team:
                             return
                         await self.collaboration.leader_session(project, session_id, state='running', last_wake=time.time(), retry_after=0, **({'failures': 0} if not wake_only else {}))
                         context = Context(self.collaboration, project, 'leader', session_id, f'leader:{session_id}')
-                        context.read_context = uuid4().hex
                         collaboration_token = active.set(context)
                 async for event in self._run(history, session_id):
                     yield event
@@ -330,7 +334,10 @@ class Team:
             previous = (saved_memory or {}).get('snapshot') if saved_memory and saved_memory['history_cutoff'] <= len(history) else None
             text, snapshot = coordination_update(await ctx.service.handoff(ctx.project, 'leader'), previous)
             messages.append(HumanMessage(content=text, additional_kwargs={'coordination_state': True}))
+        self.leader_contexts[conversation_id] = messages
+
         async def save_memory(current, reply=None):
+            self.leader_contexts[conversation_id] = current
             state = {'history_cutoff': len(history), 'messages': messages_to_dict(current[1:]), 'snapshot': snapshot}
             if reply is not None:
                 state['reply'] = reply
@@ -370,12 +377,14 @@ class Team:
             # The goal reminder is stored once per change (after compaction, which drops
             # reminders) instead of being appended to every call.
             current = with_goal_state(await prepare(current), await goal_messages())
+            self.leader_contexts[conversation_id] = current
             try:
                 response = await self.leader.next_message(current, allow_delegation=allow_delegation)
             except Exception as exc:
                 if not is_context_overflow(exc):
                     raise
                 current = with_goal_state(await prepare(current, force_clean=True), await goal_messages())
+                self.leader_contexts[conversation_id] = current
                 response = await self.leader.next_message(current, allow_delegation=allow_delegation)
             return current, response
 
@@ -398,9 +407,6 @@ class Team:
                 yield "status", {"id": "leader", "status": AgentStatus.FAILED}
                 raise
             messages.append(response)
-            if ctx:
-                await ctx.service.confirm_reads(ctx.project, ctx.pending_reads)
-                ctx.pending_reads.clear()
             if ctx and reminders:
                 event_ids = [i for r in reminders for i in r.get('event_ids', [r.get('event_id')])]
                 ctx.seen_events.update(event_ids)
@@ -492,11 +498,6 @@ class Team:
                     prepared = await memory.checkpoint([*messages, tool_result], reset_handoff.as_prompt())
                     messages = prepared.messages
                     await save_memory(messages)
-                    if active.get():
-                        # Tool bodies just left the model history; old read
-                        # receipts must not suppress reads in the new context.
-                        active.get().read_context = uuid4().hex
-                        active.get().pending_reads.clear()
                     yield "activity", {
                         "id": uuid4().hex,
                         "agent": "leader",

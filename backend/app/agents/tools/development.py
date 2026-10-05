@@ -8,6 +8,7 @@ from typing import Annotated, Literal
 from pydantic import Field
 
 from app.agents.tools.validation import tool, ToolFailure, failure_result, command_failure
+from app.agents.context_policy import RECOMPUTABLE
 from app.agents.tools._workspace import resolve_allowed, workspace_root
 from app.execution.processes import processes, port_open
 from app.execution.permissions import connection_texts, network_targets, argv_ports, scope, LOG_PORT_PATTERN
@@ -150,7 +151,7 @@ async def register_observed(job, ports):
     return registered
 
 
-@tool
+@tool(context_policy=RECOMPUTABLE)
 async def execute_command(command: str, arguments: list[str], cwd: str = '.',
                           timeout: Annotated[int | None, Field(ge=1, le=1800)] = None,
                           background: bool = False, name: str = 'command',
@@ -281,7 +282,7 @@ async def execute_command(command: str, arguments: list[str], cwd: str = '.',
     return compact_output(result, full)
 
 
-@tool
+@tool(context_policy=RECOMPUTABLE)
 async def manage_process(action: Literal['list', 'status', 'logs', 'stop'], process_id: str = '',
                          offset: Annotated[int, Field(ge=0)] = 0,
                          limit: Annotated[int, Field(ge=1, le=30000)] = 10000) -> dict:
@@ -342,7 +343,7 @@ HOST_NOTES = {
 }
 
 
-@tool
+@tool(context_policy=RECOMPUTABLE)
 async def detect_environment(cwd: str = '.') -> dict:
     """Manifests, package manager, scripts, virtual environment, sandbox, host command
     conventions (BSD/GNU) and project services with their live runtime state."""

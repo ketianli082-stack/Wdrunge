@@ -280,25 +280,38 @@ class EnvironmentMixin:
             except Exception as error:
                 note = f'迁移前没能备份数据库：{kinds.friendly(error)}。'
         tokens = active_workspace.set(root), source_workspace.set(root)
+        cause = ''
         try:
             problem = await processes.prepare_root(SimpleNamespace(argv=command['argv'], cwd=str(Path(work) / cwd)), root, cwd)
-            result = {'exit_code': None, 'output': problem} if problem else await processes.run(
-                command['argv'], cwd, 600, name='migrate', network=sandbox.capability().get('backend') != 'seatbelt',
-                reason='任务交付已合并：平台在项目根目录对项目数据库执行登记的迁移命令')
+            if problem:
+                cause, result = '迁移前准备项目根目录的运行环境失败', {'exit_code': None, 'output': problem}
+            else:
+                # A command a task already ran successfully was authorized there; replaying it
+                # is the platform's step, not a new choice by a model.
+                result = await processes.run(
+                    command['argv'], cwd, 600, name='migrate', network=sandbox.capability().get('backend') != 'seatbelt',
+                    reason='任务交付已合并：平台在项目根目录对项目数据库执行登记的迁移命令',
+                    platform='重放任务中已验证的登记迁移命令' if command.get('status') == 'verified' else None)
         except Exception as error:
-            result = {'exit_code': None, 'output': str(error)}
+            cause, result = f'{type(error).__name__}: {error}', {'exit_code': None, 'output': ''}
         finally:
             source_workspace.reset(tokens[1])
             active_workspace.reset(tokens[0])
         if result.get('exit_code') == 0 and not result.get('timed_out'):
             await self.register_command(project, 'platform', command['name'], command['argv'], cwd, command.get('purpose'), verified=True)
             return True
-        output = str(result.get('output') or '')[-1500:]
+        if not cause:
+            cause = '执行超时（600 秒）' if result.get('timed_out') else f"命令退出码 {result.get('exit_code')}"
+        output = str(result.get('output') or '').strip()[-1500:]
         async with self.transaction() as c:
             await self._event(c, project, 'leader', {
-                'type': 'migration_failed', 'request_id': request_id,
-                'summary': (f"任务 {request_id} 的交付已合并，但迁移命令 {' '.join(command['argv'])} 在项目根目录执行失败：\n{output}\n"
-                            f'{note}服务没有切换到新代码。请让后端修复迁移并重新交付。')}, conversation)
+                'type': 'migration_failed', 'request_id': request_id, 'cause': cause[:500],
+                'cwd': str(root / cwd), 'argv': command['argv'],
+                'summary': (f"任务 {request_id} 的交付已合并，但迁移命令 {' '.join(command['argv'])} "
+                            f"在 {root / cwd} 执行失败。原因：{cause[:500]}\n"
+                            + (f'输出末尾：\n{output}\n' if output else '（命令没有输出）\n')
+                            + f'{note}服务没有切换到新代码。先按上面的原因判断是代码问题还是环境/审批问题，'
+                            '只有代码问题才需要让后端修复迁移并重新交付。')}, conversation)
         return False
 
     async def report_service_failure(self, job, detail):

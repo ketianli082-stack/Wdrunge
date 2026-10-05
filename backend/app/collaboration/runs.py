@@ -5,6 +5,15 @@ from sqlalchemy import text
 from app.storage import StorageConflictError
 
 
+def activated(old):
+    """When the conversation's current run began: kept while it runs or is paused by a
+    restart, new after a stop or idle period. Only messages sent since then wake idle
+    members for a reply, never ones from before a stop."""
+    if old and old.get('state') in {'active', 'paused'} and old.get('activated'):
+        return old['activated']
+    return time.time()
+
+
 class ConversationRuns:
     async def conversation_stopped(self, project, conversation, generation=None):
         async with self.reading() as c:
@@ -20,7 +29,7 @@ class ConversationRuns:
             if message_id is not None:
                 await self.store.add_user_message_in_transaction(c, conversation, content, message_id)
             generation = uuid4().hex
-            await self._put(c, 'conversation_run', project, conversation, dict(state='active', generation=generation, pending=True))
+            await self._put(c, 'conversation_run', project, conversation, dict(state='active', generation=generation, pending=True, activated=activated(old)))
             return generation
 
     async def end_conversation_run(self, project, conversation, generation):
@@ -115,7 +124,8 @@ class ConversationRuns:
                 control = await self._get(c,'conversation_run',project,conversation,False)
                 if control and control['state'] in {'stopped','stopping'}:
                     continue
-                await self._put(c,'conversation_run',project,conversation,dict(state='paused',generation=uuid4().hex))
+                await self._put(c,'conversation_run',project,conversation,dict(state='paused',generation=uuid4().hex,
+                                                                               **({'activated': control['activated']} if control and control.get('activated') else {})))
                 session = await self._get(c,'leader_session',project,conversation,False)
                 if session:
                     session.update(state='idle',retry_after=0)
@@ -130,7 +140,7 @@ class ConversationRuns:
             control = await self._get(c,'conversation_run',project,conversation,False)
             if control and control['state'] in {'stopping','stopped'}:
                 raise StorageConflictError('已停止的任务不会重新启动；请发送新消息创建任务')
-            await self._put(c,'conversation_run',project,conversation,dict(state='active',generation=uuid4().hex))
+            await self._put(c,'conversation_run',project,conversation,dict(state='active',generation=uuid4().hex,activated=activated(control)))
             for kind in ('request','goal'):
                 for value in await self._list(c,kind,project):
                     if value.get('conversation') != conversation or not value.get('paused_on_restart'):

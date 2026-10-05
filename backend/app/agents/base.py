@@ -132,19 +132,20 @@ class Agent:
             parts.append((root / "skills" / skill).read_text(encoding="utf-8"))
         runs_commands = any(tool.name == 'execute_command' for tool in self.spec.tools)
         if runs_commands:
-            parts.append("开发工具：先用 detect_environment 确认环境，它也给出宿主命令约定（macOS 为 BSD 工具，不用 GNU 专有参数）。execute_command 使用 command（可执行文件名）+ arguments（字符串数组，无参数时 []）+ cwd，"
-                         "不要假设后端宿主 Python 就是目标项目环境。依赖安装同样使用 execute_command，Python 在项目 .venv、Node 在项目 node_modules 中安装，遵循锁文件。execute_command 的 background=true 启动服务并返回进程 ID，"
-                         "给出 ready_port 会等待该端口就绪，端口已被其他程序占用时立即报错；manage_process 可用进程 ID 或启动时的 name 读取日志、状态和停止，可同时管理前后端。"
-                         "监听端口和访问 localhost 需要网络权限：不传 network 时，后台服务和只访问 loopback 地址的命令会自动开启，访问其他主机时显式传 network=true。"
-                         "预期中的非零退出码（如确认端口已关闭的 curl 退出 7、无匹配的 lsof/grep 退出 1）放进 ok_exit_codes，不要当作失败。"
-                         "命令必须经审核并在系统沙箱中运行，人工授权弹窗出现时等待用户，不通过其他工具绕过。"
-                         "browse_directory/search_code 支持分页；项目外的配置用 read_external_file 请求指定文件授权。"
-                         "文件移动/删除用 manage_file；浏览器验证结果和截图才是页面证据。")
+            # Only what the tool descriptions do not already say.
+            parts.append("开发工具：先用 detect_environment 确认环境和宿主命令约定（macOS 为 BSD 工具，不用 GNU 专有参数）。"
+                         "不要把后端宿主 Python 当作项目环境；依赖用 execute_command 按锁文件装进项目 .venv 或 node_modules。"
+                         "访问本机以外的主机时传 network=true；预期的非零退出码（确认端口已关的 curl 退出 7、无匹配的 grep 退出 1）放进 ok_exit_codes。"
+                         "命令经审核并在沙箱中运行，出现人工授权时等待用户，不用其他工具绕过。项目外的配置用 read_external_file 请求授权，"
+                         "移动/删除文件用 manage_file；页面证据以浏览器验证结果和截图为准。")
         if collaborative:
             names = ['documents.md', 'leader.md' if self.spec.id == 'leader' else 'worker.md']
             if self.spec.id == 'leader' or runs_commands:
                 names.append('environment.md')
             parts += [(modules / name).read_text(encoding="utf-8") for name in names]
+        if runs_commands and self.spec.id != 'leader':
+            # Members who write and run code: reuse what exists, run each slice.
+            parts.append((modules / 'implementation.md').read_text(encoding="utf-8"))
         return "\n\n".join(parts)
 
     def model_name(self, purpose: str = "work", scale: str | None = None) -> str:

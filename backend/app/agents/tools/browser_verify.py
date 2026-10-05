@@ -9,6 +9,7 @@ from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 from app.agents.tools.validation import tool, failure_result
+from app.agents.context_policy import RECOMPUTABLE
 from app.agents.tools._workspace import resolve_allowed
 from app.execution.processes import processes
 
@@ -38,7 +39,7 @@ class BrowserCheck(BaseModel):
         return self
 
 
-@tool(args_schema=BrowserCheck)
+@tool(args_schema=BrowserCheck, context_policy=RECOMPUTABLE)
 async def browser_verify(url: str, actions: list[BrowserAction] = [], allowed_origins: list[str] = [],
                          expect_errors: bool = False) -> dict:
     """Open a page, perform ordered selector actions, inspect text/console/page and HTTP

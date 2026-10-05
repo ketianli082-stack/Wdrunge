@@ -49,6 +49,14 @@ def make_write_project_file(allowed_roots: tuple[str, ...]):
         if ctx and bool(Path(path).parts) and Path(path).parts[0].lower() == 'docs' and target.suffix.lower() == '.md':
             raise ValueError('Shared Markdown must use collaboration_publish (legacy: collaborate publish) with changes=[{path,base_version:0,summary,content}] for new documents; existing documents require document_id, base_version and edits.')
         length, revision = update_file(target, content, edits, expected_hash)
-        return f"Wrote {path} ({length} characters; sha256={revision})."
+        receipt = f"Wrote {path} ({length} characters; sha256={revision})."
+        # The written text folds out of the context later; its declarations (names,
+        # signatures, selectors, with line numbers) stay in the receipt and the ledger.
+        from app.agents.context_fold import structure
+        try:
+            outline = structure(path, target.read_text(encoding='utf-8'))
+        except (OSError, UnicodeDecodeError):
+            outline = ''
+        return receipt + (f"\nStructure: {outline}" if outline else '')
 
     return write_project_file

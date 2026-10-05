@@ -57,7 +57,26 @@ def verification_python(directory):
         'after_environment_change')
 
 
-def installation_commands(directory, runtime):
+def base_python(directory, preferred=None):
+    """The interpreter to create a project .venv from: the one the task used (`preferred`),
+    the version `.python-version` pins, else python3 on PATH. Never the platform's own
+    virtual environment, which would tie the project to Wdrunge's Python."""
+    import shutil
+    from app.execution.sandbox import host_path
+    if preferred and Path(preferred).is_file():
+        return str(preferred)
+    path = host_path()
+    pinned = directory / '.python-version'
+    if pinned.is_file():
+        version = pinned.read_text().strip().split('\n')[0]
+        minor = '.'.join(version.split('.')[:2])
+        if found := shutil.which(f'python{minor}', path=path):
+            return found
+    return shutil.which('python3', path=path) or getattr(sys, '_base_executable', sys.executable)
+
+
+def installation_commands(directory, runtime, python=None):
+    """`python`: the interpreter to build a new .venv from (see base_python)."""
     entries = inspect_environment(directory)['runtimes']
     item = next((entry for entry in entries if entry['type'] == runtime), None)
     if not item:
@@ -76,6 +95,6 @@ def installation_commands(directory, runtime):
     commands = []
     python = project_python(directory)
     if not python.exists():
-        commands.append([sys.executable, '-m', 'venv', str(directory / '.venv')])
+        commands.append([base_python(directory, python), '-m', 'venv', str(directory / '.venv')])
     commands.append([str(python), '-m', 'pip', 'install', *(['-r', 'requirements.txt'] if (directory / 'requirements.txt').exists() else ['-e', '.'])])
     return commands

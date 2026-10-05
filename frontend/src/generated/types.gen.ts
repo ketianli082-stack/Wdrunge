@@ -5,6 +5,128 @@ export type ClientOptions = {
 };
 
 /**
+ * AgentContextListResponse
+ */
+export type AgentContextListResponse = {
+    /**
+     * Contexts
+     */
+    contexts: Array<AgentContextSummary>;
+};
+
+/**
+ * AgentContextMessage
+ */
+export type AgentContextMessage = {
+    /**
+     * Id
+     */
+    id?: string | null;
+    /**
+     * Type
+     */
+    type: string;
+    /**
+     * Content
+     */
+    content: string;
+    /**
+     * Reasoning
+     */
+    reasoning?: string | null;
+    /**
+     * Tool Calls
+     */
+    tool_calls?: Array<AgentContextToolCall>;
+    /**
+     * Tool Call Id
+     */
+    tool_call_id?: string | null;
+    /**
+     * Name
+     */
+    name?: string | null;
+    /**
+     * Status
+     */
+    status?: string | null;
+};
+
+/**
+ * AgentContextResponse
+ */
+export type AgentContextResponse = {
+    /**
+     * Key
+     */
+    key: string;
+    /**
+     * Agent
+     */
+    agent: string;
+    /**
+     * Revision
+     */
+    revision: string;
+    /**
+     * Unchanged
+     */
+    unchanged?: boolean;
+    /**
+     * Messages
+     */
+    messages?: Array<AgentContextMessage>;
+};
+
+/**
+ * AgentContextSummary
+ */
+export type AgentContextSummary = {
+    /**
+     * Key
+     */
+    key: string;
+    /**
+     * Agent
+     */
+    agent: string;
+    /**
+     * Label
+     */
+    label: string;
+    /**
+     * Running
+     */
+    running: boolean;
+    /**
+     * Updated
+     */
+    updated?: number | null;
+};
+
+/**
+ * AgentContextToolCall
+ */
+export type AgentContextToolCall = {
+    /**
+     * Id
+     */
+    id?: string | null;
+    /**
+     * Name
+     */
+    name: string;
+    /**
+     * Arguments
+     */
+    arguments: string;
+    /**
+     * Invalid
+     */
+    invalid?: boolean;
+};
+
+/**
  * AgentUsageResponse
  */
 export type AgentUsageResponse = {
@@ -1736,6 +1858,75 @@ export type ConversationUsageApiConversationsConversationIdUsageGetResponses = {
 };
 
 export type ConversationUsageApiConversationsConversationIdUsageGetResponse = ConversationUsageApiConversationsConversationIdUsageGetResponses[keyof ConversationUsageApiConversationsConversationIdUsageGetResponses];
+
+export type AgentContextsApiConversationsConversationIdAgentContextsGetData = {
+    body?: never;
+    path: {
+        /**
+         * Conversation Id
+         */
+        conversation_id: string;
+    };
+    query?: never;
+    url: '/api/conversations/{conversation_id}/agent-contexts';
+};
+
+export type AgentContextsApiConversationsConversationIdAgentContextsGetErrors = {
+    /**
+     * Validation Error
+     */
+    422: HttpValidationError;
+};
+
+export type AgentContextsApiConversationsConversationIdAgentContextsGetError = AgentContextsApiConversationsConversationIdAgentContextsGetErrors[keyof AgentContextsApiConversationsConversationIdAgentContextsGetErrors];
+
+export type AgentContextsApiConversationsConversationIdAgentContextsGetResponses = {
+    /**
+     * Successful Response
+     */
+    200: AgentContextListResponse;
+};
+
+export type AgentContextsApiConversationsConversationIdAgentContextsGetResponse = AgentContextsApiConversationsConversationIdAgentContextsGetResponses[keyof AgentContextsApiConversationsConversationIdAgentContextsGetResponses];
+
+export type AgentContextApiConversationsConversationIdAgentContextGetData = {
+    body?: never;
+    path: {
+        /**
+         * Conversation Id
+         */
+        conversation_id: string;
+    };
+    query: {
+        /**
+         * Key
+         */
+        key: string;
+        /**
+         * Revision
+         */
+        revision?: string | null;
+    };
+    url: '/api/conversations/{conversation_id}/agent-context';
+};
+
+export type AgentContextApiConversationsConversationIdAgentContextGetErrors = {
+    /**
+     * Validation Error
+     */
+    422: HttpValidationError;
+};
+
+export type AgentContextApiConversationsConversationIdAgentContextGetError = AgentContextApiConversationsConversationIdAgentContextGetErrors[keyof AgentContextApiConversationsConversationIdAgentContextGetErrors];
+
+export type AgentContextApiConversationsConversationIdAgentContextGetResponses = {
+    /**
+     * Successful Response
+     */
+    200: AgentContextResponse;
+};
+
+export type AgentContextApiConversationsConversationIdAgentContextGetResponse = AgentContextApiConversationsConversationIdAgentContextGetResponses[keyof AgentContextApiConversationsConversationIdAgentContextGetResponses];
 
 export type ResetRecordsApiDebugRecordsResetPostData = {
     body: ResetRecordsRequest;

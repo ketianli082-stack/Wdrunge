@@ -515,6 +515,7 @@ def test_worker_can_finish_beyond_default_graph_recursion_limit(monkeypatch):
     from langchain_core.runnables import RunnableLambda
     from app.agents.limits import graph_recursion_limit
     monkeypatch.delenv('WDRUNGE_GRAPH_RECURSION_LIMIT', raising=False)
+    monkeypatch.setenv('WDRUNGE_READ_STREAK', '100')  # 30 clock reads would pause reads at 24
     assert graph_recursion_limit() == 1000
     calls = []
     async def respond(messages):

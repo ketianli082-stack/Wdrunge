@@ -7,6 +7,7 @@ from langgraph.checkpoint.memory import InMemorySaver
 
 from app.agents.base import Agent, AgentSpec
 from app.agents.memory import ContextMemory, ContextBudgetError, message_tokens, reminder
+from app.agents.context_fold import is_ledger
 from app.agents.team import Team
 from app.agents.worker import WorkerAgent
 from app.storage import ChatStore
@@ -27,7 +28,7 @@ class Summarizer:
 
 
 def tools(content, i=0):
-    return [AIMessage(content='', id=f'call-message-{i}', tool_calls=[{'name': 'future_unknown_tool', 'args': {}, 'id': f'call-{i}'}]),
+    return [AIMessage(content='', id=f'call-message-{i}', tool_calls=[{'name': 'read_project_file', 'args': {'path': f'f{i}.txt'}, 'id': f'call-{i}'}]),
             ToolMessage(content=content, tool_call_id=f'call-{i}', id=f'result-{i}')]
 
 
@@ -38,7 +39,7 @@ def test_old_results_fold_without_model_calls_or_broken_pairs():
                    *[AIMessage(content=f'recent {i}') for i in range(9)]]
         result = await ContextMemory(member, 'scope').prepare(history)
         assert result.stage == 'fold'
-        assert len(result.messages) == len(history)
+        assert len(result.messages) == len(history) + 1 and is_ledger(result.messages[4])  # the ledger joins
         assert result.messages[2].tool_calls[0]['id'] == result.messages[3].tool_call_id
         assert len(result.messages[3].content) <= 600
         assert history[3].content == 'x' * 15000
@@ -84,9 +85,9 @@ def test_oversized_active_turn_rolls_into_clean_context_and_chunks_inputs():
         history = [SystemMessage(content='system'), HumanMessage(content='巨大的当前任务' * 4000), *tools('x' * 12000)]
         result = await ContextMemory(member, 'scope').prepare(history)
         assert result.stage == 'clean'
-        assert len(result.messages) == 2
+        assert len(result.messages) == 2 + is_ledger(result.messages[1])
         assert not any(isinstance(m, ToolMessage) for m in result.messages)
-        assert 'Pending: tests' in result.messages[1].content
+        assert 'Pending: tests' in result.messages[-1].content
         assert message_tokens(result.messages) < 3000
         assert len(model.inputs) > 1
         assert all(message_tokens(call) < member.context_window() * .8 for call in model.inputs)
@@ -277,16 +278,17 @@ def test_cache_hits_persist_and_old_databases_gain_the_column(tmp_path):
 
 
 def test_old_tool_bodies_fold_in_batches_under_budget(monkeypatch):
-    monkeypatch.setenv('WDRUNGE_FOLD_TRIGGER_TOKENS', '3000')
     monkeypatch.setenv('WDRUNGE_FOLD_VERBATIM_TOKENS', '5000')
     class Member:
         spec = SimpleNamespace(id='backend')
         def context_window(self):
             return 131072
     def round_trip(i, size):
-        call = AIMessage(content='', id=f'a{i}', tool_calls=[{'id': f'c{i}', 'name': 'write_project_file',
-                                                              'args': {'path': f'f{i}.py', 'content': 'x' * size}}])
-        return [call, ToolMessage('y' * size, tool_call_id=f'c{i}', id=f't{i}')]
+        call = AIMessage(content='', id=f'a{i}', tool_calls=[
+            {'id': f'c{i}', 'name': 'write_project_file', 'args': {'path': f'f{i}.py', 'content': 'x' * size}},
+            {'id': f'r{i}', 'name': 'read_project_file', 'args': {'path': f'g{i}.py'}}])
+        return [call, ToolMessage(f'Wrote f{i}.py', tool_call_id=f'c{i}', id=f'w{i}'),
+                ToolMessage('y' * size, tool_call_id=f'r{i}', id=f't{i}')]
     async def run():
         memory = ContextMemory(Member(), 'fold-scope')
         small = [SystemMessage(content='sys'), HumanMessage(content='task', id='h'), *round_trip(0, 1500),
@@ -296,8 +298,8 @@ def test_old_tool_bodies_fold_in_batches_under_budget(monkeypatch):
                    *[m for i in range(4) for m in round_trip(i, 4000)], *round_trip(9, 4000)]
         prepared = await memory.prepare(history)
         assert prepared.changed and prepared.stage == 'fold'
-        folded, recent = prepared.messages[2], prepared.messages[-2:]
+        folded, recent = prepared.messages[2], prepared.messages[-3:]
         assert len(folded.tool_calls[0]['args']['content']) < 400 and folded.tool_calls[0]['args']['path'] == 'f0.py'
-        assert len(prepared.messages[3].content) <= 600
-        assert recent[0].tool_calls[0]['args']['content'] == 'x' * 4000 and recent[1].content == 'y' * 4000
+        assert len(prepared.messages[4].content) <= 1200 and 'recall_context' in prepared.messages[4].content
+        assert recent[0].tool_calls[0]['args']['content'] == 'x' * 4000 and recent[2].content == 'y' * 4000
     asyncio.run(run())

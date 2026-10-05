@@ -1,6 +1,7 @@
 """List files visible to one specialist."""
 
 from app.agents.tools.validation import tool
+from app.agents.context_policy import RECOMPUTABLE
 
 from app.agents.tools._workspace import effective_roots, workspace_root
 from app.agents.tools.file_management import walk_files, visible
@@ -8,7 +9,7 @@ from itertools import islice
 
 
 def make_list_project_files(allowed_roots: tuple[str, ...]):
-    @tool("list_project_files")
+    @tool("list_project_files", context_policy=RECOMPUTABLE)
     def list_project_files() -> str:
         """List up to 150 files in your assigned project areas."""
         files: list[str] = []

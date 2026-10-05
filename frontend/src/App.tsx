@@ -25,6 +25,7 @@ import {
   type TeamUsage,
 } from "./api";
 import { applyConversationEvent } from "./conversationEvents";
+import AgentContextPanel from "./AgentContextPanel";
 import CollaborationPanel from "./CollaborationPanel";
 import DeliveryPanel from "./DeliveryPanel";
 import { DeliveryPreview, useDeliveryFiles } from "./DeliveryFiles";
@@ -49,7 +50,7 @@ type ConversationView = Omit<ConversationDetail, "messages" | "activities"> & {
   messages: VisibleMessage[];
   activities: VisibleActivity[];
 };
-type Panel = "chat" | "activity" | "collaboration";
+type Panel = "chat" | "activity" | "collaboration" | "context";
 
 const initialAgents: TeamMember[] = [
   { id: "leader", name: memberName("leader"), status: "idle", tools: [], skills: [] },
@@ -479,8 +480,9 @@ function Workspace({ onRecordsCleared }: { onRecordsCleared: () => void }) {
         <button role="tab" aria-selected={panel === "chat"} className={panel === "chat" ? "active" : ""} onClick={() => setPanel("chat")}>团队群聊</button>
         <button role="tab" aria-selected={panel === "activity"} className={panel === "activity" ? "active" : ""} onClick={() => setPanel("activity")}>工作日志 <span>{active?.activities.length || 0}</span></button>
         <button role="tab" aria-selected={panel === "collaboration"} className={panel === "collaboration" ? "active" : ""} onClick={() => setPanel("collaboration")}>交付文档</button>
+        <button role="tab" aria-selected={panel === "context"} className={panel === "context" ? "active" : ""} onClick={() => setPanel("context")}>Agent 上下文</button>
       </div>
-      {panel === "collaboration" && activeProject ? <DeliveryPanel key={activeProject.id} files={deliveryFiles} selected={openFile?.path || null} onOpen={showFile} /> : !active ? <section className="chat-panel empty-conversation"><div className="chat-welcome"><span className="welcome-icon">W</span><strong>{activeProject ? activeProject.name : "开始使用 Wdrunge"}</strong><p>{activeProject ? "在此项目中创建一段对话。" : "先创建一个项目，团队会围绕项目工作区持续协作。"}</p><button onClick={() => activeProject ? void startConversation(activeProject.id) : setProjectDialog(true)}>{activeProject ? "新建对话" : "新建项目"}</button></div></section> : panel === "chat" ? <section className="chat-panel" role="tabpanel" aria-label="团队群聊">
+      {panel === "collaboration" && activeProject ? <DeliveryPanel key={activeProject.id} files={deliveryFiles} selected={openFile?.path || null} onOpen={showFile} /> : !active ? <section className="chat-panel empty-conversation"><div className="chat-welcome"><span className="welcome-icon">W</span><strong>{activeProject ? activeProject.name : "开始使用 Wdrunge"}</strong><p>{activeProject ? "在此项目中创建一段对话。" : "先创建一个项目，团队会围绕项目工作区持续协作。"}</p><button onClick={() => activeProject ? void startConversation(activeProject.id) : setProjectDialog(true)}>{activeProject ? "新建对话" : "新建项目"}</button></div></section> : panel === "context" ? <AgentContextPanel key={active.id} conversation={active.id} /> : panel === "chat" ? <section className="chat-panel" role="tabpanel" aria-label="团队群聊">
         <header className="panel-heading"><div><strong>{active.project_name} · {active.title}</strong><span>{Object.values(teamIdentities).map((member) => member.name).join(" · ")}</span></div><div className="chat-heading-actions"><button aria-expanded={showCollaboration} onClick={() => setShowCollaboration(value => !value)}>{showCollaboration ? "返回群聊" : "任务与协作"}</button><span className="member-count">6 人</span></div></header>
         {showCollaboration ? <CollaborationPanel key={active.id} project={active.project_id} conversation={active.id} onOpen={showFile} /> : <>
         <div className="workspace-banner"><span title={active.workspace_path}>项目工作区 · {active.workspace_path}</span></div>

@@ -1,4 +1,4 @@
-import type { ConversationUsageResponse, TeamMemberResponse, TeamStatusResponse, TeamUsageResponse } from "./generated";
+import type { AgentContextListResponse, AgentContextResponse, ConversationUsageResponse, TeamMemberResponse, TeamStatusResponse, TeamUsageResponse } from "./generated";
 
 export type TeamMember = TeamMemberResponse;
 export type TeamUsage = TeamUsageResponse;
@@ -101,6 +101,18 @@ export type SessionUsage = ConversationUsageResponse;
 
 export function getConversationUsage(id: string, signal?: AbortSignal): Promise<SessionUsage> {
   return requestJson<SessionUsage>(`/api/conversations/${encodeURIComponent(id)}/usage`, { signal });
+}
+
+export type { AgentContextMessage, AgentContextSummary, AgentContextToolCall } from "./generated";
+
+export function listAgentContexts(id: string, signal?: AbortSignal): Promise<AgentContextListResponse> {
+  return requestJson<AgentContextListResponse>(`/api/conversations/${encodeURIComponent(id)}/agent-contexts`, { signal });
+}
+
+/** With the last revision, an unchanged context returns no messages. */
+export function getAgentContext(id: string, key: string, revision?: string, signal?: AbortSignal): Promise<AgentContextResponse> {
+  const query = new URLSearchParams({ key, ...(revision ? { revision } : {}) });
+  return requestJson<AgentContextResponse>(`/api/conversations/${encodeURIComponent(id)}/agent-context?${query}`, { signal });
 }
 
 export async function getTeamStatus(signal?: AbortSignal): Promise<TeamStatusResponse> {

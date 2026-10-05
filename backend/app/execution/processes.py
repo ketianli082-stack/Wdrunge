@@ -17,6 +17,30 @@ from app.agents.tools.validation import command_failure
 from app.execution.ports import port_open
 
 logger = logging.getLogger(__name__)
+
+
+def brings_own_python(executable: str, directory: Path) -> bool:
+    """An absolute Python interpreter outside `directory/.venv` (a venv in the data
+    directory, a system Python): the command does not use a project .venv."""
+    path = Path(executable)
+    return (path.is_absolute() and path.name.startswith('python') and path.exists()
+            and not path.resolve().is_relative_to((directory / '.venv').resolve()))
+
+
+def snapshot_python(venv: Path) -> str | None:
+    """The interpreter a task built its own .venv from (pyvenv.cfg), so the project root
+    gets the same Python version rather than whatever runs the platform."""
+    try:
+        config = dict(line.split('=', 1) for line in (venv / 'pyvenv.cfg').read_text().splitlines() if '=' in line)
+    except OSError:
+        return None
+    config = {key.strip(): value.strip() for key, value in config.items()}
+    candidates = [config.get('executable')]
+    if home := config.get('home'):
+        version = config.get('version_info') or config.get('version') or ''
+        minor = '.'.join(version.split('.')[:2])
+        candidates += [str(Path(home) / f'python{minor}') if minor else None, str(Path(home) / 'python3')]
+    return next((item for item in candidates if item and Path(item).is_file()), None)
 # Dependent tasks wait at most this long for a kept service to move to the project root
 # (its restart is reviewed and may wait for the user).
 MOVE_WAIT = 120
@@ -148,7 +172,8 @@ class Processes:
         self.failure_handler = None
 
     async def start(self, argv, cwd='.', timeout=120, name='command', network=False,
-                    reason='', *, extra_reads=(), write_paths=None, browser=False, keep=False, before_spawn=None):
+                    reason='', *, extra_reads=(), write_paths=None, browser=False, keep=False, before_spawn=None,
+                    platform=None):
         if not argv or len(argv) > 200 or any(not isinstance(arg, str) or '\0' in arg or len(arg) > 16000 for arg in argv):
             raise ValueError('Use an executable plus at most 199 string arguments, without NUL bytes')
         if keep:
@@ -182,7 +207,7 @@ class Processes:
             # For the reviewer only (not part of the approval key): what the platform provides.
             operation['resources'] = {'connected_services': list(provided.names), 'service_ports': list(provided.ports),
                                       'data_dir': str(provided.data_dir) if provided.data_dir else None}
-        await permissions().authorize(operation)
+        await permissions().authorize(operation, platform=platform)
         # Re-resolve after HITL: symlinks may have changed while the dialog was open.
         if resolve_allowed(cwd, ('.',)) != directory:
             raise ValueError('工作目录在审核期间发生变化，请重新执行')
@@ -381,7 +406,7 @@ class Processes:
                 return None
             reason = (f'{job.reason}；' if job.reason else '') + '任务已交付，同一命令改从项目根目录运行'
             new = await self.start(job.argv, cwd, name=job.name, network=job.network, reason=reason, keep=True,
-                                   before_spawn=release)
+                                   before_spawn=release, platform='重启已授权运行的保留服务：同一命令改从项目根目录运行')
         except BaseException:
             job.relaunch = 'failed'
             raise
@@ -424,6 +449,8 @@ class Processes:
         for runtime, folder in (('python', '.venv'), ('node', 'node_modules')):
             if runtime not in runtimes:
                 continue
+            if runtime == 'python' and brings_own_python(job.argv[0], directory):
+                continue  # an absolute interpreter elsewhere never loads this directory's .venv
             target = directory / folder
             had_own = (snapshot / folder).is_dir() and not (snapshot / folder).is_symlink() and snapshot != directory
             manifest_changed = any(Path(path).name in manifests[runtime] and (Path(path).parent.as_posix() or '.') == cwd
@@ -431,14 +458,19 @@ class Processes:
             if not (manifest_changed or (not target.exists() and (had_own or missing))):
                 continue
             try:
-                commands = installation_commands(directory, runtime)
+                commands = installation_commands(directory, runtime, python=snapshot_python(snapshot / folder))
             except ValueError as error:
                 return f'无法在项目根目录安装依赖：{error}'
             for argv in commands:
-                result = await self.run(argv, cwd, 900, name=f'install {runtime} dependencies', network=True,
-                                        reason='任务已交付；依赖目录不随交付合并，平台在项目根目录按清单安装依赖后再重启服务')
+                try:
+                    result = await self.run(argv, cwd, 900, name=f'install {runtime} dependencies', network=True,
+                                            reason='任务已交付；依赖目录不随交付合并，平台在项目根目录按清单安装依赖后再重启服务',
+                                            platform='平台按项目清单在项目根目录安装依赖')
+                except (OSError, PermissionError, RuntimeError) as error:
+                    return f"在项目根目录安装依赖失败（{' '.join(argv[:4])}，目录 {cwd}）：{type(error).__name__}: {error}"
                 if result.get('exit_code') != 0 or result.get('timed_out'):
-                    return (f"在项目根目录安装依赖失败（{' '.join(argv[:4])}）：\n"
+                    cause = '超时' if result.get('timed_out') else f"退出码 {result.get('exit_code')}"
+                    return (f"在项目根目录安装依赖失败（{' '.join(argv[:4])}，目录 {cwd}，{cause}）：\n"
                             + str(result.get('output', ''))[-1200:])
         if sandbox.resolve_executable(job.argv[0], directory) is None:
             return (f'项目根目录下找不到启动命令 {job.argv[0]}；它可能只存在于任务快照里'
@@ -453,7 +485,8 @@ class Processes:
         tokens = active_workspace.set(workspace), source_workspace.set(Path(job.scope))
         try:
             old = await self.start(job.argv, cwd, name=job.name, network=job.network, keep=True,
-                                   reason='从项目根目录重启失败，恢复交付前的运行副本')
+                                   reason='从项目根目录重启失败，恢复交付前的运行副本',
+                                   platform='恢复已授权运行的保留服务的交付前副本')
         except Exception:
             logger.warning('Could not restore service %s', job.service or job.name, exc_info=True)
             return None

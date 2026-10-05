@@ -4,12 +4,13 @@ from app.execution.environment import verification_python
 from typing import Literal
 
 from app.agents.tools.validation import tool, failure_result, command_failure
+from app.agents.context_policy import RECOMPUTABLE
 
 from app.agents.tools._workspace import resolve_allowed
 from app.agents.tools._process import run_process
 
 
-@tool
+@tool(context_policy=RECOMPUTABLE)
 async def run_project_check(check: Literal["backend_tests", "frontend_build"]) -> dict:
     """Run backend pytest or the frontend TypeScript/Vite build and return its result."""
     if check == "backend_tests":

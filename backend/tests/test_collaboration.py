@@ -152,12 +152,7 @@ def test_section_subscriptions_diff_search_and_read_confirmation(tmp_path):
         assert not await s.inbox(p, 'designer', 'ctx')
         assert '+newer' in (await s.section_diff(p, doc, 1, 3, api))['diff']
         assert (await s.search(p, 'newer'))['matches'][0]['section_id'] == api
-        result, key = await s.read_cached(p, 'frontend', 'ctx', document_id=doc, section_id=api)
-        assert result['content'] == 'newer\n'
-        assert not (await s.read_cached(p, 'frontend', 'ctx', document_id=doc, section_id=api))[0].get('already_in_context')
-        await s.confirm_reads(p, [key])
-        assert (await s.read_cached(p, 'frontend', 'ctx', document_id=doc, section_id=api))[0]['already_in_context']
-        assert 'content' in (await s.read_cached(p, 'frontend', 'fresh', document_id=doc, section_id=api))[0]
+        assert (await s.read(p, document_id=doc, section_id=api))['content'] == 'newer\n'
         await store.close()
     run(scenario())
 
@@ -360,6 +355,61 @@ def test_missing_delivery_does_not_publish_partial_edits(tmp_path):
         assert not (workspace/'partial.txt').exists()
         await store.close()
     run(scenario())
+
+
+def test_rejected_delivery_merges_nothing_and_a_corrected_one_merges_everything(tmp_path):
+    async def scenario():
+        store, s, p, workspace = await setup(tmp_path)
+        r = await s.create_request(p, 'leader', 'backend', 'Build API', 'api')
+        job = (await s.claim())[2]
+        w = await s.prepare_workspace(p, r['id'])
+        (w.work/'app.py').write_text('v1\n')
+        (w.work/'.task-scratch').mkdir()
+        (w.work/'.task-scratch'/'probe.py').write_text('print(1)\n')
+        # A listed path that is never merged is rejected before anything reaches the project.
+        with pytest.raises(ValueError, match='never merged'):
+            await s.publish_artifacts(p, r['id'], job['instance_id'], delivered=['app.py', '.task-scratch/probe.py'])
+        with pytest.raises(ValueError, match='task workspace'):
+            await s.publish_artifacts(p, r['id'], job['instance_id'], delivered=['app.py', 'tools/check.py'])
+        assert not (workspace/'app.py').exists()
+        # A transition rejected after the merge (here: no summary) does not end merging:
+        # later snapshot edits, including to merged files, merge on the next delivery.
+        await s.publish_artifacts(p, r['id'], job['instance_id'], delivered=['app.py'])
+        with pytest.raises(ValueError, match='summary'):
+            await s.transition(p, r['id'], 'backend', 'review', '', artifacts=['app.py'])
+        (w.work/'app.py').write_text('v2\n')
+        (w.work/'tools').mkdir()
+        (w.work/'tools'/'check.py').write_text('ok\n')
+        await s.publish_artifacts(p, r['id'], job['instance_id'], delivered=['app.py', 'tools/check.py'])
+        assert (workspace/'app.py').read_text() == 'v2\n'
+        assert (workspace/'tools'/'check.py').read_text() == 'ok\n'
+        assert sorted((await s.get_request(p, r['id']))['merged_paths']) == ['app.py', 'tools/check.py']
+        await s.transition(p, r['id'], 'backend', 'review', 'API delivered', artifacts=['app.py', 'tools/check.py'])
+        # Nothing changed since: delivering again is a no-op.
+        await s.publish_artifacts(p, r['id'], job['instance_id'])
+        assert (await s.get_request(p, r['id']))['state'] == 'review'
+        await store.close()
+    run(scenario())
+
+
+def test_rebased_snapshot_merges_later_edits_beside_concurrent_ones(tmp_path):
+    from app.collaboration.workspaces import IsolatedWorkspace
+    root = tmp_path/'source'
+    root.mkdir()
+    (root/'code.txt').write_text('one\ntwo\nthree\n')
+    w = IsolatedWorkspace(root, 'abc123')
+    w.prepare()
+    (w.work/'code.txt').write_text('ONE\ntwo\nthree\n')
+    (root/'code.txt').write_text('one\ntwo\nTHREE\n')  # a colleague's merge
+    changes = w.plan()
+    w.publish(changes)
+    w.rebase(changes)
+    # The snapshot now holds the merged text; the next plan carries only the new edit.
+    assert (w.work/'code.txt').read_text() == 'ONE\ntwo\nTHREE\n'
+    assert w.plan() == []
+    (w.work/'code.txt').write_text('ONE\nTWO\nTHREE\n')
+    w.publish(w.plan())
+    assert (root/'code.txt').read_text() == 'ONE\nTWO\nTHREE\n'
 
 
 def test_directory_artifact_needs_a_file_inside(tmp_path):

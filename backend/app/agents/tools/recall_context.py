@@ -7,6 +7,7 @@ from langchain_core.runnables import RunnableConfig
 from pydantic import Field
 
 from app.agents.tools.validation import tool, ToolFailure
+from app.agents.context_policy import RECOMPUTABLE
 
 
 async def recall(store, scope: str, message_id: str, offset: int = 0, limit: int = 12000) -> str:
@@ -27,7 +28,7 @@ async def recall(store, scope: str, message_id: str, offset: int = 0, limit: int
 
 
 def make_recall_context(store_getter):
-    @tool
+    @tool(context_policy=RECOMPUTABLE)
     async def recall_context(message_id: Annotated[str, Field(min_length=1, max_length=120)],
                              config: RunnableConfig,
                              offset: Annotated[int, Field(ge=0)] = 0,

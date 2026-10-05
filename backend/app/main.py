@@ -179,6 +179,71 @@ async def conversation_usage(conversation_id: str):
     return {**usage, 'approvals': approvals, 'tool_calls': await store.conversation_tool_counts(conversation_id)}
 
 
+class AgentContextSummary(BaseModel):
+    key: str
+    agent: str
+    label: str
+    running: bool
+    updated: float | None = None
+
+
+class AgentContextListResponse(BaseModel):
+    contexts: list[AgentContextSummary]
+
+
+class AgentContextToolCall(BaseModel):
+    id: str | None = None
+    name: str
+    arguments: str
+    invalid: bool = False
+
+
+class AgentContextMessage(BaseModel):
+    id: str | None = None
+    type: str
+    content: str
+    reasoning: str | None = None
+    tool_calls: list[AgentContextToolCall] = Field(default_factory=list)
+    tool_call_id: str | None = None
+    name: str | None = None
+    status: str | None = None
+
+
+class AgentContextResponse(BaseModel):
+    key: str
+    agent: str
+    revision: str
+    # True when the caller's revision is current; messages are then omitted.
+    unchanged: bool = False
+    messages: list[AgentContextMessage] = Field(default_factory=list)
+
+
+async def _agent_contexts(conversation_id):
+    from app.agents.context_view import list_contexts
+    service, project = await execution_context(conversation_id)
+    return await list_contexts(get_team(), service, project, conversation_id)
+
+
+@app.get('/api/conversations/{conversation_id}/agent-contexts', response_model=AgentContextListResponse, tags=['Conversations'])
+async def agent_contexts(conversation_id: str):
+    """The Leader, direct and task contexts of a session's agents."""
+    return {'contexts': await _agent_contexts(conversation_id)}
+
+
+@app.get('/api/conversations/{conversation_id}/agent-context', response_model=AgentContextResponse, tags=['Conversations'])
+async def agent_context(conversation_id: str, key: str = Query(..., min_length=1), revision: str | None = None):
+    """The model-facing messages of one context, as its next model call would see them."""
+    from app.agents.context_view import context_messages, message_entry, revision_of
+    context = next((item for item in await _agent_contexts(conversation_id) if item['key'] == key), None)
+    if context is None:
+        raise HTTPException(404, 'Agent context not found')
+    entries = [message_entry(message) for message in await context_messages(get_team(), context, conversation_id)]
+    current = revision_of(entries)
+    if current == revision:
+        return {'key': key, 'agent': context['agent'], 'revision': current, 'unchanged': True}
+    return {'key': key, 'agent': context['agent'], 'revision': current, 'messages': entries}
+
+
 @app.post('/api/debug/records/reset', response_model=ResetRecordsResponse, tags=['Debug'])
 async def reset_records(body: ResetRecordsRequest):
     """Stop local work and clear all app records, preserving project workspaces."""

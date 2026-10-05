@@ -42,11 +42,13 @@ def retry_attempts() -> int:
 
 
 def annotate(response, started, retries):
-    """Latency and retry count travel with the response into usage records."""
+    """Latency and retry count travel with the response into usage records; the wall
+    time of the request lets context memory tell whether the provider cache is cold."""
     metadata = getattr(response, 'response_metadata', None)
     if isinstance(metadata, dict):
         metadata['wdrunge_latency_ms'] = round((time.monotonic() - started) * 1000)
         metadata['wdrunge_retries'] = retries
+        metadata['wdrunge_requested_at'] = round(time.time() - (time.monotonic() - started), 3)
     return response
 
 
