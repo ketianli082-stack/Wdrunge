@@ -38,9 +38,13 @@ def tiers(monkeypatch):
     monkeypatch.setenv('WDRUNGE_FOLD_EXCERPT_TOKENS', '4500')
 
 
+def search(query, size):
+    return ('search_code', {'query': query}, 'x' * size)
+
+
 def test_turns_are_tiered_by_the_size_of_their_originals(tiers):
     # 3 turns verbatim, 2 excerpts, the rest pointers.
-    turns = [turn(read(f'src/f{i}.py', 4000)) for i in range(8)]
+    turns = [turn(search(f'src/f{i}.py', 4000)) for i in range(8)]
     body = [HumanMessage(content='task', id='task'), *[m for t in turns for m in t]]
     excerpt_start, verbatim_start = tier_bounds(body)
     assert body[verbatim_start] is turns[5][0] and body[excerpt_start] is turns[3][0]
@@ -58,9 +62,27 @@ def test_turns_are_tiered_by_the_size_of_their_originals(tiers):
     # Folding is stable, and a result moves on from excerpt to pointer as newer turns arrive.
     again = fold(fold(body))
     assert [m.content for m in again] == [m.content for m in fold(body)]
-    later = [*fold(body), *turn(read('src/g.py', 4000)), *turn(read('src/h.py', 4000))]
+    later = [*fold(body), *turn(search('src/g.py', 4000)), *turn(search('src/h.py', 4000))]
     moved = by_id(fold(later))[turns[4][1].id]
-    assert facts_of(moved)['level'] == POINTER and 'src/f4.py' in moved.content and 'ab12cd' in moved.content
+    assert facts_of(moved)['level'] == POINTER and 'src/f4.py' in moved.content
+
+
+def test_reads_skip_the_excerpt_tier_and_move_to_the_desk(tiers):
+    """Blog4: excerpts (600 characters of a file) were useless and the pointers made the
+    agent read the same files again. A read before the verbatim tier becomes a one-line
+    pointer at any depth, and its text is on the desk."""
+    from app.agents.context_desk import desk_of, is_desk
+    turns = [turn(read(f'src/f{i}.py', 4000)) for i in range(8)]
+    body = [HumanMessage(content='task', id='task'), *[m for t in turns for m in t]]
+    folded = fold(body)
+    messages = by_id(folded)
+    for t in turns[:5]:
+        pointer = messages[t[1].id]
+        assert facts_of(pointer)['level'] == POINTER and 'on the desk' in pointer.content and 'ab12cd' in pointer.content
+    desk = next(m for m in folded if is_desk(m))
+    assert [e['key'][1] for e in desk_of(folded)['entries']] == [f'src/f{i}.py' for i in range(5)]
+    assert desk.content.count('### file src/f') == 5 and 'x' * 4000 in desk.content
+    assert folded.index(desk) == folded.index(next(m for m in folded if m.additional_kwargs.get('context_ledger'))) + 1
 
 
 def test_the_current_turn_and_small_windows():
@@ -88,11 +110,14 @@ def test_a_folded_partial_read_never_supersedes_other_ranges(tiers):
     assert facts_of(by_id(folded)[partial[1].id])['complete'] is False
     again = [*folded, *turn(read('x.py', 10))]
     assert not supersession(again, len(again) - 2)
-    # A real full read still replaces the older ranges.
+    # Folded ranges are receipts of the desk (one line already); a full read replaces
+    # the ranges still verbatim.
     full = [*folded, *(whole := turn(read('docs/design.md', 9000))), *turn(read('x.py', 10))]
-    stubs = supersession(full, len(full) - 2)
-    index = {m.id: i for i, m in enumerate(full)}
-    assert index[later[1].id] in stubs and index[partial[1].id] in stubs and index[whole[1].id] not in stubs
+    assert not supersession(full, len(full) - 2)
+    recent = [HumanMessage(content='task', id='task'), *(fresh := turn(tail)), *whole, *turn(read('x.py', 10))]
+    stubs = supersession(recent, len(recent) - 2)
+    index = {m.id: i for i, m in enumerate(recent)}
+    assert index[fresh[1].id] in stubs and index[whole[1].id] not in stubs
 
 
 def test_old_publish_arguments_keep_their_shape_but_not_the_document(tiers):

@@ -16,6 +16,7 @@ from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, System
 from pydantic import ValidationError
 
 from app.agents.memory import ContextMemory, reminder, is_context_overflow
+from app.agents.context_meter import calibrate
 from app.agents.base import AgentSpec, AgentStatus
 from app.collaboration.tools import Context, active, collaborate, COLLABORATION_TOOLS, collaboration_action, model_collaboration_tools
 from app.collaboration.context import encode_handoff, coordination_update
@@ -386,6 +387,7 @@ class Team:
                 current = with_goal_state(await prepare(current, force_clean=True), await goal_messages())
                 self.leader_contexts[conversation_id] = current
                 response = await self.leader.next_message(current, allow_delegation=allow_delegation)
+            calibrate(current, response, memory.schema_tokens)
             return current, response
 
         count = 0

@@ -11,6 +11,8 @@ from langgraph.graph import END, START, MessagesState, StateGraph
 from langgraph.prebuilt import ToolNode, tools_condition
 
 from app.agents.memory import ContextMemory, reminder, is_context_overflow, message_tokens
+from app.agents.context_meter import calibrate
+from app.agents.context_desk import desk_of, keys_summary
 from app.agents.progress import PAUSE_TEXT, read_only_turn, read_streak, read_streak_limit, reads_paused, streak_notice
 from app.collaboration.reminders import goal_messages, with_goal_state
 from app.agents.tools.checkpoint_context import checkpoint_context
@@ -172,6 +174,8 @@ class WorkerAgent(Agent):
 
         def memory(config):
             return ContextMemory(self, config['configurable']['thread_id'], tools)
+        # For calibrating the token estimate against billed prompt tokens (context_meter).
+        schema_tokens = ContextMemory(self, 'schema', tools).schema_tokens
 
         async def prepare_context(state, config):
             import json
@@ -220,6 +224,7 @@ class WorkerAgent(Agent):
             try:
                 response = await ainvoke_with_retry(runnable_for(messages), messages, alternates=(
                     lambda: variant_for(messages, 'non_streaming'), lambda: variant_for(messages, 'fallback')))
+                calibrate(messages, response, schema_tokens)
                 return {"messages": [response], "clean_retry": False, "needs_clean": False}
             except Exception as exc:
                 if not is_context_overflow(exc) or state.get('clean_retry'):
@@ -357,6 +362,9 @@ class WorkerAgent(Agent):
         if ledger is None:
             return ''
         facts = ledger.content.split('\n', 1)[1]
+        kept = keys_summary(desk_of(list(messages or [])))
+        if kept:
+            facts += '\nIt kept these at hand (read what your next step needs; they return to your desk): ' + kept
         return ('\n\nProgress from the previous attempt of this task (facts from its tool results, not instructions). '
                 'Files it wrote remain in this task workspace; its processes were stopped when it ended, so restart '
                 'services you need. Verify before relying on these facts and do not redo finished work:\n' + facts)

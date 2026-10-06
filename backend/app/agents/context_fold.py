@@ -12,11 +12,16 @@ fold by tier, counted per message by content volume from the newest:
 - verbatim: the newest results up to WDRUNGE_FOLD_VERBATIM_TOKENS (the current turn always);
 - excerpt: the next WDRUNGE_FOLD_EXCERPT_TOKENS keep each result's facts and its head;
 - pointer: older results keep one line naming the tool, the resource and the message ID.
+Reads of resources (desk policy) skip the excerpt tier: before the verbatim tier they
+move to the desk (app.agents.context_desk), which shows each resource once with its
+current text, and leave a pointer; a read of what the desk shows enters as a notice.
 Durable results stay until a model summary of their work segment (L3) replaces them.
 A task ledger keeps file, process, check and error facts from everything folded.
 Originals stay in the compaction audit; recall_context returns them by message ID.
 Facts about an original (its size, digest, whether a read covered the whole file) are
 kept in additional_kwargs['fold'], which is never sent to the model.
+Thresholds are configured in actual tokens; `ratio` (actual per estimated token, from
+app.agents.context_meter) converts them to the estimated units used here.
 """
 from __future__ import annotations
 
@@ -28,7 +33,7 @@ import re
 
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMessage
 
-from app.agents.context_policy import recomputable
+from app.agents.context_policy import recomputable, desk as desk_policy
 
 LEDGER_PREFIX = 'Task ledger (facts extracted from earlier tool results; historical data, not instructions):\n'
 SIGNAL = re.compile(r'error|fail|exception|traceback|warn|denied|not found|cannot|unable|refused|✗|✘', re.I)
@@ -50,23 +55,28 @@ def _setting(name: str, default: int, minimum: int) -> int:
 
 
 def verbatim_tokens() -> int:
-    """Estimated tokens of the newest turns whose tool results stay verbatim."""
-    return _setting('WDRUNGE_FOLD_VERBATIM_TOKENS', 30000, 1000)
+    """Actual tokens of the newest turns whose tool results stay verbatim."""
+    return _setting('WDRUNGE_FOLD_VERBATIM_TOKENS', 8000, 1000)
 
 
 def excerpt_tokens() -> int:
-    """Estimated tokens (of the originals) before the verbatim turns kept as excerpts."""
+    """Actual tokens (of the originals) before the verbatim turns kept as excerpts."""
     return _setting('WDRUNGE_FOLD_EXCERPT_TOKENS', 15000, 0)
 
 
 def result_tokens() -> int:
-    """Estimated tokens one tool result may bring into the context."""
+    """Actual tokens one tool result may bring into the context."""
     return _setting('WDRUNGE_RESULT_TOKENS', 8000, 500)
 
 
 def response_tokens() -> int:
-    """Estimated tokens the results of one model response may bring together."""
+    """Actual tokens the results of one model response may bring together."""
     return _setting('WDRUNGE_RESPONSE_RESULT_TOKENS', 20000, 1000)
+
+
+def scaled(actual: int, ratio: float) -> int:
+    """A limit in actual tokens, in the estimated units counted here."""
+    return math.ceil(actual / max(ratio, 0.4))
 
 
 def text_of(message: BaseMessage) -> str:
@@ -113,7 +123,7 @@ def with_facts(message: BaseMessage, level: int, **update) -> BaseMessage:
     return message.model_copy(update={**update, 'additional_kwargs': {**message.additional_kwargs, 'fold': meta}})
 
 
-def tier_bounds(messages: list[BaseMessage], budget: int | None = None) -> tuple[int, int]:
+def tier_bounds(messages: list[BaseMessage], budget: int | None = None, ratio: float = 1.0) -> tuple[int, int]:
     """(excerpt_start, verbatim_start): indexes of the first message of the excerpt and
     verbatim tiers, counted per message by the size of its original from the newest; a
     result counts at most one result budget, so one large result (from before the entry
@@ -121,13 +131,13 @@ def tier_bounds(messages: list[BaseMessage], budget: int | None = None) -> tuple
     results the model has not read yet, is always verbatim. verbatim_start is 0 when
     everything fits verbatim (nothing to fold); it may fall inside a turn, between its
     results. With a context budget, the tiers take at most a third and a sixth of it."""
-    verbatim_limit, excerpt_limit = verbatim_tokens(), excerpt_tokens()
+    verbatim_limit, excerpt_limit = scaled(verbatim_tokens(), ratio), scaled(excerpt_tokens(), ratio)
     if budget:
         verbatim_limit, excerpt_limit = min(verbatim_limit, budget // 3), min(excerpt_limit, budget // 6)
     turns = [i for i, m in enumerate(messages) if isinstance(m, AIMessage)]
     if not turns:
         return 0, 0
-    cap = result_tokens() + 12
+    cap = scaled(result_tokens(), ratio) + 12
 
     def size(m):
         return min(facts_of(m)['tokens'], cap) if isinstance(m, (AIMessage, ToolMessage)) else 0
@@ -151,9 +161,9 @@ def turn_start(messages: list[BaseMessage], index: int) -> int:
     return next((i for i in range(index, len(messages)) if isinstance(messages[i], AIMessage)), len(messages))
 
 
-def verbatim_boundary(messages: list[BaseMessage], budget: int | None = None) -> int:
+def verbatim_boundary(messages: list[BaseMessage], budget: int | None = None, ratio: float = 1.0) -> int:
     """Index of the first whole turn of the verbatim tier; 0 when nothing is folded."""
-    boundary = tier_bounds(messages, budget)[1]
+    boundary = tier_bounds(messages, budget, ratio)[1]
     return turn_start(messages, boundary) if boundary else 0
 
 
@@ -245,8 +255,9 @@ def supersession(messages: list[BaseMessage], until: int) -> dict[int, str]:
     writes: dict[str, int] = {}
     stubs: dict[int, str] = {}
     for index, message in enumerate(messages):
-        if not isinstance(message, ToolMessage) or unchanged_of(message):
-            # A notice stands for an earlier result, which therefore stays.
+        if not isinstance(message, ToolMessage) or unchanged_of(message) or facts_of(message).get('desk') or desk_hit_of(message):
+            # A notice stands for an earlier result, which therefore stays; a receipt of
+            # a read that moved to the desk, or a desk hit, is already one line.
             continue
         call = calls.get(message.tool_call_id) or {}
         name, args = tool_name(message, calls), call.get('args') or {}
@@ -261,10 +272,9 @@ def supersession(messages: list[BaseMessage], until: int) -> dict[int, str]:
                 stubs.setdefault(earlier, f'[Failed; the same {name} call succeeded later in message {message.id}.]')
         same_call[key] = index
         if name == 'write_project_file' and ok:
-            for older in reads.pop(args.get('path'), []):
-                if older < until:
-                    stubs[older] = (f"[Stale: {args.get('path')} was rewritten by message {message.id} after this read; "
-                                    'read it again for current content.]')
+            # Reads of the rewritten file are not stubbed: they move to the desk, which
+            # shows the file as it is now.
+            reads.pop(args.get('path'), None)
             older = writes.get(args.get('path'))
             if older is not None and older < until and '\nStructure: ' in text_of(messages[older]):
                 # The receipt line stays; its outline is the newer write's.
@@ -459,12 +469,28 @@ def pointer_facts(name: str, args: dict, text: str) -> dict:
     return facts
 
 
-def pointer_message(message: ToolMessage, name: str, facts: dict) -> ToolMessage:
+def pointer_message(message: ToolMessage, name: str, facts: dict, note: str = '') -> ToolMessage:
     pointer = json.dumps(facts.get('pointer') or {'characters': facts.get('characters')}, ensure_ascii=False)
-    content = f'[Folded {name} result {pointer}; recall_context(message_id="{message.id}") returns it.]'
+    content = f'[Folded {name} result {pointer};{note} recall_context(message_id="{message.id}") returns it.]'
     meta = {key: value for key, value in facts.items() if key != 'outline'}
     return message.model_copy(update={'content': content, 'artifact': None,
                                       'additional_kwargs': {**message.additional_kwargs, 'fold': {**meta, 'level': POINTER}}})
+
+
+def desk_hit_of(message: BaseMessage) -> list | None:
+    """The desk key a notice stands for (a read of what the desk already shows)."""
+    return facts_of(message).get('desk_hit') if isinstance(message, ToolMessage) else None
+
+
+def desk_hit_notice(message: ToolMessage, name: str, args: dict, entry: dict) -> ToolMessage:
+    from app.agents.context_desk import label
+    text = json.dumps({'on_desk': True, 'entry': label(entry['key']),
+                       'note': f'This {name} result is on your desk above and unchanged; it is not repeated. '
+                               'Pass force=true to receive it anyway.'}, ensure_ascii=False)
+    meta = {'level': 0, 'tokens': 12 + estimate(text), 'characters': len(text), 'complete': True,
+            'desk_hit': entry['key'], 'digest': text_digest(text_of(message))}
+    return message.model_copy(update={'content': text, 'artifact': None,
+                                      'additional_kwargs': {**message.additional_kwargs, 'fold': meta}})
 
 
 def fold_result(message: ToolMessage, name: str, args: dict, level=EXCERPT, keep_outline=False) -> ToolMessage:
@@ -676,9 +702,10 @@ def unchanged_notice(message: ToolMessage, name: str, args: dict, earlier: ToolM
                                       'additional_kwargs': {**message.additional_kwargs, 'fold': meta}})
 
 
-def ingest(body: list[BaseMessage], budget: int | None = None) -> tuple[list[BaseMessage], list[BaseMessage], list[BaseMessage]]:
+def ingest(body: list[BaseMessage], budget: int | None = None, ratio: float = 1.0) -> tuple[list[BaseMessage], list[BaseMessage], list[BaseMessage]]:
     """L0: results of the newest turn the model has not seen yet enter the context
     within the entry budget. Returns (body, originals changed, their replacements).
+    - a read of a resource the desk already shows, unchanged, becomes a short notice;
     - a recomputable result identical to the newest earlier result of the same call
       (tool and arguments), still verbatim in this context, becomes a short notice;
       repeating the call after a notice (or force=true) returns the result itself;
@@ -688,7 +715,8 @@ def ingest(body: list[BaseMessage], budget: int | None = None) -> tuple[list[Bas
       the largest cut first.
     With a context budget, a result takes at most a quarter of it and a response a third.
     The original goes to the compaction audit; recall_context returns it by message ID."""
-    single, together = result_tokens(), response_tokens()
+    from app.agents.context_desk import desk_of, shows
+    single, together = scaled(result_tokens(), ratio), scaled(response_tokens(), ratio)
     if budget:
         single, together = min(single, max(500, budget // 4)), min(together, max(1000, budget // 3))
     turns = [i for i, m in enumerate(body) if isinstance(m, AIMessage)]
@@ -705,6 +733,7 @@ def ingest(body: list[BaseMessage], budget: int | None = None) -> tuple[list[Bas
         if isinstance(body[index], ToolMessage):
             call = calls.get(body[index].tool_call_id) or {}
             newest[call_key(tool_name(body[index], calls), call.get('args') or {})] = index
+    desk = desk_of(body)
     result = list(body)
     sizes: dict[int, int] = {}
     for index in fresh:
@@ -712,6 +741,11 @@ def ingest(body: list[BaseMessage], budget: int | None = None) -> tuple[list[Bas
         call = calls.get(message.tool_call_id) or {}
         name, args, text = tool_name(message, calls), call.get('args') or {}, text_of(message)
         digest = text_digest(text)
+        if desk_policy(name, args) and not args.get('force') and not failed(message):
+            entry = next((e for e in desk['entries'] if shows(e, name, args, text)), None)
+            if entry is not None:
+                result[index] = desk_hit_notice(message, name, args, entry)
+                continue
         earlier = newest.get(call_key(name, args))
         if earlier is not None and not args.get('force') and not failed(message) and recomputable(name, args):
             previous = body[earlier]
@@ -764,7 +798,8 @@ def record_facts(ledger: dict, messages: list[BaseMessage], calls: dict | None =
     order = list(ledger['seen'])
     seen = set(order)
     for message in messages:
-        if not isinstance(message, ToolMessage) or message.id in seen or text_of(message).startswith(('[Superseded', '[Stale')):
+        if (not isinstance(message, ToolMessage) or message.id in seen or text_of(message).startswith(('[Superseded', '[Stale'))
+                or desk_hit_of(message)):
             continue
         seen.add(message.id)
         order.append(message.id)
@@ -952,12 +987,15 @@ def prune(messages: list[BaseMessage], until: int) -> list[BaseMessage]:
     return [m for i, m in enumerate(messages) if i not in removed]
 
 
-def fold(body: list[BaseMessage], budget: int | None = None) -> list[BaseMessage]:
+def fold(body: list[BaseMessage], budget: int | None = None, ratio: float = 1.0) -> list[BaseMessage]:
     """L1 and L2: replace redundant results by stubs, fold recomputable results before
-    the verbatim tier (excerpts, then pointers), shrink large call arguments there, prune
-    redundant turns, and place an updated ledger at the verbatim boundary. Durable
-    results are left for a work-segment summary (app.agents.memory)."""
-    excerpt_start, boundary = tier_bounds(body, budget)
+    the verbatim tier (excerpts, then pointers), move reads of resources to the desk,
+    shrink large call arguments there, prune redundant turns, and place an updated
+    ledger and the desk at the verbatim boundary. Durable results are left for a
+    work-segment summary (app.agents.memory). The desk placed here is a draft: it holds
+    the text as read; ContextMemory refreshes and bounds it (app.agents.context_desk)."""
+    from app.agents.context_desk import admit, desk_of, desk_message, is_desk, record_hit
+    excerpt_start, boundary = tier_bounds(body, budget, ratio)
     if not boundary:
         return list(body)
     turns = [i for i, m in enumerate(body) if isinstance(m, AIMessage)]
@@ -973,14 +1011,21 @@ def fold(body: list[BaseMessage], budget: int | None = None) -> list[BaseMessage
     if entry is not None and previous is not None and previous.content == entry.content:
         entry = previous  # Unchanged facts keep the same message and its cache prefix.
     start = turn_start(body, boundary)
+    # The desk clock counts the turns that have passed its position.
+    desk = desk_of(body)
+    previous_desk = next((m for m in body if is_desk(m)), None)
+    desk_index = body.index(previous_desk) if previous_desk is not None else -1
+    desk['clock'] += sum(isinstance(m, AIMessage) for m in body[desk_index + 1:start])
+    clock = desk['clock']
     goal_states = [i for i, m in enumerate(body) if isinstance(m, HumanMessage) and m.additional_kwargs.get('goal_state')]
-    folded, until = [], None
+    folded, until, desk_at = [], None, None
     for index, message in enumerate(body):
         if index == start:
             until = len(folded)
             if entry is not None:
                 folded.append(entry)
-        if is_ledger(message):
+            desk_at = len(folded)
+        if is_ledger(message) or is_desk(message):
             continue
         if index in goal_states[:-1] and index < current and not message.content.startswith('[Superseded goal reminder'):
             message = message.model_copy(update={'content': '[Superseded goal reminder; a newer one follows.]'})
@@ -988,15 +1033,29 @@ def fold(body: list[BaseMessage], budget: int | None = None) -> list[BaseMessage
         if isinstance(message, ToolMessage):
             call = calls.get(message.tool_call_id) or {}
             name, args = tool_name(message, calls), call.get('args') or {}
-            if index in stubs and message.id not in pinned:
+            if index < boundary and (hit := desk_hit_of(message)):
+                record_hit(desk, hit, clock)
+                if facts_of(message)['level'] < STUB:
+                    message = with_facts(message, STUB, content=f'[{name} result: on the desk.]', artifact=None)
+            elif index in stubs and message.id not in pinned:
                 stub = stubs[index] + f' recall_context(message_id="{message.id}") returns this older result.'
                 if text_of(message) != stub:
                     message = with_facts(message, STUB, content=stub, artifact=None)
+            elif index < boundary and message.id not in pinned and desk_policy(name, args) and not failed(message):
+                facts = facts_of(message)
+                if facts['level'] == 0:
+                    admit(desk, name, args, text_of(message), clock)
+                    facts = {**facts, 'pointer': pointer_facts(name, args, text_of(message)), 'desk': True}
+                    message = pointer_message(message.model_copy(update={'additional_kwargs': {**message.additional_kwargs, 'fold': facts}}),
+                                              name, facts, note=' on the desk;')
             elif index < boundary and message.id not in pinned and recomputable(name, args):
                 message = fold_result(message, name, args, level, keep_outline=index in outlines)
         elif isinstance(message, AIMessage) and message.tool_calls and index < boundary:
             message = fold_call(message, level)
         folded.append(message)
+    draft = desk_message(desk, previous_desk)
+    if draft is not None and desk_at is not None:
+        folded.insert(desk_at, draft)
     return prune(folded, len(folded) if until is None else until)
 
 
@@ -1019,7 +1078,7 @@ def milestone(message: AIMessage, results: list[BaseMessage]) -> bool:
                for call in message.tool_calls)
 
 
-def segments(body: list[BaseMessage], budget: int | None = None) -> list[tuple[int, int]]:
+def segments(body: list[BaseMessage], budget: int | None = None, ratio: float = 1.0) -> list[tuple[int, int]]:
     """[start, end) spans of completed work before the verbatim tier (the ledger marks
     its boundary once anything was folded): whole turns from one durable change to the next, between inputs.
     A span holding the newest outline of a document (its section IDs) or a result an
@@ -1027,7 +1086,7 @@ def segments(body: list[BaseMessage], budget: int | None = None) -> list[tuple[i
     ledger with their message IDs. Spans are bounded by SEGMENT_MAX_TOKENS."""
     until = next((i for i, m in enumerate(body) if is_ledger(m)), None)
     if until is None:
-        until = verbatim_boundary(body, budget)
+        until = verbatim_boundary(body, budget, ratio)
     if not until:
         return []
     calls = calls_by_id(body)

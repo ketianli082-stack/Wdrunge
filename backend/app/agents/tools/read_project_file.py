@@ -1,7 +1,7 @@
 """Read a UTF-8 project file within a role's scope."""
 
 from app.agents.tools.validation import tool
-from app.agents.context_policy import RECOMPUTABLE
+from app.agents.context_policy import DESK
 
 from app.agents.tools._workspace import resolve_allowed, published_documents, published_hint
 from app.agents.tools._file_edits import file_hash
@@ -10,7 +10,7 @@ from pydantic import Field
 
 
 def make_read_project_file(allowed_roots: tuple[str, ...]):
-    @tool("read_project_file", context_policy=RECOMPUTABLE)
+    @tool("read_project_file", context_policy=DESK)
     def read_project_file(path: str, offset: Annotated[int, Field(ge=0)] = 0, limit: Annotated[int, Field(ge=1, le=30000)] = 30000, include_hash: bool = False) -> str:
         """Read UTF-8 text at a relative path. offset/limit page through characters.
         include_hash=true includes the full-file SHA-256 for write_project_file's

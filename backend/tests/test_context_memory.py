@@ -8,6 +8,7 @@ from langgraph.checkpoint.memory import InMemorySaver
 from app.agents.base import Agent, AgentSpec
 from app.agents.memory import ContextMemory, ContextBudgetError, message_tokens, reminder
 from app.agents.context_fold import is_ledger
+from app.agents.context_desk import is_desk
 from app.agents.team import Team
 from app.agents.worker import WorkerAgent
 from app.storage import ChatStore
@@ -39,7 +40,8 @@ def test_old_results_fold_without_model_calls_or_broken_pairs():
                    *[AIMessage(content=f'recent {i}') for i in range(9)]]
         result = await ContextMemory(member, 'scope').prepare(history)
         assert result.stage == 'fold'
-        assert len(result.messages) == len(history) + 1 and is_ledger(result.messages[4])  # the ledger joins
+        # The ledger and the desk join at the verbatim boundary.
+        assert len(result.messages) == len(history) + 2 and is_ledger(result.messages[4]) and is_desk(result.messages[5])
         assert result.messages[2].tool_calls[0]['id'] == result.messages[3].tool_call_id
         assert len(result.messages[3].content) <= 600
         assert history[3].content == 'x' * 15000
@@ -296,7 +298,12 @@ def test_old_tool_bodies_fold_in_batches_under_budget(monkeypatch):
         assert not (await memory.prepare(small)).changed
         history = [SystemMessage(content='sys'), HumanMessage(content='task', id='h'),
                    *[m for i in range(4) for m in round_trip(i, 4000)], *round_trip(9, 4000)]
-        prepared = await memory.prepare(history)
+        # The reads move to the desk (no saving by themselves); the written bodies fold
+        # once waiting has cost as much as the rewrite (rent-or-buy).
+        for _ in range(12):
+            prepared = await memory.prepare(history)
+            if prepared.changed:
+                break
         assert prepared.changed and prepared.stage == 'fold'
         folded, recent = prepared.messages[2], prepared.messages[-3:]
         assert len(folded.tool_calls[0]['args']['content']) < 400 and folded.tool_calls[0]['args']['path'] == 'f0.py'

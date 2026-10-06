@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from typing import Literal
 
 from app.agents.tools.validation import tool, validation_failure, exception_result, failure_result, EXAMPLE_CALLS
-from app.agents.context_policy import DURABLE, RECOMPUTABLE
+from app.agents.context_policy import DESK, DURABLE, RECOMPUTABLE
 from app.agents.progress import READ_ACTIONS
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
@@ -400,7 +400,7 @@ def _action_tool(action):
 
     invoke.__doc__ = ACTION_DESCRIPTIONS[action]
     # Reads and inspections can be repeated; everything else records state or a decision.
-    policy = RECOMPUTABLE if action in READ_ACTIONS or action == 'get_goal' else DURABLE
+    policy = DESK if action == 'read' else RECOMPUTABLE if action in READ_ACTIONS or action == 'get_goal' else DURABLE
     return tool(action if action in GOAL_ACTIONS else f'collaboration_{action}', args_schema=schema,
                 context_policy=policy)(invoke)
 

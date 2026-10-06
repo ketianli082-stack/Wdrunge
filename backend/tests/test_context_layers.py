@@ -90,7 +90,9 @@ def test_superseded_results_become_stubs_but_the_current_turn_stays():
     stubs = supersession(body, len(body) - 2)
     index = {m.id: i for i, m in enumerate(body)}
     assert 'newer full read of app.py' in stubs[index[first[1].id]] and index[partial[1].id] in stubs
-    assert 'rewritten by message' in stubs[index[full[1].id]]
+    # A read of a file the agent then rewrote is not stubbed as stale (it moves to the
+    # desk, which shows the file as it is now); only a newer read of it supersedes it.
+    assert 'newer read_project_file result' in stubs[index[full[1].id]] and 'rewritten' not in stubs[index[full[1].id]]
     assert 'the same execute_command call succeeded later' in stubs[index[probe_fail[1].id]]
     assert index[probe_ok[1].id] not in stubs and index[reread[1].id] not in stubs
     # The newest result can never be stubbed by an even newer one in the same turn.
@@ -116,8 +118,10 @@ def test_digests_keep_the_facts_agents_act_on():
     browser = json.loads(kept(folded[page[1].id].content))
     assert browser['passed'] is False and browser['screenshot'] == 'docs/testing/browser-1.png'
     assert browser['actions'] == [{'action': 'assert_text', 'selector': '.state', 'passed': True}] and browser['code'] == 'page_errors'
-    file = json.loads(kept(folded[source[1].id].content))
-    assert file['path'] == 'frontend/app.js' and file['sha256'] == 'deadbeef' and file['lines'] == 1501
+    # A read leaves a pointer naming the file and its hash; its text is on the desk.
+    pointer = folded[source[1].id].content
+    assert pointer.startswith('[Folded read_project_file result') and 'frontend/app.js' in pointer and 'deadbeef' in pointer
+    assert 'on the desk' in pointer and len(pointer) < 400
     # Tools that declare no context policy are durable: never cut mechanically.
     assert folded[unknown[1].id].content == unknown[1].content and folded[text[1].id].content == text[1].content
 
@@ -169,7 +173,7 @@ def test_fold_waits_for_a_large_batch_and_records_only_changed_messages(tmp_path
         small = [SystemMessage(content='sys'), HumanMessage(content='task', id='task'),
                  *turn(read('a.py', 'a' * 4000)), *turn(('future_tool', {}, 'd' * 24000)), *turn(), *turn(), *turn()]
         assert not (await memory.prepare(small)).changed
-        big = [*small, *[m for i in range(6) for m in turn(read(f'f{i}.py', 'b' * 8000))], *turn(), *turn(), *turn()]
+        big = [*small, *[m for i in range(6) for m in turn(('search_code', {'query': f'f{i}'}, 'b' * 8000))], *turn(), *turn(), *turn()]
         # Each call that keeps the foldable bodies pays for them; once that has cost as much as
         # the rewrite would (rent-or-buy), the whole batch folds in one rewrite.
         for calls in range(1, 10):
@@ -283,8 +287,11 @@ def test_the_newest_outline_of_each_document_keeps_every_section_id_when_folded(
     outline_kept = json.loads(kept(folded[publish[1].id].content))
     assert [s["id"] for s in outline_kept["revisions"][0]["outline"]] == [s['id'] for s in outline]
     assert outline_kept["revisions"][0]["budget"] == 15000
-    # The older outline of the same document is folded to the usual short form.
-    assert len(json.loads(kept(folded[older[1].id].content))['outline']) == 20
+    # The older outline read moves to the desk, which lists every section ID.
+    from app.agents.context_desk import is_desk
+    assert 'on the desk' in folded[older[1].id].content
+    desk = next(m for m in fold(body) if is_desk(m))
+    assert '- s29 Section 29' in desk.content and 'outline' in desk.content
 
 
 def test_folded_writes_and_reads_keep_the_file_structure():
@@ -297,5 +304,7 @@ def test_folded_writes_and_reads_keep_the_file_structure():
     assert folded_call_failure(call['args'])['error_details']['code'] == 'folded_placeholder'
     body = [HumanMessage(content='task', id='task'), *(page := turn(read('backend/app.py', '[sha256=ab12; characters=9]\n' + source))),
             *filler()]
-    digest = json.loads(kept(by_id(fold(body))[page[1].id].content))
-    assert 'L9 def create_app():' in digest['structure']
+    folded = fold(body)
+    assert 'on the desk' in by_id(folded)[page[1].id].content
+    # The whole read's declarations are in the ledger's code index, with line numbers.
+    assert 'L9 def create_app():' in next(m for m in folded if is_ledger(m)).content
