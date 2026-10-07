@@ -46,7 +46,7 @@ def test_ports_are_allocated_free_and_never_reserved_or_shared(tmp_path, monkeyp
         store, s, p, _ = await setup(tmp_path)
         environment.note_platform_port(8100)
         monkeypatch.setenv('WDRUNGE_RESERVED_PORTS', '8101')
-        api = await s.register_service(p, 'backend', 'api', command=['python3', 'app.py'], cwd='backend')
+        api = await s.register_service(p, 'backend', 'api', argv=['python3', 'app.py'], cwd='backend')
         assert api['port'] not in {8100, 8101} and api['claimed'] and api['url'] == f"http://127.0.0.1:{api['port']}"
         # Re-registering keeps the port; another service gets a different one.
         assert (await s.register_service(p, 'backend', 'api'))['port'] == api['port']
@@ -99,7 +99,7 @@ def test_every_agent_handoff_carries_the_environment(tmp_path):
     async def run():
         store, s, p, _ = await setup(tmp_path)
         environment.note_platform_port(17420)
-        await s.register_service(p, 'backend', 'api', port=free_port(), command=['python3', 'app.py'])
+        await s.register_service(p, 'backend', 'api', port=free_port(), argv=['python3', 'app.py'])
         await s.register_command(p, 'testing', 'test', ['pytest', '-q'], cwd='backend')
         handoff = await s.handoff(p, 'frontend')
         brief = handoff['environment']
@@ -119,7 +119,7 @@ def test_agents_use_registry_tools_and_users_set_trusted_entries(tmp_path):
         store, s, p, _ = await setup(tmp_path)
         token = active.set(Context(s, p, 'backend', '', 'ctx'))
         try:
-            created = await execute_collaboration('register_service', {'name': 'api', 'command': ['python3', 'app.py']})
+            created = await execute_collaboration('register_service', {'name': 'api', 'argv': ['python3', 'app.py']})
             assert created['claimed'] and created['owner'] == 'backend'
             invalid = await execute_collaboration('register_service', {'name': 'API Server'})
             assert 'error' in invalid
@@ -165,14 +165,14 @@ def test_started_services_are_verified_in_the_registry(tmp_path, real_processes)
         port = registered['port']
         tokens = active.set(Context(s, p, 'frontend', '', 'ctx')), active_workspace.set(workspace), source_workspace.set(workspace)
         try:
-            started = await development.execute_command.ainvoke({'command': sys.executable, 'background': True, 'name': 'web-dev',
-                'cwd': 'web', 'arguments': ['-m', 'http.server', '--bind', '127.0.0.1', str(port)], 'ready_port': port})
+            started = await development.execute_command.ainvoke({'background': True, 'name': 'web-dev',
+                'cwd': 'web', 'argv': [sys.executable, '-m', 'http.server', '--bind', '127.0.0.1', str(port)], 'ready_port': port})
             assert started['ready'] and started['registered_services'][0]['name'] == 'web'
             stub_port = free_port()
             # A server that prints its own address is recognized without ready_port.
             script = f"import http.server as h; print('Serving on http://127.0.0.1:{stub_port}/', flush=True); h.HTTPServer(('127.0.0.1', {stub_port}), h.SimpleHTTPRequestHandler).serve_forever()"
-            observed = await development.execute_command.ainvoke({'command': sys.executable, 'background': True, 'name': 'Stub API',
-                                                                  'arguments': ['-c', script]})
+            observed = await development.execute_command.ainvoke({'background': True, 'name': 'Stub API',
+                                                                  'argv': [sys.executable, '-c', script]})
             assert observed['ports'] == [stub_port]
         finally:
             await real_processes.close()

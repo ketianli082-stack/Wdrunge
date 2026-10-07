@@ -56,7 +56,7 @@ def command(argv, exit_code=0, output='', error=None, **args):
     result = {'id': f'p{next(counter)}', 'name': 'command', 'argv': argv, 'state': 'exited', 'exit_code': exit_code, 'output': output}
     if error:
         result.update(error=error, error_details={'code': 'connection_failed', 'category': 'service_unavailable'})
-    return ('execute_command', {'command': argv[0], 'arguments': argv[1:], **args}, result)
+    return ('execute_command', {'argv': [argv[0], *argv[1:]], **args}, result)
 
 
 def agent(window=131072):
@@ -143,7 +143,7 @@ def test_folded_call_arguments_cannot_be_sent_back_as_values():
 def test_ledger_records_files_processes_checks_and_open_failures():
     body = [HumanMessage(content='task', id='task'),
             *turn(('write_project_file', {'path': 'backend/app.py', 'content': 'x' * 3000}, 'Wrote backend/app.py (3000 characters; sha256=abcdef1234567890ff).')),
-            *turn(('execute_command', {'command': 'python3', 'arguments': ['backend/app.py'], 'background': True, 'ready_port': 8765},
+            *turn(('execute_command', {'argv': ['python3', 'backend/app.py'], 'background': True, 'ready_port': 8765},
                    {'id': 'svc1', 'name': 'api', 'argv': ['python3', 'backend/app.py'], 'state': 'running', 'ready': True})),
             *turn(command(['curl', 'http://127.0.0.1:8765/api/hello'], 0, '{"message": "Hello World"}')),
             *turn(command(['lsof', '-i'], 1, '', error='Command exited 1')),
@@ -308,3 +308,23 @@ def test_folded_writes_and_reads_keep_the_file_structure():
     assert 'on the desk' in by_id(folded)[page[1].id].content
     # The whole read's declarations are in the ledger's code index, with line numbers.
     assert 'L9 def create_app():' in next(m for m in folded if is_ledger(m)).content
+
+
+def test_a_stylesheet_is_indexed_by_its_class_names():
+    """Blog5: the index listed selector lines with line numbers, 162 of 339 class names
+    in 1,500 characters a file, and members ran 31 greps over stylesheets for the rest."""
+    css = ('/* .commented-out { } */\n:root { --gap: .5rem; }\n.page, .page-header {\n  margin: .5em;\n}\n'
+           '.page .card:hover > .card-title,\n.card.is-active {\n  background: url(img/a.b.png);\n}\n'
+           '@media (min-width: 768.5px) {\n  .page { padding: 0; }\n  .sidebar { display: none; }\n}\n#app .btn--primary { color: red; }\n')
+    assert context_fold.structure('src/styles/layout.css', css) == 'classes: page page-header card card-title is-active sidebar btn--primary'
+    assert context_fold.structure('src/app.scss', '.a { .b { c: d; } }') == 'classes: a b'
+    assert context_fold.structure('src/empty.css', 'body { margin: 0; }') == ''
+    # Every class of a large stylesheet fits; past the limit the rest is counted.
+    many = ''.join(f'.component-{i:03d}-wrapper {{ margin: 0; }}\n' for i in range(140))
+    index = context_fold.structure('layout.css', many)
+    shown = index.count('component-')
+    assert 100 < shown < 140 and index.endswith(f'…(+{140 - shown} more)') and len(index) <= context_fold.STYLE_STRUCTURE_LIMIT
+    names = ''.join(f'.c{i} {{ margin: 0; }}\n' for i in range(140))
+    assert context_fold.structure('layout.css', names).count(' c') == 140
+    # Other files keep line-numbered declarations.
+    assert context_fold.structure('a.py', 'def f():\n    pass\n') == 'L1 def f():'

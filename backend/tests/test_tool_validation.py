@@ -31,7 +31,6 @@ def test_every_collaboration_action_rejects_unknown_fields_before_io(action):
     ('request', {'recipient': 'backend', 'goal': 'a', 'key': 'k', 'dependencies': 'r'}),
     ('request', {'recipient': 'backend', 'goal': 'a', 'key': 'k', 'parent': 'forged'}),
     ('read', {'document_id': 'd', 'offset': 'bad'}),
-    ('subscribe', {'document_id': 'd', 'enabled': 'false'}),
     ('decision', {'title': {}, 'rationale': 'x', 'links': []}),
     ('schedule', {'identifier': 'r', 'deadline': float('nan')}),
 ])
@@ -209,9 +208,8 @@ def test_large_invalid_input_does_not_hide_the_actual_validation_error():
     assert len(result) < 2200
     details = json.loads(result)['error_details']
     assert details['category'] == 'invalid_arguments'
-    assert details['fields'][0]['received_type'] == 'string'
-    assert details['fields'][0]['expected_schema']['type'] == 'array'
     assert details['fields'][0]['example'] == [{'old_text': 'exact original text', 'new_text': 'replacement text'}]
+    assert 'expected_schema' not in details['fields'][0]
 
 
 @pytest.mark.parametrize('edit', [

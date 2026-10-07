@@ -81,14 +81,30 @@ async def replay(data: Path, agent_id: str, attempts, ratio: float, window: int)
         from app.agents.context_desk import desk_of, is_desk
     except ImportError:
         desk_of = is_desk = None
+    try:
+        from app.agents.read_result import format_read, parse_read
+    except ImportError:  # an earlier revision: file entries are keyed by the requested offset and limit
+        format_read = parse_read = None
     report = []
     for name, start, end in attempts:
         member = Agent(AgentSpec(id=agent_id, name=agent_id, prompt_file=f'{agent_id}.md', context_window=window))
         summary_model = FakeSummaryModel()
         member.model = lambda **kwargs: summary_model
         latest: dict[str, str] = {}
+        # Ranges of each file as last read, newest last: the desk re-reads a file by the
+        # range an entry holds, which need not be a range any recorded call asked for.
+        ranges: dict[str, list] = collections.defaultdict(list)
 
         async def refresher(tool, args):
+            if tool == 'read_project_file' and parse_read is not None:
+                start = args.get('offset') or 0
+                end = start + (args.get('limit') or 30000)
+                for read in reversed(ranges.get(args.get('path'), [])):
+                    if read.start <= start and (end <= read.end or read.next_offset is None):
+                        total = read.total if read.total is not None else (read.end if read.next_offset is None else None)
+                        return format_read(read.body[start - read.start:end - read.start], start, total,
+                                           more=read.next_offset is not None or end < read.end)
+                raise KeyError(args.get('path'))
             key = resource(tool, args)
             if key not in latest:
                 raise KeyError(key)
@@ -148,6 +164,8 @@ async def replay(data: Path, agent_id: str, attempts, ratio: float, window: int)
                 key = resource(c['tool'], arguments(c))
                 if key and c['status'] == 'success':
                     latest[key] = text
+                    if c['tool'] == 'read_project_file' and parse_read is not None:
+                        ranges[arguments(c).get('path')].append(parse_read(text, arguments(c).get('offset') or 0))
                 stats['reads'] += bool(key)
             messages = [*messages, ai, *results]
             stats['calls'] += 1

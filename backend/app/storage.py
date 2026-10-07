@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import asynccontextmanager
+import json
 import os
 from datetime import UTC, datetime
 from pathlib import Path
@@ -177,6 +178,9 @@ tool_calls = Table(
     Column("arguments", Text, nullable=False),
     Column("result", Text, nullable=False),
     Column("created_at", DateTime(timezone=True), nullable=False, index=True),
+    # What the platform did to the arguments before the tool ran (JSON): arguments it
+    # ignored, structures it repaired. Shows which tool descriptions mislead models.
+    Column("notes", Text, nullable=True),
 )
 
 agent_usage = Table(
@@ -338,7 +342,10 @@ def default_database_url() -> str:
 class ChatStore:
     def __init__(self, database_url: str | None = None):
         self.database_url = database_url or default_database_url()
-        engine_options: dict[str, Any] = {"pool_pre_ping": True}
+        # A pre-ping guards against a server dropping idle connections. A local SQLite
+        # file cannot do that, and the ping costs several thread round trips on every
+        # checkout (a worker checks a connection out more than a dozen times per model turn).
+        engine_options: dict[str, Any] = {"pool_pre_ping": not self.database_url.startswith("sqlite")}
         if self.database_url.endswith(":memory:"):
             engine_options["poolclass"] = StaticPool
         self.engine: AsyncEngine = create_async_engine(self.database_url, **engine_options)
@@ -379,6 +386,8 @@ class ChatStore:
                         await connection.execute(text(f"ALTER TABLE agent_usage ADD COLUMN {name} {kind}"))
                 if "conversation_id" not in columns:
                     await connection.execute(text("CREATE INDEX IF NOT EXISTS ix_agent_usage_conversation_id ON agent_usage (conversation_id)"))
+                if "notes" not in {row[1] for row in await connection.execute(text("PRAGMA table_info(tool_calls)"))}:
+                    await connection.execute(text("ALTER TABLE tool_calls ADD COLUMN notes TEXT"))
         self._initialized = True
 
     async def clear_records(self) -> None:
@@ -406,11 +415,12 @@ class ChatStore:
     async def _conversation_exists(self, connection, conversation_id: str) -> bool:
         return await connection.scalar(select(conversations.c.id).where(conversations.c.id == conversation_id)) is not None
 
-    async def _next_sequence(self, connection, conversation_id: str) -> int:
+    async def _next_sequence(self, connection, conversation_id: str, count: int = 1) -> int:
+        """Allocate `count` consecutive sequence numbers; returns the last one."""
         result = await connection.execute(
             update(conversations)
             .where(conversations.c.id == conversation_id)
-            .values(next_sequence=conversations.c.next_sequence + 1, updated_at=utcnow())
+            .values(next_sequence=conversations.c.next_sequence + count, updated_at=utcnow())
             .returning(conversations.c.next_sequence)
         )
         value = result.scalar_one_or_none()
@@ -616,20 +626,23 @@ class ChatStore:
         await self.initialize()
         now = utcnow()
         async with self.write() as connection:
-            existing = await connection.scalar(select(activities.c.id).where(activities.c.id == payload["id"]))
-            if existing:
-                await connection.execute(update(activities).where(activities.c.id == payload["id"]).values(
-                    agent_id=payload["agent"], tool=payload["tool"], description=payload["description"],
-                    phase=payload["phase"], updated_at=now,
-                ))
+            # Every tool call writes here twice (running, then its outcome). The update
+            # itself tells whether the activity exists, and a new one takes its own and
+            # its event's sequence numbers in one statement. Starting with a write also
+            # takes the write lock at once instead of upgrading a read lock.
+            updated = await connection.execute(update(activities).where(activities.c.id == payload["id"]).values(
+                agent_id=payload["agent"], tool=payload["tool"], description=payload["description"],
+                phase=payload["phase"], updated_at=now,
+            ))
+            if updated.rowcount:
+                event_sequence = await self._next_sequence(connection, conversation_id)
             else:
-                sequence = await self._next_sequence(connection, conversation_id)
+                event_sequence = await self._next_sequence(connection, conversation_id, 2)
                 await connection.execute(insert(activities).values(
-                    id=payload["id"], conversation_id=conversation_id, sequence=sequence,
+                    id=payload["id"], conversation_id=conversation_id, sequence=event_sequence - 1,
                     agent_id=payload["agent"], tool=payload["tool"], description=payload["description"],
                     phase=payload["phase"], created_at=now, updated_at=now,
                 ))
-            event_sequence = await self._next_sequence(connection, conversation_id)
             await self._insert_event(connection, conversation_id, event_sequence, "activity", payload["id"], payload, now)
 
     async def add_event(self, conversation_id: str, event_type: str, payload: dict[str, Any]) -> None:
@@ -722,7 +735,8 @@ class ChatStore:
         await self.initialize()
         rows = [{'conversation_id': conversation_id, 'tool_call_id': str(call['id'])[:120], 'agent_id': agent_id,
                  'tool': str(call['tool'])[:120], 'status': call['status'], 'arguments': call['arguments'][:8000],
-                 'result': call['result'][:8000], 'created_at': utcnow()} for call in calls]
+                 'result': call['result'][:8000], 'created_at': utcnow(),
+                 'notes': json.dumps(call['notes'], ensure_ascii=False)[:2000] if call.get('notes') else None} for call in calls]
         async with self.write() as connection:
             await connection.execute(sqlite_insert(tool_calls).values(rows).on_conflict_do_nothing())
             newest = select(tool_calls.c.created_at).order_by(tool_calls.c.created_at.desc()).offset(keep).limit(1)

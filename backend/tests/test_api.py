@@ -241,3 +241,33 @@ def test_background_event_pages_are_ordered_scoped_and_resumable(tmp_path, monke
     assert client.get('/api/conversations/missing/events').status_code == 404
     assert client.get(f'/api/conversations/{cid}/events?after=-1').status_code == 422
     asyncio.run(store.close())
+
+
+def test_an_activity_and_its_event_take_consecutive_sequence_numbers(tmp_path):
+    """Every tool call is stored twice (running, then its outcome). A new activity takes
+    its own number and its event's together, an update only the event's; the order the
+    UI replays depends on these numbers."""
+    import asyncio
+    import pytest
+    from app.storage import ChatStore, StorageNotFoundError
+
+    async def scenario():
+        store = ChatStore(f'sqlite+aiosqlite:///{tmp_path / "activities.db"}')
+        project = await store.create_project('Activities', str(tmp_path))
+        cid = (await store.create_conversation(project['id']))['id']
+        activity = dict(id='tool-1', agent='backend', tool='execute_command', description='Run', phase='running')
+        await store.upsert_activity(cid, activity)
+        await store.upsert_activity(cid, {**activity, 'phase': 'completed'})
+        await store.upsert_activity(cid, {**activity, 'id': 'tool-2'})
+        detail = await store.get_conversation_detail(cid)
+        assert [(a['id'], a['sequence'], a['phase']) for a in detail['activities']] == [
+            ('tool-1', 1, 'completed'), ('tool-2', 4, 'running')]
+        page = await store.conversation_event_page(cid)
+        assert [(e['sequence'], e['payload']['id'], e['payload']['phase']) for e in page['events']] == [
+            (2, 'tool-1', 'running'), (3, 'tool-1', 'completed'), (5, 'tool-2', 'running')]
+        with pytest.raises(StorageNotFoundError):
+            await store.upsert_activity('missing', {**activity, 'id': 'tool-3'})
+        # Nothing of the refused activity was kept.
+        assert len((await store.get_conversation_detail(cid))['activities']) == 2
+        await store.close()
+    asyncio.run(scenario())

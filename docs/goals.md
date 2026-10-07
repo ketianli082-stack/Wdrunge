@@ -8,10 +8,11 @@ SQLite 持久化协作请求、独立工作区、依赖图、执行租约与重�
 
 | 工具 | 用途 |
 | --- | --- |
-| `create_goal` | Leader 创建目标，提供 objective、criteria、稳定的 key；默认每 180 秒检查 |
-| `create_task` | 为目标创建异步任务，提供 goal_id、recipient、goal、criteria、key，可指定 dependencies、artifacts 和 based_on |
+| `create_goal` | Leader 创建目标，提供 objective、criteria、稳定的 key、scale 和 requirements（需求文档路径，或不需要需求文档的原因）；默认每 180 秒检查。返回项目是否已初始化、需求文档是否就绪和下一步 |
+| `create_task` | 为目标创建异步任务，提供 goal_id、recipient、goal、criteria、key，可指定 dependencies、artifacts、documents、services、needs；目标登记了需求文档时，后端和前端的任务要带 module（模块名或 "init"）。规则见 backend/task-planning.md |
+| `create_tasks` | 一次调用建多个任务：`goal_id` 加 `tasks` 数组（每项的字段和 `create_task` 相同，不含 `goal_id`），按顺序创建，后面的任务可以用 `"leader:<key>"` 依赖同一次调用里前面的任务。某一项失败不影响其他项，返回里逐项给出结果。Leader 只看得到这个批量形式 |
 | `get_goal` | 读取目标、完整验收条件及证据、任务统计和分页预览 |
-| `submit_task` | 执行者提交交付，发布当前工作区后进入 review |
+| `submit_task` | 执行者提交交付，发布当前工作区后进入 review。依据的文档是否变化由平台按读过的章节判断，不需要填版本号 |
 | `complete_task` | 委派者或 Leader 检查交付后验收，evidence 必须逐项覆盖任务条件 |
 | `update_goal` | Leader 暂停、恢复、阻塞或取消目标，必须给出 reason |
 | `complete_goal` | Leader 在全部 Task 验收后，提供逐项目标证据并关闭目标 |

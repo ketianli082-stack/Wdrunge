@@ -39,18 +39,25 @@ class LeaderCoordinator:
 
     async def tick(self, now=None):
         now = time.time() if now is None else now
+        # One read for every session with its run fence and its project's pause switch:
+        # this runs four times a second, and two more reads per conversation (also for
+        # the stopped ones, which stay forever) grew with every conversation ever held.
         async with self.service.reading() as c:
-            rows = (await c.execute(text("SELECT r.project,r.data,p.workspace_path FROM collaboration_records r JOIN projects p ON p.id=r.project JOIN conversations v ON v.id=r.id WHERE r.kind='leader_session' ORDER BY r.updated"))).mappings().all()
+            rows = (await c.execute(text("""SELECT r.project,r.data,p.workspace_path,run.state AS run_state,
+                COALESCE(json_extract(s.data,'$.paused'),0) AS paused
+              FROM collaboration_records r JOIN projects p ON p.id=r.project JOIN conversations v ON v.id=r.id
+              LEFT JOIN collaboration_records run ON run.kind='conversation_run' AND run.project=r.project AND run.id=r.id
+              LEFT JOIN collaboration_records s ON s.kind='settings' AND s.project=r.project AND s.id='project'
+              WHERE r.kind='leader_session' ORDER BY r.updated"""))).mappings().all()
         for row in rows:
             session = json.loads(row['data'])
             if session['state'] in {'running', 'failed'} or session.get('retry_after', 0) > now:
                 continue
             project, conversation = row['project'], session['id']
-            if await self.service.conversation_stopped(project, conversation):
+            # A run record that is not active fences the conversation (conversation_stopped).
+            if row['run_state'] is not None and row['run_state'] != 'active':
                 continue
-            async with self.service.reading() as c:
-                settings = await self.service._get(c, 'settings', project, 'project', False)
-            if settings and settings.get('paused'):
+            if row['paused']:
                 continue
             if not self.job or self.job.done():
                 if await self.service.inbox(project, 'leader', f'leader:{conversation}', conversation):

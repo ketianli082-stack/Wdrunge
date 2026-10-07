@@ -42,7 +42,7 @@ def test_journal_collects_facts_notes_attempts_and_renders_handoff(tmp_path):
                     *turn('write_project_file', {'path': 'docs/testing/report.md', 'content': 'x'},
                           'Wrote docs/testing/report.md (1 characters; sha256=abcdef).', 'c1'),
                     *turn('browser_verify', {}, {'url': 'http://localhost:5173/', 'passed': True, 'screenshot': 'docs/testing/a.png'}, 'c2'),
-                    *turn('execute_command', {'command': 'curl', 'arguments': ['http://127.0.0.1:8765/']},
+                    *turn('execute_command', {'argv': ['curl', 'http://127.0.0.1:8765/']},
                           {'id': 'p1', 'argv': ['curl', 'http://127.0.0.1:8765/'], 'exit_code': 7, 'error': 'Command exited 7',
                            'error_details': {'code': 'connection_failed'}}, 'c3')]
         await s.journal_attempt_start(p, r['id'], 1, 'inst-1', 'fresh')

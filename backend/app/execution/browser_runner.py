@@ -10,6 +10,32 @@ class AssertionFailed(ValueError):
     pass
 
 
+# The model reviews the page from these images. A provider scales any image above
+# about 2.6M pixels down to that size (~2,560 tokens), so a long page is cut into
+# tiles: each tile is scaled at most ~0.64x and body text stays legible.
+TILE_HEIGHT = 4000
+MAX_TILES = 3
+
+
+async def capture(page, base):
+    """Full-page screenshot as up to MAX_TILES files (base, base-2, ...); returns the
+    paths and the page height, which exceeds the tiles' coverage when cut off."""
+    width, height = await page.evaluate(
+        '[document.documentElement.clientWidth, Math.max(document.documentElement.scrollHeight, document.body ? document.body.scrollHeight : 0)]')
+    width, height = max(1, int(width)), max(1, int(height))
+    if height <= TILE_HEIGHT:
+        await page.screenshot(path=base, full_page=True)
+        return [base], height
+    stem = base[:-len('.png')]
+    paths = []
+    for index, top in enumerate(range(0, min(height, TILE_HEIGHT * MAX_TILES), TILE_HEIGHT)):
+        path = base if index == 0 else f'{stem}-{index + 1}.png'
+        await page.screenshot(path=path, full_page=True,
+                              clip={'x': 0, 'y': top, 'width': width, 'height': min(TILE_HEIGHT, height - top)})
+        paths.append(path)
+    return paths, height
+
+
 def browser_failure(exc, stage, action_index=None):
     """Classify at the failing stage; never call a browser API defect a bad selector."""
     from playwright.async_api import Error, TimeoutError
@@ -30,9 +56,8 @@ def browser_failure(exc, stage, action_index=None):
     else:
         category, code, policy = 'internal_error', 'browser_runtime_error', 'do_not_retry_unchanged'
         advice = 'Inspect the browser/runtime error and environment. Preserve evidence and report the blocker or use another supported verification method.'
-    return {'error': message, 'error_details': {'category': category, 'code': code,
-        'retry_policy': policy, 'next_action': advice, 'stage': stage,
-        'action_index': action_index, 'exception_type': type(exc).__name__}, 'passed': False}
+    return {'error': message, 'error_details': {'category': category, 'code': code, 'next_action': advice, 'stage': stage,
+        **({'action_index': action_index} if action_index is not None else {})}, 'passed': False}
 
 
 async def run(spec):
@@ -102,20 +127,22 @@ async def run(spec):
                         raise AssertionFailed(f"Expected text {action['value']!r}; got {actual[:500]!r}")
                 results.append({'action': kind, 'selector': action['selector'], 'passed': True})
             stage, action_index = 'screenshot', None
-            await page.screenshot(path=spec['screenshot'], full_page=False)
+            screenshots, page_height = await capture(page, spec['screenshot'])
             return {'url': page.url, 'title': await page.title(), 'status': response.status if response else None,
                     'text': (await page.locator('body').inner_text())[:12000], 'actions': results,
                     'console': console, 'page_errors': errors, 'http_errors': responses,
-                    'screenshot': spec['screenshot'],
+                    'screenshots': screenshots, 'page_height': page_height,
                     'expected_errors': bool(spec.get('expect_errors')),
                     'passed': bool(spec.get('expect_errors')) or not errors and not responses and not any(item['level'] == 'error' for item in console)}
         except Exception as exc:
+            shots = {}
             try:
-                await page.screenshot(path=spec['screenshot'], full_page=False)
+                screenshots, page_height = await capture(page, spec['screenshot'])
+                shots = {'screenshots': screenshots, 'page_height': page_height}
             except Exception:
                 pass
             return {**browser_failure(exc, stage, action_index), 'actions': results, 'console': console,
-                    'page_errors': errors, 'http_errors': responses}
+                    'page_errors': errors, 'http_errors': responses, **shots}
         finally:
             await browser.close()
 
@@ -132,7 +159,8 @@ if __name__ == '__main__':
         return json.dumps(result, ensure_ascii=False)
     while len(encode().encode()) > 24000:
         result['truncated'] = True
-        candidates = [key for key, value in result.items() if isinstance(value, (list, str)) and len(value) > 1]
+        candidates = [key for key, value in result.items()
+                      if isinstance(value, (list, str)) and len(value) > 1 and key != 'screenshots']
         key = max(candidates, key=lambda k: len(json.dumps(result[k]).encode()))
         result[key] = result[key][:max(1, len(result[key]) // 2)]
     print('WDRUNGE_BROWSER_RESULT=' + encode())

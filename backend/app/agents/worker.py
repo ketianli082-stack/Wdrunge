@@ -4,6 +4,7 @@ from collections.abc import AsyncIterator
 from typing import TYPE_CHECKING, Literal
 from uuid import uuid4
 
+import openai
 from langchain_core.messages import AIMessage, AIMessageChunk, BaseMessage, HumanMessage, SystemMessage, ToolMessage, RemoveMessage
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.graph.message import REMOVE_ALL_MESSAGES
@@ -12,6 +13,7 @@ from langgraph.prebuilt import ToolNode, tools_condition
 
 from app.agents.memory import ContextMemory, reminder, is_context_overflow, message_tokens
 from app.agents.context_meter import calibrate
+from app.agents.page_images import with_page_images
 from app.agents.context_desk import desk_of, keys_summary
 from app.agents.progress import PAUSE_TEXT, read_only_turn, read_streak, read_streak_limit, reads_paused, streak_notice
 from app.collaboration.reminders import goal_messages, with_goal_state
@@ -22,7 +24,8 @@ import logging
 
 logger = logging.getLogger(__name__)
 from app.agents.limits import graph_recursion_limit
-from app.agents.tools.validation import tool_error, tool_result_failed, normalize_failure, model_tool_schemas, folded_call_failure, failure_result
+from app.agents.tools.validation import tool_error, tool_result_failed, normalize_failure, model_tool_schemas, folded_call_failure, failure_result, model_result
+from app.agents.tools.arguments import call_problem, normalize_arguments, problem_failure, screen_response, with_notice
 from app.agents.base import Agent, build_model
 from app.collaboration.tools import active, collaborate, COLLABORATION_TOOLS, model_collaboration_tools, collaboration_action
 from app.collaboration.context import encode_handoff
@@ -57,7 +60,7 @@ TOOL_LABELS = {
 
 COLLABORATION_LABELS = {
     'create_goal': '创建长期目标', 'get_goal': '查看目标与任务', 'update_goal': '更新目标状态',
-    'complete_goal': '验收目标', 'create_task': '创建目标任务', 'submit_task': '提交任务交付', 'complete_task': '验收目标任务',
+    'complete_goal': '验收目标', 'create_task': '创建目标任务', 'create_tasks': '创建目标任务', 'submit_task': '提交任务交付', 'complete_task': '验收目标任务',
     'catalog': '查看交付文档目录', 'read': '读取文档章节', 'publish': '发布文档修订',
     'subscribe': '订阅文档变化', 'send': '在群里 @ 成员沟通', 'request': '发起协作任务',
     'inspect_request': '查看任务进展', 'wait': '等待依赖交付', 'transition': '更新任务交付与验收状态',
@@ -105,6 +108,7 @@ class WorkerAgent(Agent):
         self._store: ChatStore | None = None
         self._task: dict | None = None
         self._scale: str | None = None
+        self._session: str | None = None  # the conversation the tool-call log is kept under
         # Reply turns: only reading tools, and a short step budget.
         self.read_only = False
         self.recursion_limit: int | None = None
@@ -172,10 +176,12 @@ class WorkerAgent(Agent):
             return bound[key]
         runnable_for([])
 
-        def memory(config):
-            return ContextMemory(self, config['configurable']['thread_id'], tools)
-        # For calibrating the token estimate against billed prompt tokens (context_meter).
+        # For the context budget and for calibrating the token estimate against billed
+        # prompt tokens (context_meter); measured once per graph, not per model call.
         schema_tokens = ContextMemory(self, 'schema', tools).schema_tokens
+
+        def memory(config):
+            return ContextMemory(self, config['configurable']['thread_id'], tools, schema_tokens=schema_tokens)
 
         async def prepare_context(state, config):
             import json
@@ -221,11 +227,25 @@ class WorkerAgent(Agent):
                 if current['state'] != 'running' or (ctx.instance_id and current.get('instance_id') != ctx.instance_id):
                     return {'messages': [AIMessage(content='Request execution suspended.')]}
             messages = state["messages"]
-            try:
-                response = await ainvoke_with_retry(runnable_for(messages), messages, alternates=(
+            # Screenshots of the latest page check ride along on this call only (page_images).
+            shown, media = with_page_images(messages)
+            async def invoke(sent):
+                return await ainvoke_with_retry(runnable_for(messages), sent, alternates=(
                     lambda: variant_for(messages, 'non_streaming'), lambda: variant_for(messages, 'fallback')))
-                calibrate(messages, response, schema_tokens)
-                return {"messages": [response], "clean_retry": False, "needs_clean": False}
+            try:
+                try:
+                    response = await invoke(shown)
+                except openai.BadRequestError as exc:
+                    if not media or is_context_overflow(exc):
+                        raise
+                    # A model without image input (e.g. a text-only fallback) still gets the text result.
+                    logger.warning('Model rejected the page screenshots (%s); calling without them', exc)
+                    shown, media = messages, 0
+                    response = await invoke(shown)
+                calibrate(messages, response, schema_tokens, media)
+                # Calls the provider could not parse, or cut off by the length limit, are
+                # kept answerable so the tool node can say what was wrong.
+                return {"messages": [screen_response(response)], "clean_retry": False, "needs_clean": False}
             except Exception as exc:
                 if not is_context_overflow(exc) or state.get('clean_retry'):
                     raise
@@ -277,11 +297,21 @@ class WorkerAgent(Agent):
         if tools:
             tool_node = ToolNode([*tools, *([collaborate] if active.get() else [])], handle_tool_errors=tool_error)
 
+            by_name = dict(tool_node.tools_by_name)
+
             async def guarded_tools(state, config):
-                ctx = active.get()
+                import json
                 from langchain_core.messages import ToolMessage
+                ctx = active.get()
                 results = []
                 last = state['messages'][-1]
+
+                async def refuse(call, failure, notes=None):
+                    """Answer a call without running it, and keep it in the tool-call log."""
+                    content = json.dumps(failure, ensure_ascii=False) if isinstance(failure, dict) else failure
+                    results.append(ToolMessage(content=content, name=call['name'], tool_call_id=call['id'], status='error'))
+                    await self._record_tool_call(call, content, 'error', notes)
+
                 # A long read-only run: refuse further reads until the agent writes, runs
                 # something or states its next step; any such call lifts the pause.
                 paused = reads_paused(state['messages'][:-1]) if read_only_turn(last) else 0
@@ -289,38 +319,50 @@ class WorkerAgent(Agent):
                 # any subsequent tool in the same model response may execute.
                 for call in last.tool_calls:
                     if call['name'] == 'checkpoint_context' and len(last.tool_calls) != 1:
-                        results.append(ToolMessage(content='Call checkpoint_context alone.', name='checkpoint_context', tool_call_id=call['id'], status='error'))
+                        await refuse(call, 'Call checkpoint_context alone.')
                         continue
                     if ctx and ctx.request:
                         current = await ctx.service.get_request(ctx.project, ctx.request)
                         if current['state'] != 'running' or (ctx.instance_id and current.get('instance_id') != ctx.instance_id):
-                            results.append(ToolMessage(content='Request is no longer running; tool skipped.', tool_call_id=call['id'], status='error'))
+                            await refuse(call, 'Request is no longer running; tool skipped.')
                             continue
+                    if problem := call_problem(last, call['id']):
+                        await refuse(call, problem_failure(problem, call['name']), {'problem': problem['kind']})
+                        continue
                     if paused:
-                        import json
-                        results.append(ToolMessage(content=json.dumps(failure_result(
+                        await refuse(call, failure_result(
                             PAUSE_TEXT.format(count=paused), 'operation_rejected', 'reads_paused',
-                            'Write the next file or section, run a check, or record collaboration_journal(kind="next"); reads resume after that.',
-                            'after_state_change'), ensure_ascii=False), name=call['name'], tool_call_id=call['id'], status='error'))
+                            'Write the next file or section, run a check, or record collaboration_journal(kind="next"); reads resume after that.'))
                         continue
                     if failure := folded_call_failure(call.get('args')):
-                        import json
-                        results.append(ToolMessage(content=json.dumps(failure, ensure_ascii=False), name=call['name'],
-                                                   tool_call_id=call['id'], status='error'))
+                        await refuse(call, failure)
                         continue
-                    single = last.model_copy(update={'tool_calls': [call]})
+                    # Undeclared arguments are dropped (and reported), JSON-encoded arrays decoded.
+                    normalized = normalize_arguments(by_name.get(call['name']), call.get('args'))
+                    notes = {**(normalized.notes() or {}),
+                             **({'syntax': repairs} if (repairs := last.additional_kwargs.get('call_repairs', {}).get(call['id'])) else {})}
+                    if normalized.failure:
+                        await refuse(call, normalized.failure, notes)
+                        continue
+                    single = last.model_copy(update={'tool_calls': [{**call, 'args': normalized.args}]})
                     result = await tool_node.ainvoke({**state, 'messages': [*state['messages'][:-1], single]}, config)
                     for message in result['messages']:
-                        if tool_result_failed(message):
-                            import json
+                        content = message.content if isinstance(message.content, str) else json.dumps(message.content, ensure_ascii=False, default=str)
+                        failed = tool_result_failed(message)
+                        if failed:
                             try:
-                                output = json.loads(message.content)
+                                output = json.loads(content)
                             except (ValueError, TypeError):
-                                output = {'error': message.content}
+                                output = {'error': content}
                             if not isinstance(output, dict):
                                 output = {'error': str(output)}
-                            message = message.model_copy(update={'content': json.dumps(
-                                normalize_failure(output, tool_name=call['name']), ensure_ascii=False), 'status': 'error'})
+                            content = json.dumps(normalize_failure(output, tool_name=call['name']), ensure_ascii=False)
+                        # The log keeps the whole result; the model gets the fields it can use.
+                        await self._record_tool_call(call, content, 'error' if failed else 'success', notes)
+                        shown = with_notice(content if failed else model_result(call['name'], normalized.args, content),
+                                            normalized.notice(call['name']))
+                        if shown != message.content or (failed and message.status != 'error'):
+                            message = message.model_copy(update={'content': shown, **({'status': 'error'} if failed else {})})
                         results.append(message)
                 return {'messages': results}
 
@@ -392,8 +434,7 @@ class WorkerAgent(Agent):
         import json
         return [ToolMessage(content=json.dumps({'error': 'Interrupted before this tool finished; its effect is unknown. '
                                                          'Check the current state and run it again only if still needed.',
-                                                'error_details': {'category': 'internal_error', 'code': 'interrupted',
-                                                                  'retry_policy': 'inspect_before_retry'}}),
+                                                'error_details': {'category': 'internal_error', 'code': 'interrupted'}}),
                             tool_call_id=call['id'], name=call['name'], status='error')
                 for call in history[last].tool_calls if call.get('id') and call['id'] not in answered]
 
@@ -414,6 +455,7 @@ class WorkerAgent(Agent):
         handoff: str,
     ) -> AsyncIterator[tuple[str, dict]]:
         resolved = self.resolve_context_mode(conversation_id, context_mode)
+        self._session = conversation_id
         if resolved == "fresh":
             if 'Work journal of this task' not in handoff:
                 handoff += await self.previous_progress(conversation_id)
@@ -467,29 +509,20 @@ class WorkerAgent(Agent):
             except Exception:
                 logger.warning('Could not record the stall in the task journal', exc_info=True)
 
-    async def _record_tool_call(self, conversation_id, tool_name, data, run_id=''):
-        # Raw arguments and result as the model saw them, before context folding
-        # shortens the result; the same log the Leader keeps.
-        import json
-        output = data.get("output")
+    async def _record_tool_call(self, call, result, status, notes=None):
+        """The call as the model sent it and the whole result, before the model's view
+        of it is cut down and before context folding; the same log the Leader keeps.
+        Recorded where the call is answered, so refused calls (unparsable, truncated,
+        paused) are in the log too."""
         if not self._store:
             return
-        if isinstance(output, ToolMessage) and output.tool_call_id:
-            identifier, status = output.tool_call_id, 'error' if output.status == 'error' or tool_result_failed(output) else 'success'
-            result = output.content if isinstance(output.content, str) else json.dumps(output.content, ensure_ascii=False, default=str)
-        elif isinstance(data.get("error"), BaseException):
-            # A tool that raised (invalid arguments, not found): the model receives the
-            # normalized failure from the tool node; the log records the same failure.
-            from app.agents.tools.validation import exception_result
-            identifier, status = f'run:{run_id}', 'error'
-            result = json.dumps(normalize_failure(exception_result(data["error"], tool_name=tool_name), tool_name=tool_name),
-                                ensure_ascii=False, default=str)
-        else:
-            return
+        import json
+        ctx = active.get()
         try:
-            await self._store.record_tool_calls(conversation_id, self.spec.id, [{
-                'id': identifier, 'tool': tool_name, 'status': status,
-                'arguments': json.dumps(data.get("input") or {}, ensure_ascii=False, default=str), 'result': result}])
+            await self._store.record_tool_calls((ctx.conversation if ctx else '') or self._session or '', self.spec.id, [{
+                'id': call.get('id') or f'call-{uuid4().hex}', 'tool': call.get('name') or '', 'status': status,
+                'arguments': json.dumps(call.get('args') or {}, ensure_ascii=False, default=str), 'result': result,
+                'notes': notes or None}])
         except Exception:
             logger.warning('Could not record %s tool call', self.spec.id, exc_info=True)
 
@@ -526,7 +559,6 @@ class WorkerAgent(Agent):
                 }
             elif kind in {"on_tool_end", "on_tool_error"} and run_id in active_tools:
                 tool_name, description = active_tools.pop(run_id)
-                await self._record_tool_call((ctx.conversation if ctx else '') or conversation_id, tool_name, event.get("data", {}), run_id)
                 yield "activity", {
                     "id": run_id,
                     "tool": tool_name,

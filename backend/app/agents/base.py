@@ -121,12 +121,10 @@ class Agent:
         from app.agents.memory import MEMORY_PROMPT
         parts = [(modules / "shared.md").read_text(encoding="utf-8")] if collaborative else []
         parts.append(MEMORY_PROMPT)
-        parts.append('工具失败会返回 error 和 error_details。invalid_arguments 表示参数未通过校验、操作未执行：'
-                     '按 fields 中的字段名、expected_schema 和 example 修正，数组/对象直接传 JSON 值，不把它们编码为字符串。'
-                     'service_unavailable 表示服务或端口问题，先检查进程日志与就绪状态；permission_denied 必须遵守授权边界；'
-                     'environment_unavailable 先确认所需环境；verification_failed 表示实际检查未通过；internal_error 表示工具或运行时问题。'
-                     '保留 error、输出和证据，遵循 retry_policy/next_action，必要时选择其他受支持的方法或向 Leader 报告阻塞。'
-                     '不要重复相同的失败调用，不把工具内部错误当作项目功能缺陷，也不伪称验证通过。')
+        parts.append('工具失败会返回 error 和 error_details（category、code）。invalid_arguments：参数没有通过校验，操作没有执行，'
+                     '按 fields 里的字段名和 example 修正。返回里有 next_action 就照它做；有 notice 说明你传的某个参数不存在、已被忽略。'
+                     'permission_denied 必须遵守授权边界；internal_error 是工具或运行时的问题，不是项目缺陷。'
+                     '不重复相同的失败调用，不伪称验证通过；解决不了就向 Leader 报告阻塞。')
         parts += [(root / "prompts" / self.spec.prompt_file).read_text(encoding="utf-8"), team_identity_prompt(self.spec.id)]
         for skill in self.spec.skills:
             parts.append((root / "skills" / skill).read_text(encoding="utf-8"))
@@ -135,7 +133,6 @@ class Agent:
             # Only what the tool descriptions do not already say.
             parts.append("开发工具：先用 detect_environment 确认环境和宿主命令约定（macOS 为 BSD 工具，不用 GNU 专有参数）。"
                          "不要把后端宿主 Python 当作项目环境；依赖用 execute_command 按锁文件装进项目 .venv 或 node_modules。"
-                         "访问本机以外的主机时传 network=true；预期的非零退出码（确认端口已关的 curl 退出 7、无匹配的 grep 退出 1）放进 ok_exit_codes。"
                          "命令经审核并在沙箱中运行，出现人工授权时等待用户，不用其他工具绕过。项目外的配置用 read_external_file 请求授权，"
                          "移动/删除文件用 manage_file；页面证据以浏览器验证结果和截图为准。")
         if collaborative:

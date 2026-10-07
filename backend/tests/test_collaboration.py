@@ -235,11 +235,13 @@ def test_safe_document_auto_merge_rejects_changed_section(tmp_path):
 def test_multi_instance_leases_and_isolated_merge(tmp_path):
     async def scenario():
         store, s, p, workspace = await setup(tmp_path)
+        s.role_concurrency = 2  # two sessions of one member (WDRUNGE_ROLE_CONCURRENCY=2)
         (workspace/'code.txt').write_text('one\ntwo\nthree\n')
         for key in ['a','b','c']:
             await s.create_request(p, 'leader', 'frontend', key, key)
         other = Collaboration(ChatStore(f'sqlite+aiosqlite:///{tmp_path / "test.db"}'))
         await other.initialize()
+        other.role_concurrency = 2
         claims = await asyncio.gather(s.claim('one'), other.claim('two'))
         assert len({job[2]['id'] for job in claims}) == 2
         assert await s.claim('three') is None
@@ -690,6 +692,7 @@ def test_live_usage_counts_concurrent_instances_before_completion(tmp_path, monk
         store, s, p, workspace = await setup(tmp_path)
         team = Team()
         await team.configure_persistence(store, InMemorySaver())
+        s.role_concurrency = 2  # two sessions of one member (WDRUNGE_ROLE_CONCURRENCY=2)
         scheduler = Scheduler(s, team)
         release = asyncio.Event()
         started = asyncio.Queue()
@@ -751,6 +754,7 @@ def test_task_can_deliver_a_shared_document_it_published_mid_task(tmp_path):
     from app.collaboration.tools import Context, active, execute_collaboration
     async def scenario():
         store, s, p, workspace = await setup(tmp_path)
+        s.role_concurrency = 2  # the second task below starts while the first still runs
         r = await s.create_request(p, 'leader', 'backend', 'Contract and API', 'api', artifacts=['backend/', 'docs/api-contract.md'])
         job = (await s.claim())[2]
         w = await s.prepare_workspace(p, r['id'])

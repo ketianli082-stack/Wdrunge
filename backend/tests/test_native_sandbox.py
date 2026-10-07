@@ -1,5 +1,6 @@
 """Real OS smoke test. Run on macOS/Linux hosts with the sandbox backend installed."""
 import asyncio
+import json
 import os
 from pathlib import Path
 import sys
@@ -106,6 +107,8 @@ def test_native_browser_interactions_errors_and_screenshot(tmp_path, monkeypatch
             self.wfile.write(b'<title>Verification</title><button id="go" onclick="document.querySelector(\'#result\').textContent=\'Done\'">Go</button><p id="result">Ready</p>')
             if self.path == '/error':
                 self.wfile.write(b'<script>console.error("console evidence");throw Error("page evidence")</script>')
+            if self.path == '/tall':
+                self.wfile.write(b'<div style="height:13000px;background:linear-gradient(red,blue)"></div>')
         def log_message(self, *args):
             pass
     server = ThreadingHTTPServer(('127.0.0.1', 0), Handler)
@@ -119,10 +122,20 @@ def test_native_browser_interactions_errors_and_screenshot(tmp_path, monkeypatch
                 {'action': 'click', 'selector': '#go'},
                 {'action': 'assert_text', 'selector': '#result', 'value': 'Done'}]})
             assert good.get('passed'), good.get('error', good)
-            assert Path(good['screenshot']).read_bytes().startswith(b'\x89PNG')
+            assert (tmp_path / good['screenshot']).read_bytes().startswith(b'\x89PNG')
             bad = await browser_verify.ainvoke({'url': url+'/error'})
             assert not bad['passed'] and bad['page_errors'], bad
             assert any('console evidence' in entry['text'] for entry in bad['console'])
+            # A long page comes back as full-width tiles, attached to the result for the model.
+            tall = await browser_verify.ainvoke({'url': url+'/tall'})
+            assert tall['passed'] and len(tall['screenshots']) == 3 and tall['screenshot'] == tall['screenshots'][0], tall
+            assert tall['screenshot_covers'].startswith('top 12000px of'), tall
+            from langchain_core.messages import ToolMessage
+            from app.agents.page_images import with_page_images
+            result = ToolMessage(content=json.dumps(tall), name='browser_verify', tool_call_id='c1')
+            shown, tokens = with_page_images([result])
+            assert [part['type'] for part in shown[0].content] == ['text', 'text', 'image_url', 'image_url', 'image_url']
+            assert 3 * 2000 < tokens <= 3 * 2570
         finally:
             await processes.close()
             active_workspace.reset(token)
@@ -169,11 +182,11 @@ def test_command_tool_graph_foreground_and_background(tmp_path, monkeypatch):
         token=active_workspace.set(tmp_path)
         source_token=source_workspace.set(tmp_path)
         try:
-            result=await call('execute_command',{'command':sys.executable,'arguments':['-c','print("dispatch-ok")']})
+            result=await call('execute_command',{'argv': [sys.executable, '-c','print("dispatch-ok")']})
             assert result['exit_code']==0 and 'dispatch-ok' in result['output']
             jobs=[]
             for name in ('frontend','backend'):
-                jobs.append(await call('execute_command',{'command':sys.executable,'arguments':['-u','-c','import time;print("ready");time.sleep(30)'],'background':True,'name':name,'timeout':40}))
+                jobs.append(await call('execute_command',{'argv': [sys.executable, '-u','-c','import time;print("ready");time.sleep(30)'],'background':True,'name':name,'timeout':40}))
                 assert jobs[-1]['name'] == name
             assert len({job['id'] for job in jobs})==2
             listed=await call('manage_process',{'action':'list'})
@@ -253,7 +266,7 @@ def test_native_browser_forwards_allowed_websocket_and_blocks_other_origins(tmp_
                 {'action': 'wait_visible', 'selector': '[data-ready="true"]'},
                 {'action': 'assert_text', 'selector': '#hmr', 'value': 'hmr-ready'}]})
             assert good.get('passed'), good
-            assert Path(good['screenshot']).read_bytes().startswith(b'\x89PNG')
+            assert (tmp_path / good['screenshot']).read_bytes().startswith(b'\x89PNG')
             bad = await browser_verify.ainvoke({'url': url+'/blocked', 'actions': [
                 {'action': 'wait_visible', 'selector': '[data-closed="true"]'},
                 {'action': 'assert_text', 'selector': '#hmr', 'value': 'closed'}]})

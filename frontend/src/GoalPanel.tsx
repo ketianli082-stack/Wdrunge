@@ -4,6 +4,7 @@ export type Goal = {
   id: string; objective: string; criteria: string[]; state: string;
   conversation: string; reason: string; evidence: Record<string, string>;
   next_reminder_at: number; reminder_count: number; scale?: string | null;
+  requirements?: { document?: string; none?: string } | null;
 };
 const scaleLabels: Record<string, string> = { small: '小型', medium: '中型', large: '大型' };
 type Task = { id: string; goal_id?: string; state: string; summary?: string; goal?: string };
@@ -56,6 +57,8 @@ export default function GoalPanel({ goals, tasks, busy, command, act }: {
         <div><strong>{g.objective}</strong><span>{labels[g.state] || g.state}{g.scale ? ` · ${scaleLabels[g.scale] || g.scale}` : ''}</span></div>
         <p>任务验收 {completed} / {own.length} · 已提醒 {g.reminder_count} 次</p>
         {g.state === 'active' && <small>下次检查：{new Date(g.next_reminder_at * 1000).toLocaleString()}；需要处理时提醒。</small>}
+        {g.requirements?.document && <small>需求文档：{g.requirements.document}</small>}
+        {g.requirements?.none && <small>不写需求文档：{g.requirements.none}</small>}
         {g.reason && <p role="status">{g.reason}</p>}
         <ol>{g.criteria.map(c => <li key={c}>{c}{g.evidence[c] && <p>{g.evidence[c]}</p>}</li>)}</ol>
         {own.map(t => <a className="collaboration-document" key={t.id} href={`#request-${t.id}`}>{t.summary || t.goal || '查看任务'}</a>)}

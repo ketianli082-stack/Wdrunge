@@ -18,6 +18,8 @@ import shlex
 
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
 
+from app.agents.tools.arguments import call_argv
+
 READ_TOOLS = {
     'read_project_file', 'browse_directory', 'search_code', 'list_project_files', 'detect_environment',
     'recall_context', 'current_utc_time', 'read_external_file', 'enable_tools', 'get_goal',
@@ -131,7 +133,7 @@ def read_only_call(call: dict) -> bool:
     if name == 'manage_process':
         return args.get('action') in {'list', 'status', 'logs'}
     if name == 'execute_command' and not args.get('background'):
-        return read_only_argv([args.get('command') or '', *(args.get('arguments') or [])])
+        return read_only_argv(call_argv(args))
     return False
 
 

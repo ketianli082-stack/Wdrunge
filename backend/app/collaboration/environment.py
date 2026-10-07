@@ -151,6 +151,88 @@ def discover(root: str) -> list[dict]:
     return found
 
 
+# --- commands the project root must be able to run ---------------------------
+
+# The dependency folders the platform builds itself at the project root, in the
+# command's cwd, from that directory's manifests (processes.prepare_root).
+DEPENDENCY_FOLDERS = {'.venv': ('python', 'pyproject.toml or requirements.txt'),
+                      'node_modules': ('node', 'package.json')}
+# What a root installation reads; a change to any of them calls for a new check.
+INSTALL_INPUTS = ('pyproject.toml', 'requirements.txt', 'uv.lock', '.python-version', 'package.json',
+                  'package-lock.json', 'pnpm-lock.yaml', 'yarn.lock', 'bun.lock')
+
+
+def _manifest_dirs(workspace: Path, runtime: str) -> list[str]:
+    names = {'python': ('pyproject.toml', 'requirements.txt'), 'node': ('package.json',)}[runtime]
+    return sorted({str(path.parent.relative_to(workspace)) for path in _candidates(workspace) if path.name in names})[:5]
+
+
+def placement_problem(argv, cwd, workspace) -> str | None:
+    """Why a command that runs in `workspace` (a task snapshot) cannot run at the project
+    root once the task's files are merged, or None. Dependency folders and build output
+    are never merged; the root gets a .venv or node_modules only where the platform
+    installs one, in the command's cwd from a manifest there."""
+    from app.collaboration.workspaces import unmerged_reason
+    from app.execution.sandbox import resolve_executable
+    workspace = Path(workspace).resolve()
+    cwd = os.path.normpath(cwd or '.')
+    directory = workspace / cwd
+    executable = argv[0]
+    if Path(executable).is_absolute():
+        if Path(os.path.normpath(executable)).is_relative_to(workspace) or Path(executable).resolve().is_relative_to(workspace):
+            return (f'{executable} is an absolute path into your task snapshot, which does not exist at the project root. '
+                    f'Give the executable relative to cwd (e.g. ".venv/bin/python") or by name.')
+        return None
+    found = resolve_executable(executable, directory) if directory.is_dir() else None
+    if not found or not Path(os.path.abspath(found)).is_relative_to(workspace):
+        return None
+    relative = Path(os.path.abspath(found)).relative_to(workspace)
+    reason = unmerged_reason(relative.as_posix())
+    if not reason:
+        return None
+    for folder, (runtime, manifest) in DEPENDENCY_FOLDERS.items():
+        if folder not in relative.parts:
+            continue
+        index = relative.parts.index(folder)
+        owner = Path(*relative.parts[:index]).as_posix() if index else '.'
+        if owner == cwd and runtime in _runtimes(directory):
+            return None
+        where = '' if Path(executable) == relative else f' runs from {relative}, which is'
+        lead = (f'{executable}{where} inside {folder}/, which is never merged: the project root gets a {folder} only '
+                f'where the platform installs one, in the command\'s cwd from the {manifest} there. ')
+        if owner != cwd:
+            inner = Path(*relative.parts[index:]).as_posix()
+            return lead + (f'This {folder} is in "{owner}", not in cwd "{cwd}": register the command with cwd="{owner}" '
+                           f'and argv[0]="{inner}"' + ('' if runtime in _runtimes(workspace / owner) else
+                                                        f', and keep {manifest} in "{owner}"') + '.')
+        places = [place for place in _manifest_dirs(workspace, runtime) if place != cwd]
+        return lead + (f'cwd "{cwd}" has no {manifest}. Keep the manifest in the directory the command runs in'
+                       + (f' (found in: {", ".join(places)}; set cwd to that directory and create its {folder} there)' if places else '')
+                       + '.')
+    return (f'{executable} runs from {relative}: {reason}, so it does not exist at the project root after the merge and the '
+            'platform does not build it. Register a command that runs from merged source files or builds first.')
+
+
+def _runtimes(directory: Path) -> set:
+    from app.execution.environment import inspect_environment
+    try:
+        return {item['type'] for item in inspect_environment(directory)['runtimes']}
+    except (OSError, ValueError):
+        return set()
+
+
+def install_fingerprint(argv, cwd, workspace) -> str:
+    """Identifies what a root check of this command depends on: the command and the
+    installation inputs in its cwd."""
+    import hashlib
+    digest = hashlib.sha256(json.dumps([list(argv), os.path.normpath(cwd or '.')]).encode())
+    directory = Path(workspace) / (cwd or '.')
+    for name in INSTALL_INPUTS:
+        path = directory / name
+        digest.update(name.encode() + (path.read_bytes() if path.is_file() else b'-'))
+    return digest.hexdigest()[:24]
+
+
 async def service_runtime(root, service) -> dict:
     """Whether a registry service is serving now. `status: verified` only records that
     it once served; this is the live state."""
@@ -291,7 +373,7 @@ class EnvironmentMixin:
                 result = await processes.run(
                     command['argv'], cwd, 600, name='migrate', network=sandbox.capability().get('backend') != 'seatbelt',
                     reason='任务交付已合并：平台在项目根目录对项目数据库执行登记的迁移命令',
-                    platform='重放任务中已验证的登记迁移命令' if command.get('status') == 'verified' else None)
+                    platform='重放任务中已验证的登记迁移命令' if command.get('status') in {'verified', 'ran_in_task'} else None)
         except Exception as error:
             cause, result = f'{type(error).__name__}: {error}', {'exit_code': None, 'output': ''}
         finally:
@@ -345,10 +427,14 @@ class EnvironmentMixin:
         return None
 
     async def register_service(self, project, actor, name, kind='http', port=None, host='127.0.0.1', base_url=None,
-                               health_path=None, command=None, cwd='.', note=None, source=None):
-        """Create or update a service. Without a port, keep its port or allocate a free one."""
+                               health_path=None, argv=None, cwd='.', note=None, source=None, task=None, workspace=None):
+        """Create or update a service. Without a port, keep its port or allocate a free one.
+        `task`/`workspace`: the running task registering it and its snapshot, where the
+        start command is checked against what the project root will have."""
         if not SERVICE_NAME.match(name):
             raise ValueError('Service name must be 1-40 lowercase letters, digits, ".", "_" or "-"')
+        if argv and workspace and (problem := placement_problem(argv, cwd, workspace)):
+            raise ValueError(f'Service {name} not registered: {problem}')
         if kind not in KINDS:
             raise ValueError(f'kind must be one of {KINDS}')
         if connected := await self.connected_service(project, name, port):
@@ -381,8 +467,11 @@ class EnvironmentMixin:
                    'claimed': claimed, 'source': source if source == 'user' or not existing else existing.get('source', source),
                    'status': (existing or {}).get('status', 'declared') if existing and existing.get('port') == port else 'declared',
                    'updated': time.time(), 'updated_by': actor}
-        if command:
-            service['command'] = {'argv': list(command), 'cwd': cwd or '.'}
+        if argv:
+            service['command'] = {'argv': list(argv), 'cwd': cwd or '.'}
+            service.pop('root_checked', None)
+            if task:
+                service['task'] = task
         if note is not None:
             service['note'] = note[:300]
         service = {key: value for key, value in service.items() if value is not None}
@@ -433,17 +522,108 @@ class EnvironmentMixin:
             await self._put(c, 'service', project, service['name'], service)
         return service
 
-    async def register_command(self, project, actor, name, argv, cwd='.', purpose=None, verified=False):
+    async def register_command(self, project, actor, name, argv, cwd='.', purpose=None, verified=False, ran=False,
+                               task=None, workspace=None):
+        """Status: verified (ran at the project root, or its root installation was checked
+        when its task delivered), ran_in_task (ran successfully in a task snapshot only),
+        declared. `task`/`workspace` as in register_service."""
         if not SERVICE_NAME.match(name):
             raise ValueError('Command name must be 1-40 lowercase letters, digits, ".", "_" or "-"')
         if not argv or not all(isinstance(a, str) for a in argv):
             raise ValueError('argv must be a non-empty list of strings')
+        if workspace and (problem := placement_problem(argv, cwd, workspace)):
+            raise ValueError(f'Command {name} not registered: {problem}')
         record = {'name': name, 'argv': list(argv)[:40], 'cwd': cwd or '.', 'purpose': (purpose or '')[:200],
-                  'status': 'verified' if verified else 'declared', 'updated': time.time(), 'updated_by': actor}
+                  'status': 'verified' if verified else 'ran_in_task' if ran else 'declared',
+                  'updated': time.time(), 'updated_by': actor, **({'task': task} if task else {})}
         async with self.transaction() as c:
             await self._project(c, project)
             await self._put(c, 'command', project, name, record)
         return record
+
+    async def check_root_commands(self, project, request, root, work):
+        """Before a task's delivery merges: every command and service start command it
+        registered, and every service it keeps running, must be able to run at the project
+        root, where dependency folders and build output never arrive. Its dependencies are
+        installed the way the root gets them (processes.prepare_root) in a clean copy of
+        the snapshot without them, and the executable must then resolve. Raises
+        ValueError naming each problem; a check that passed is not repeated until the
+        command or the installation inputs in its cwd change."""
+        from app.collaboration.workspaces import project_runs
+        from app.execution.processes import processes
+        work = Path(work).resolve()
+        async with self.reading() as c:
+            commands = await self._list(c, 'command', project)
+            services = await self._list(c, 'service', project)
+        targets = [('command', item, item['argv'], item.get('cwd') or '.') for item in commands if item.get('task') == request['id']]
+        targets += [('service', item, item['command']['argv'], item['command'].get('cwd') or '.') for item in services
+                    if item.get('task') == request['id'] and item.get('command')]
+        for job in list(processes.jobs.values()):
+            if job.keep and job.process.returncode is None and Path(job.workspace) == work:
+                record = next((item for item in services if item['name'] == job.service), None)
+                targets.append(('service', record or {'name': job.service or job.name}, job.argv, os.path.relpath(job.cwd, work)))
+        pending, seen = [], set()
+        for kind, record, argv, cwd in targets:
+            cwd = os.path.normpath(cwd)
+            fingerprint = install_fingerprint(argv, cwd, work)
+            if (tuple(argv), cwd) in seen or record.get('root_checked') == fingerprint:
+                continue
+            seen.add((tuple(argv), cwd))
+            pending.append((kind, record, argv, cwd, fingerprint))
+        if not pending:
+            return
+        problems = [f"{kind} {record['name']} ({' '.join(argv)[:120]}, cwd {cwd}): {problem}"
+                    for kind, record, argv, cwd, _ in pending if (problem := placement_problem(argv, cwd, work))]
+        if not problems:
+            problems = await self._install_check(project_runs(root) / f"{request['workspace_id']}-check", work, pending)
+        if problems:
+            raise ValueError('Not merged: the project root could not run what this task registers or keeps running. '
+                             'Dependency folders (.venv, node_modules) and build output are never merged; the platform '
+                             'installs dependencies at the root from the manifests in each command\'s cwd. Checked in a '
+                             'clean copy of your snapshot without them:\n- ' + '\n- '.join(problems[:6])
+                             + '\nFix the manifests or the registration, then deliver again.')
+        async with self.transaction() as c:
+            for kind, record, _, _, fingerprint in pending:
+                stored = await self._get(c, kind, project, record['name'], False)
+                if stored:
+                    stored['root_checked'] = fingerprint
+                    if kind == 'command' and stored.get('status') != 'verified':
+                        stored['status'] = 'verified'
+                    await self._put(c, kind, project, record['name'], stored)
+
+    async def _install_check(self, clean, work, pending) -> list[str]:
+        import asyncio
+        import shutil
+        from types import SimpleNamespace
+        from app.agents.tools._workspace import active_workspace, source_workspace
+        from app.collaboration.workspaces import files
+        from app.execution.processes import processes
+        def copy():
+            shutil.rmtree(clean, ignore_errors=True)
+            for name, source in files(work).items():
+                target = clean / name
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(source, target)
+            clean.mkdir(parents=True, exist_ok=True)
+        await asyncio.to_thread(copy)
+        tokens = active_workspace.set(clean), source_workspace.set(clean)
+        problems = []
+        try:
+            for kind, record, argv, cwd, _ in pending:
+                if not (clean / cwd).is_dir():
+                    problems.append(f"{kind} {record['name']}: its cwd {cwd} has no delivered files")
+                    continue
+                try:
+                    problem = await processes.prepare_root(SimpleNamespace(argv=argv, cwd=str(work / cwd)), clean, cwd)
+                except Exception as error:
+                    problem = f'{type(error).__name__}: {error}'
+                if problem:
+                    problems.append(f"{kind} {record['name']} ({' '.join(argv)[:120]}, cwd {cwd}): {problem}")
+        finally:
+            source_workspace.reset(tokens[1])
+            active_workspace.reset(tokens[0])
+            await asyncio.to_thread(shutil.rmtree, clean, True)
+        return problems
 
     async def discover_services(self, project):
         """Add manifest-declared ports once; never override agent, user or verified entries."""

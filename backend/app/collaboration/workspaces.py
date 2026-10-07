@@ -24,7 +24,8 @@ MERGED_COPIES = f'{TASK_SCRATCH}/project-versions'
 # The project's runtime data (its SQLite database, uploads) lives in DATA_DIR at the
 # project root, shared by every task and never copied into a snapshot or merged.
 DATA_DIR = '.wdrunge-data'
-EXCLUDED = {'.git', '.wdrunge-runs', 'node_modules', '.venv', '__pycache__', '.pytest_cache', 'dist', 'target', '.env', '.aws', '.codex', '.agents',
+LEGACY_RUNS = '.wdrunge-runs'
+EXCLUDED = {'.git', LEGACY_RUNS, 'node_modules', '.venv', '__pycache__', '.pytest_cache', 'dist', 'target', '.env', '.aws', '.codex', '.agents',
             TASK_SCRATCH, DATA_DIR}
 # Live database files anywhere in the project: binary state that changes while a
 # service runs, so a three-way merge could only conflict or lose writes.
@@ -34,6 +35,28 @@ MAX_BYTES = 128 * 1024 * 1024
 # merges (sync) from different threads; one read-modify-write at a time.
 MANIFEST_LOCK = threading.Lock()
 MAX_FILES = 10000
+# Task snapshots live outside every project tree: tools that look upward for their
+# configuration (uv and pytest for pyproject.toml, Node for node_modules, tsconfig
+# "extends") must find the snapshot's files, never the project root's, which the
+# sandbox lets a command see but not read. Snapshots taken before this lived in
+# LEGACY_RUNS inside the project.
+
+
+def runs_root() -> Path:
+    """Where task snapshots are kept: WDRUNGE_RUNS_DIR, or a folder beside (not inside)
+    the application data, which project commands and file tools may never touch."""
+    configured = os.environ.get('WDRUNGE_RUNS_DIR')
+    if configured:
+        return Path(configured).expanduser().resolve()
+    from platformdirs import user_data_path
+    return user_data_path('Wdrunge', 'Wdrunge').resolve().with_name('Wdrunge Runs')
+
+
+def project_runs(source) -> Path:
+    """The snapshots folder of one project, named after it for people browsing the disk."""
+    source = Path(source).resolve()
+    name = re.sub(r'[^A-Za-z0-9_-]+', '-', source.name).strip('-')[:40] or 'project'
+    return runs_root() / f"{name}-{hashlib.sha256(str(source).encode()).hexdigest()[:12]}"
 
 
 def save_json(path, value):
@@ -158,15 +181,26 @@ class IsolatedWorkspace:
         self.source = Path(source).resolve()
         if not instance.isalnum():
             raise ValueError('Invalid workspace instance')
-        self.root = self.source/'.wdrunge-runs'/instance
-        if (self.source/'.wdrunge-runs').is_symlink() or self.root.is_symlink():
+        self.root = project_runs(self.source)/instance
+        # A snapshot taken inside the project before snapshots moved out of it; prepare()
+        # moves it out when its task runs again.
+        self.legacy = self.source/LEGACY_RUNS/instance
+        if not (self.root/'manifest.json').exists() and (self.legacy/'manifest.json').exists():
+            self.root = self.legacy
+        elif self.root.is_relative_to(self.source):
+            raise ValueError(f'Task snapshots ({runs_root()}) must be outside the project; set WDRUNGE_RUNS_DIR elsewhere')
+        if (self.source/LEGACY_RUNS).is_symlink() or self.root.is_symlink():
             raise ValueError('Run workspace must not be a symlink')
         self.base = self.root/'base'
         self.work = self.root/'work'
         self.manifest_path = self.root/'manifest.json'
 
-    def prepare(self):
+    def prepare(self, relocate=True):
+        """`relocate`: move a legacy snapshot out of the project (false while a process
+        still runs from it)."""
         if self.manifest_path.exists():
+            if relocate and self.root == self.legacy:
+                self.relocate()
             return self.work
         if self.base.exists() or self.work.exists():
             raise StorageConflictError('Incomplete snapshot retained for inspection; create a fresh request workspace')
@@ -193,6 +227,18 @@ class IsolatedWorkspace:
         # tools reject writes through links outside the isolated workspace.
         save_json(self.manifest_path, manifest)
         return self.work
+
+    def relocate(self):
+        target = project_runs(self.source)/self.legacy.name
+        if target.exists():
+            return
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(self.legacy), str(target))
+        self.root, self.base, self.work, self.manifest_path = target, target/'base', target/'work', target/'manifest.json'
+        try:
+            (self.source/LEGACY_RUNS).rmdir()
+        except OSError:
+            pass  # other legacy snapshots remain
 
     def plan(self, managed_paths=()):
         manifest = json.loads(self.manifest_path.read_text())

@@ -38,7 +38,7 @@ export default function EnvironmentPanel({ busy, command, stopService, act }: {
   const save = () => void act(async () => {
     await command('register_service', {
       name: name.trim(), ...(port.trim() ? { port: Number(port) } : {}),
-      ...(start.trim() ? { command: start.trim().split(/\s+/), cwd: cwd.trim() || '.' } : {}),
+      ...(start.trim() ? { argv: start.trim().split(/\s+/), cwd: cwd.trim() || '.' } : {}),
     });
     setName(''); setPort(''); setStart(''); setCwd('.');
     await load();

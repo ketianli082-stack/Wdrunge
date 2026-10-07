@@ -23,8 +23,10 @@ def check_evidence(criteria, evidence):
 
 
 class GoalMixin:
-    async def create_goal(self, project, actor, conversation, objective, criteria, key, reminder_seconds=180, scale=None):
-        from app.collaboration.planning import check_criteria_budget, check_scale
+    async def create_goal(self, project, actor, conversation, objective, criteria, key, reminder_seconds=180, scale=None,
+                          requirements=None):
+        from app.collaboration.planning import check_criteria_budget, check_requirements, check_scale
+        requirements = check_requirements(requirements)
         if actor != 'leader':
             raise ValueError('Only Leader may create goals')
         criteria_list(criteria)
@@ -42,10 +44,13 @@ class GoalMixin:
                 from uuid import uuid4
                 await self._put(c, 'conversation_run', project, conversation, dict(state='active', generation=uuid4().hex, activated=time.time()))
             identifier = f'{conversation}:{key}'
-            spec = dict(objective=objective, criteria=criteria, conversation=conversation, reminder_seconds=reminder_seconds, scale=scale)
+            spec = dict(objective=objective, criteria=criteria, conversation=conversation, reminder_seconds=reminder_seconds, scale=scale,
+                        requirements=requirements)
+            if requirements and requirements.get('document'):
+                self._path((await self._project(c, project))['workspace_path'], requirements['document'])
             old = await self._get(c, 'goal', project, identifier, False)
             if old:
-                if {**old['spec'], 'scale': old['spec'].get('scale')} != spec:
+                if {**old['spec'], 'scale': old['spec'].get('scale'), 'requirements': old['spec'].get('requirements')} != spec:
                     raise StorageConflictError('Idempotency key was used for another goal')
                 return old
             goals = await self._list(c, 'goal', project)
@@ -172,7 +177,14 @@ class GoalMixin:
                 await self._put(c, 'goal', project, goal['id'], goal)
 
     async def goal_reminder(self, project, conversation, request=None):
-        """Fresh bounded state; no stale transcript or completion claims from summaries."""
+        """The goal as it stands, for the model's context: its state, objective, criteria
+        and, for an assignee, its own task. It is stored in the context once and again
+        only when it changes (reminders.with_goal_state), so it holds nothing that moves
+        with ordinary progress. It used to carry counts of tasks per state: every
+        create_task and every colleague's start or delivery changed them, and a new copy
+        followed each model call (Blog6: 14 copies in a Leader turn of 18 calls). Task
+        states reach the Leader through events and the coordination update; get_goal
+        returns the counts."""
         async with self.reading() as c:
             goals = [g for g in await self._list(c, 'goal', project) if g['conversation'] == conversation and g['state'] not in {'completed','cancelled'}]
             tasks = await self._list(c, 'request', project)
@@ -183,10 +195,8 @@ class GoalMixin:
                 return ''
             snapshots = []
             for g in goals:
-                own = [r for r in tasks if r.get('goal_id') == g['id']]
                 # Exact criteria remain accessible via get_goal; no truncated JSON.
-                item = dict(id=g['id'], state=g['state'], objective=g['objective'][:600], criteria=g['criteria'], reason=g['reason'][:300],
-                            task_counts={s:sum(r['state']==s for r in own) for s in sorted({r['state'] for r in own})})
+                item = dict(id=g['id'], state=g['state'], objective=g['objective'][:600], criteria=g['criteria'], reason=g['reason'][:300])
                 if current:
                     item['current_task'] = {k:current.get(k) for k in ('id','state','acceptance_criteria','dependencies')}
                 snapshots.append(item)

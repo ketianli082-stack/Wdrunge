@@ -166,10 +166,10 @@ def test_background_defaults_and_explicit_network_choice(monkeypatch):
     monkeypatch.setattr(development.processes, 'logs', lambda job, offset=0, limit=0: {'output': ''})
     monkeypatch.setattr(development, 'STARTUP_GRACE', .01)
     async def scenario():
-        await development.execute_command.ainvoke({'command': 'npm', 'arguments': ['run', 'dev'], 'background': True})
-        await development.execute_command.ainvoke({'command': 'npm', 'arguments': ['run', 'dev'], 'background': True, 'network': False, 'timeout': 60})
-        await development.execute_command.ainvoke({'command': 'curl', 'arguments': ['http://localhost:5173/']})
-        await development.execute_command.ainvoke({'command': 'pytest', 'arguments': []})
+        await development.execute_command.ainvoke({'argv': ['npm', 'run', 'dev'], 'background': True})
+        await development.execute_command.ainvoke({'argv': ['npm', 'run', 'dev'], 'background': True, 'network': False, 'timeout': 60})
+        await development.execute_command.ainvoke({'argv': ['curl', 'http://localhost:5173/']})
+        await development.execute_command.ainvoke({'argv': ['pytest']})
     asyncio.run(scenario())
     assert calls == [(1800, True), (60, False), (120, True), (120, False)]
 
@@ -183,7 +183,7 @@ def test_a_socket_the_sandbox_denied_is_explained_even_on_an_expected_exit(monke
         return {'exit_code': 1, 'output': next(outputs)}
     monkeypatch.setattr(development.processes, 'run', run)
     async def scenario():
-        call = {'command': 'python3', 'arguments': ['tests/e2e.py'], 'ok_exit_codes': [1]}
+        call = {'argv': ['python3', 'tests/e2e.py'], 'ok_exit_codes': [1]}
         return [await development.execute_command.ainvoke(call) for _ in range(3)]
     python, node, files = asyncio.run(scenario())
     assert 'network=true' in python['warning'] and 'network=true' in node['warning']
@@ -221,14 +221,14 @@ def in_workspace(tmp_path, manager, body):
 
 def test_expected_exit_codes_are_not_failures(tmp_path, real_processes):
     async def body():
-        probe = {'command': sys.executable, 'arguments': ['-c', 'raise SystemExit(7)']}
+        probe = {'argv': [sys.executable, '-c', 'raise SystemExit(7)']}
         failed = await development.execute_command.ainvoke(probe)
         assert tool_result_failed(failed) and failed['exit_code'] == 7
         expected = await development.execute_command.ainvoke({**probe, 'ok_exit_codes': [7]})
         assert not tool_result_failed(expected) and expected['exit_code'] == 7
         # A probe expecting a closed port (7) still succeeds when the port answers (0).
         answered = await development.execute_command.ainvoke(
-            {'command': sys.executable, 'arguments': ['-c', 'pass'], 'ok_exit_codes': [7]})
+            {'argv': [sys.executable, '-c', 'pass'], 'ok_exit_codes': [7]})
         assert not tool_result_failed(answered) and answered['exit_code'] == 0
     in_workspace(tmp_path, real_processes, body)
 
@@ -237,7 +237,7 @@ def test_background_crash_during_startup_is_reported_with_its_cause(tmp_path, re
     script = "import sys; print('cannot bind 0.0.0.0:8765: [Errno 1] Operation not permitted'); sys.exit(1)"
     async def body():
         result = await development.execute_command.ainvoke(
-            {'command': sys.executable, 'arguments': ['-c', script], 'background': True, 'name': 'api'})
+            {'argv': [sys.executable, '-c', script], 'background': True, 'name': 'api'})
         assert tool_result_failed(result) and result['exit_code'] == 1
         assert result['error_details']['code'] == 'os_permission_denied'
         assert 'Operation not permitted' in result['output']
@@ -247,27 +247,27 @@ def test_background_crash_during_startup_is_reported_with_its_cause(tmp_path, re
 def test_ready_port_waits_for_service_and_rejects_taken_ports(tmp_path, real_processes):
     port = free_port()
     async def body():
-        started = await development.execute_command.ainvoke({'command': sys.executable, 'background': True, 'name': 'web',
-            'arguments': ['-m', 'http.server', '--bind', '127.0.0.1', str(port)], 'ready_port': port})
+        started = await development.execute_command.ainvoke({'background': True, 'name': 'web',
+            'argv': [sys.executable, '-m', 'http.server', '--bind', '127.0.0.1', str(port)], 'ready_port': port})
         assert started['ready'] is True and started['state'] == 'running' and 'error' not in started
         assert real_processes.jobs[started['id']].ports == {port}
-        await development.execute_command.ainvoke({'command': sys.executable, 'arguments': ['-c', 'pass']})
+        await development.execute_command.ainvoke({'argv': [sys.executable, '-c', 'pass']})
         listed = await development.manage_process.ainvoke({'action': 'list'})
         assert listed['processes'][0]['ports'] == [port]
         assert [p['name'] for p in listed['processes']] == ['web'] and listed['finished_commands'] == 1
-        quiet = await development.execute_command.ainvoke({'command': sys.executable, 'background': True,
-            'arguments': ['-c', 'pass'], 'ready_port': free_port()})
+        quiet = await development.execute_command.ainvoke({'background': True,
+            'argv': [sys.executable, '-c', 'pass'], 'ready_port': free_port()})
         assert tool_result_failed(quiet) and quiet['error_details']['code'] == 'service_not_ready'
         with pytest.raises(ToolFailure, match=f'Port {port} already accepts connections'):
-            await development.execute_command.ainvoke({'command': sys.executable, 'background': True,
-                'arguments': ['-m', 'http.server', str(port)], 'ready_port': port})
+            await development.execute_command.ainvoke({'background': True,
+                'argv': [sys.executable, '-m', 'http.server', str(port)], 'ready_port': port})
     in_workspace(tmp_path, real_processes, body)
 
 
 def test_processes_can_be_managed_by_name(tmp_path, real_processes):
     async def body():
-        await development.execute_command.ainvoke({'command': sys.executable, 'background': True, 'name': 'api',
-                                                   'arguments': ['-c', 'print("up", flush=True); import time; time.sleep(30)']})
+        await development.execute_command.ainvoke({'background': True, 'name': 'api',
+                                                   'argv': [sys.executable, '-c', 'print("up", flush=True); import time; time.sleep(30)']})
         logs = await development.manage_process.ainvoke({'action': 'logs', 'process_id': 'api'})
         assert logs['name'] == 'api' and 'up' in logs['output']
         with pytest.raises(ValueError, match=r'13c39d.*\(api, running\)'):

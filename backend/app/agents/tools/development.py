@@ -7,7 +7,7 @@ import shutil
 from typing import Annotated, Literal
 from pydantic import Field
 
-from app.agents.tools.validation import tool, ToolFailure, failure_result, command_failure
+from app.agents.tools.validation import tool, ToolFailure, failure_result, command_failure, present
 from app.agents.context_policy import RECOMPUTABLE
 from app.agents.tools._workspace import resolve_allowed, workspace_root
 from app.execution.processes import processes, port_open
@@ -151,20 +151,38 @@ async def register_observed(job, ports):
     return registered
 
 
-@tool(context_policy=RECOMPUTABLE)
-async def execute_command(command: str, arguments: list[str], cwd: str = '.',
-                          timeout: Annotated[int | None, Field(ge=1, le=1800)] = None,
-                          background: bool = False, name: str = 'command',
-                          network: bool | None = None, reason: str = '',
-                          ok_exit_codes: Annotated[list[int] | None, Field(max_length=10)] = None,
-                          ready_port: Annotated[int | None, Field(ge=1, le=65535)] = None,
-                          keep_running: bool = False) -> dict:
-    """Run an executable with arguments (string array) in cwd; no shell. Foreground
-    returns exit code and output (timeout default 120 s, max 600). background=true
-    starts a service (lifetime up to 1800 s) and returns a process ID; ready_port
-    waits for its port. keep_running=true replaces a running copy; services a task
-    declares stay running after delivery. network: omitted = automatic for services and loopback-only URLs.
-    ok_exit_codes lists expected non-zero exits. Reviewed and sandboxed.
+def command_view(result: dict, arguments: dict) -> dict:
+    """What the model acts on: the exit code and the output; for a service also what
+    identifies it (manage_process takes the ID or name) and what it serves. Not the
+    argv and cwd it just wrote (returned as absolute paths inside the task snapshot,
+    which then leaked into registered commands), nor fields at their default."""
+    shown = {key: result[key] for key in ('exit_code',) if result.get(key) is not None}
+    if arguments.get('background'):
+        shown = {**present(result, 'id', 'name', 'state'), **shown, **present(result, 'ready', 'ports', 'replaced_process', 'kept')}
+        if result.get('registered_services'):
+            shown['registered_services'] = [present(s, 'name', 'port', 'url') for s in result['registered_services']]
+    shown['output'] = result.get('output', '')
+    if result.get('truncated'):
+        shown.update(truncated=True, **present(result, 'next_offset'))
+    return {**shown, **present(result, 'timed_out', 'output_truncated', 'full_log', 'warning')}
+
+
+@tool(context_policy=RECOMPUTABLE, model_view=command_view)
+async def execute_command(argv: Annotated[list[Annotated[str, Field(max_length=20000)]], Field(min_length=1, description=
+                              'The command as an array: the executable, then each argument, e.g. ["uv", "sync"] or '
+                              '["npm", "run", "build"]. No shell; for pipes or && use ["sh", "-c", "<command line>"]')],
+                          cwd: Annotated[str, Field(description='Project-relative directory to run in, e.g. "frontend"')] = '.',
+                          timeout: Annotated[int | None, Field(ge=1, le=1800, description='Seconds; foreground default 120, max 600')] = None,
+                          background: Annotated[bool, Field(description='true starts a service and returns at once')] = False,
+                          name: Annotated[str, Field(description='Name of a background service, e.g. "api"')] = 'command',
+                          network: Annotated[bool | None, Field(description='true to reach hosts other than this machine')] = None,
+                          reason: str = '',
+                          ok_exit_codes: Annotated[list[int] | None, Field(max_length=10, description='Expected non-zero exit codes, e.g. [1] for a grep without matches')] = None,
+                          ready_port: Annotated[int | None, Field(ge=1, le=65535, description='With background: wait until this port accepts connections')] = None,
+                          keep_running: Annotated[bool, Field(description='With background: replace a running copy of the service')] = False) -> dict:
+    """Run one command (no shell) and return its exit code and output. With
+    background=true it starts a service and returns its process ID; services a task
+    declares stay running after delivery. Reviewed and sandboxed.
     """
     if not background and timeout is not None and timeout > 600:
         raise ValueError('Foreground timeout cannot exceed 600 seconds; use background=true for longer commands')
@@ -172,7 +190,7 @@ async def execute_command(command: str, arguments: list[str], cwd: str = '.',
         raise ValueError('ready_port applies to background=true services')
     if keep_running and not background:
         raise ValueError('keep_running applies to background=true services')
-    argv = [command, *arguments]
+    argv = list(argv)
     if network is None:
         network = automatic_network(argv, background)
     timeout = timeout or (1800 if background else 120)

@@ -234,7 +234,9 @@ def task_created(path, workspace) -> bool | None:
     task snapshot, where there is no such record."""
     workspace = Path(workspace)
     manifest = workspace.parent / 'manifest.json'
-    if workspace.name != 'work' or workspace.parent.parent.name != '.wdrunge-runs' or not manifest.is_file():
+    from app.collaboration.workspaces import LEGACY_RUNS, runs_root
+    snapshot = workspace.resolve().is_relative_to(runs_root()) or workspace.parent.parent.name == LEGACY_RUNS
+    if workspace.name != 'work' or not snapshot or not manifest.is_file():
         return None
     try:
         relative = Path(path).resolve().relative_to(workspace.resolve()).as_posix()

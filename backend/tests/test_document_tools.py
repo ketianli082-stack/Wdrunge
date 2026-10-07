@@ -260,3 +260,37 @@ def test_worker_rebuilds_tools_when_persistence_context_changes(monkeypatch):
         assert 'collaboration_wait' in bound[2]
     finally:
         active.reset(token)
+
+
+def test_a_section_reads_with_its_subsections_in_one_call(tmp_path):
+    """Blog5: 78 of 108 document reads were per-section; a parent's body excludes its
+    children, so one module took an outline read plus one read per requirement."""
+    import asyncio
+    from app.collaboration.service import Collaboration
+    from app.storage import ChatStore
+
+    async def run():
+        workspace = tmp_path / 'workspace'
+        workspace.mkdir()
+        store = ChatStore(f'sqlite+aiosqlite:///{tmp_path}/subtree.db')
+        project = (await store.create_project('Subtree', str(workspace)))['id']
+        s = Collaboration(store)
+        await s.initialize()
+        body = '概述\n\n# 登录\n\n模块说明\n\n## 需求1：登录\n\n输入密码\n\n## 验收标准\n\n- 能登录\n\n# 文章\n\n## 需求1：发布\n\n写文章\n'
+        document = (await s.publish(project, 'product', [{'path': 'docs/product/requirements.md', 'base_version': 0,
+                                                          'summary': '需求', 'content': body}]))[0]['document_id']
+        module = next(h for h in (await s.read(project, document))['outline'] if h['title'] == '登录')
+        direct = await s.read(project, document, section_id=module['id'])
+        assert direct['content'].strip() == '模块说明' and 'sections' not in direct
+        whole = await s.read(project, document, section_id=module['id'], subtree=True)
+        assert '输入密码' in whole['content'] and '- 能登录' in whole['content'] and '写文章' not in whole['content']
+        assert [h['title'] for h in whole['sections']] == ['登录', '需求1：登录', '验收标准']
+        with pytest.raises(ValueError, match='section_id'):
+            await s.read(project, document, subtree=True)
+        # The path works where the ID is expected; an unknown name lists what exists.
+        by_path = await s.read(project, './docs/product/requirements.md', section_id=module['id'], subtree=True)
+        assert by_path['document_id'] == document and by_path['content'] == whole['content']
+        with pytest.raises(LookupError, match=rf'No managed document .*docs/product/requirements.md \(document_id={document}\)'):
+            await s.read(project, 'docs/requirements.md')
+        await store.close()
+    asyncio.run(run())

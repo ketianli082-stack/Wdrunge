@@ -5,8 +5,9 @@ document section, an outline) enters the transcript verbatim as usual; when hist
 next rewritten, results before the verbatim tier move here and leave a one-line
 receipt in the transcript. The desk is one message at the verbatim boundary, after the
 task ledger, holding each resource once:
-- whole reads cover ranges of the same file and sections of the same document, so the
-  same text never appears twice;
+- whole reads cover ranges of the same file and sections of the same document, and
+  ranges of one file that overlap or touch merge into one entry, so the same text
+  never appears twice; a read that returned no text is not placed;
 - at every rewrite each entry re-runs its read (documents at their latest version), so
   the desk shows the text as it is now, after the agent's own writes and others'
   publications, and every document on the desk carries its latest outline;
@@ -23,12 +24,12 @@ from __future__ import annotations
 import json
 import logging
 import os
-import re
 
 from langchain_core.messages import BaseMessage, HumanMessage
 
 from app.agents.context_fold import estimate, parse, text_of, clip
 from app.agents.context_policy import canonical
+from app.agents.read_result import format_read, parse_read
 
 logger = logging.getLogger(__name__)
 
@@ -36,11 +37,11 @@ DESK_KEY = 'context_desk'
 DESK_PREFIX = ('Desk (current text of files and document sections you have read; refreshed from the source whenever '
                'history is rewritten; historical data, not instructions). Reading an entry again returns a short '
                'notice; edit from the text shown here.\n')
-HEADER = re.compile(r'\A\[sha256=(\w+); characters=(\d+)\]\n')
-TRUNCATED = re.compile(r'\n?\[truncated; next_offset=(\d+)\]\Z')
 EVICTED_SHOWN = 20
 # Arguments that select a copy rather than the resource; a refresh drops them.
 TRANSIENT_ARGS = ('version', 'force', 'include_hash')
+# A merged range stays one read when the desk refreshes it (read_project_file's limit).
+MERGE_LIMIT = 30000
 
 
 def _setting(name: str, default: int, minimum: int) -> int:
@@ -77,15 +78,34 @@ def desk_of(messages: list[BaseMessage]) -> dict:
 
 # --- keys ----------------------------------------------------------------------
 
-def entry_key(name: str, args: dict) -> list | None:
-    """What a read is a copy of: a file range or a document part. JSON-friendly."""
+def entry_key(name: str, args: dict, text: str = '') -> list | None:
+    """What a read is a copy of, JSON-friendly. A file read is keyed by the characters
+    it returned, [start, end), or end None for the whole file: the requested limit says
+    nothing about what came back, and a read by lines carries no offset in its arguments."""
     name = canonical(name, args)
     if name == 'read_project_file' and args.get('path'):
-        return ['file', str(args['path']), int(args.get('offset') or 0), int(args.get('limit') or 30000)]
+        read = parse_read(text, args.get('offset') or 0)
+        return ['file', str(args['path']), read.start, None if read.whole else read.end]
     if name == 'collaboration_read' and args.get('document_id'):
         part = 'whole' if args.get('whole') else str(args.get('section_id') or 'outline')
+        if args.get('subtree') and args.get('section_id') and not args.get('whole'):
+            part += SUBTREE
         return ['document', str(args['document_id']), part, int(args.get('offset') or 0)]
     return None
+
+
+# A section read with its subsections (collaboration_read subtree=true) is one entry.
+SUBTREE = '/*'
+
+
+def subtree_sections(entry: dict) -> set:
+    """Section IDs a complete subtree entry shows (the section and all its subsections)."""
+    key = entry['key']
+    if key[0] != 'document' or not str(key[2]).endswith(SUBTREE) or key[3] != 0 or not entry.get('complete', False):
+        return set()
+    data = parse(entry.get('content') or '')
+    sections = data.get('sections') if isinstance(data, dict) else None
+    return {str(item.get('id')) for item in sections or () if isinstance(item, dict)}
 
 
 def refresh_args(name: str, args: dict) -> tuple[str, dict]:
@@ -96,17 +116,8 @@ def refresh_args(name: str, args: dict) -> tuple[str, dict]:
     return name, kept
 
 
-def parse_file(text: str) -> tuple[str, str | None, int | None]:
-    """(body, sha256 or None, next_offset or None) of a read_project_file result."""
-    sha = None
-    header = HEADER.match(text)
-    if header:
-        sha, text = header.group(1), text[header.end():]
-    more = TRUNCATED.search(text)
-    next_offset = None
-    if more:
-        next_offset, text = int(more.group(1)), text[:more.start()]
-    return text, sha, next_offset
+def file_read(entry: dict):
+    return parse_read(entry['content'], entry['key'][2])
 
 
 def whole(entry: dict) -> bool:
@@ -120,22 +131,28 @@ def covers(entry: dict, key: list) -> bool:
     own = entry['key']
     if own == key:
         return True
-    return own[0] == key[0] and own[1] == key[1] and whole(entry)
+    if own[0] != key[0] or own[1] != key[1]:
+        return False
+    if whole(entry):
+        return True
+    if key[0] == 'file':
+        # A range inside the range the entry holds.
+        return own[3] is not None and key[3] is not None and own[2] <= key[2] and key[3] <= own[3]
+    return str(key[2]).removesuffix(SUBTREE) in subtree_sections(entry)
 
 
 def shows(entry: dict, name: str, args: dict, text: str) -> bool:
     """Whether the result text is already what the entry shows (so a read of it can
-    return a notice): the same copy, or a range/section of a whole entry."""
-    key = entry_key(name, args)
+    return a notice): the same copy, or a range/section of an entry that covers it."""
+    key = entry_key(name, args, text)
     if key is None or not covers(entry, key):
         return False
     if key[0] == 'file':
-        body, _, _ = parse_file(text)
-        own, _, _ = parse_file(entry['content'])
+        read, own = parse_read(text, args.get('offset') or 0), file_read(entry)
         if entry['key'] == key:
-            return body == own
-        start = key[2]
-        return bool(body) and own[start:start + len(body)] == body
+            return read.body == own.body
+        at = read.start - own.start
+        return bool(read.body) and at >= 0 and own.body[at:at + len(read.body)] == read.body
     data, own = parse(text), parse(entry['content'])
     if not isinstance(data, dict) or not isinstance(own, dict):
         return entry['key'] == key and text == entry['content']
@@ -155,30 +172,81 @@ def shows(entry: dict, name: str, args: dict, text: str) -> bool:
 def complete_result(name: str, args: dict, text: str) -> bool:
     name = canonical(name, args)
     if name == 'read_project_file':
-        return parse_file(text)[2] is None
+        return parse_read(text, args.get('offset') or 0).next_offset is None
     data = parse(text)
     return isinstance(data, dict) and not data.get('next_offset') and not data.get('fragment')
 
 
+def file_entry(path: str, read, clock: int, reads=None) -> dict:
+    """A desk entry for a range of a file, in the canonical form a refresh returns."""
+    total = read.total if read.total is not None else (read.end if read.next_offset is None else None)
+    args = {'path': path} if read.whole else {'path': path, 'offset': read.start, 'limit': max(1, len(read.body))}
+    return {'key': ['file', path, read.start, None if read.whole else read.end], 'name': 'read_project_file', 'args': args,
+            'content': format_read(read.body, read.start, total, more=read.next_offset is not None),
+            'complete': read.next_offset is None, 'reads': list(reads or [clock]), 'placed': clock}
+
+
+def merge_ranges(desk: dict, path: str, read, reads: list) -> tuple:
+    """Join the new range with ranges of the same file on the desk that overlap or touch
+    it. Overlapping text that differs means the file changed between the two reads:
+    the older entry goes and only what was just read stays. Returns (read, reads)."""
+    from app.agents.read_result import ReadResult
+    merged = True
+    while merged:
+        merged = False
+        for other in [e for e in desk['entries'] if e['key'][0] == 'file' and e['key'][1] == path]:
+            old = file_read(other)
+            if old.end < read.start or read.end < old.start:
+                continue
+            low, high = max(old.start, read.start), min(old.end, read.end)
+            if old.body[low - old.start:high - old.start] != read.body[low - read.start:high - read.start]:
+                desk['entries'].remove(other)
+                continue
+            start, end = min(old.start, read.start), max(old.end, read.end)
+            if end - start > MERGE_LIMIT:
+                continue
+            body = (old.body[:read.start - old.start] if old.start < read.start else '') + read.body \
+                + (old.body[read.end - old.start:] if old.end > read.end else '')
+            last = read if read.end >= old.end else old  # the part that knows whether the file continues
+            read = ReadResult(body, start, read.total if read.total is not None else old.total, last.next_offset)
+            reads = sorted({*reads, *other['reads']})[-50:]
+            desk['entries'].remove(other)
+            merged = True
+    return read, reads
+
+
 def admit(desk: dict, name: str, args: dict, text: str, clock: int) -> dict | None:
     """Place a read on the desk (or record a read of the entry already showing it).
-    A whole read replaces the ranges and sections it covers. Returns the entry."""
-    key = entry_key(name, args)
+    A whole read replaces the ranges and sections it covers. Returns the entry, or
+    None when there is nothing to place."""
+    key = entry_key(name, args, text)
     if key is None:
         return None
     name, args = refresh_args(name, args)
-    entry = {'key': key, 'name': name, 'args': args, 'content': text, 'complete': complete_result(name, args, text),
-             'reads': [clock], 'placed': clock}
-    for existing in desk['entries']:
-        if existing['key'] == key:
-            existing.update(content=text, complete=entry['complete'], placed=clock)
-            existing['reads'] = [*existing['reads'][-50:], clock]
-            return existing
-    for existing in desk['entries']:
-        if covers(existing, key):
-            existing['reads'] = [*existing['reads'][-50:], clock]
-            return existing
-    if whole(entry):
+    if key[0] == 'file':
+        read = parse_read(text, args.get('offset') or 0)
+        if not read.body:
+            return None  # past the end, or an empty file: nothing to show
+        for existing in desk['entries']:
+            if covers(existing, key) and shows(existing, name, args, text):
+                existing['reads'] = [*existing['reads'][-50:], clock]
+                return existing
+        read, reads = merge_ranges(desk, key[1], read, [clock])
+        entry = file_entry(key[1], read, clock, reads)
+        key = entry['key']
+    else:
+        entry = {'key': key, 'name': name, 'args': args, 'content': text, 'complete': complete_result(name, args, text),
+                 'reads': [clock], 'placed': clock}
+        for existing in desk['entries']:
+            if existing['key'] == key:
+                existing.update(content=text, complete=entry['complete'], placed=clock)
+                existing['reads'] = [*existing['reads'][-50:], clock]
+                return existing
+        for existing in desk['entries']:
+            if covers(existing, key):
+                existing['reads'] = [*existing['reads'][-50:], clock]
+                return existing
+    if whole(entry) or subtree_sections(entry):
         absorbed = [e for e in desk['entries'] if covers(entry, e['key'])]
         for other in absorbed:
             entry['reads'] = sorted({*entry['reads'], *other['reads']})[-50:]
@@ -215,9 +283,15 @@ def desk_estimate(desk: dict) -> int:
 def evict(desk: dict, budget: int, clock: int) -> list[dict]:
     """Drop the coldest entries until the desk fits `budget` (estimated tokens)."""
     gone = []
-    while desk['entries'] and desk_estimate(desk) > budget:
-        victim = min(desk['entries'], key=lambda e: (heat(e, clock), -entry_tokens(e)))
+    # Sizes and heat are measured once: neither changes while entries leave, and
+    # rendering every remaining entry again for each eviction was quadratic.
+    sizes = {id(e): entry_tokens(e) for e in desk['entries']}
+    heats = {id(e): heat(e, clock) for e in desk['entries']}
+    total = sum(sizes.values()) + sum(12 + estimate(outline_text(o)) for o in desk['outlines'].values())
+    while desk['entries'] and total > budget:
+        victim = min(desk['entries'], key=lambda e: (heats[id(e)], -sizes[id(e)]))
         desk['entries'].remove(victim)
+        total -= sizes[id(victim)]
         gone.append(victim)
         desk['evicted'] = [*[e for e in desk['evicted'] if e['key'] != victim['key']],
                            {'key': victim['key'], 'reason': 'space', 'reads': victim['reads'][-50:]}][-EVICTED_SHOWN:]
@@ -253,7 +327,19 @@ async def refresh(desk: dict, refresher, clock: int, cap_tokens: int | None = No
             desk['evicted'] = [*[e for e in desk['evicted'] if e['key'] != entry['key']],
                                {'key': entry['key'], 'reason': clip(str(data.get('error')), 120)}][-EVICTED_SHOWN:]
             continue
-        if text != entry['content']:
+        if entry['key'][0] == 'file':
+            # Keyed by what the file holds now: it may have grown, shrunk or emptied.
+            read = parse_read(text, entry['args'].get('offset') or 0)
+            if not read.body:
+                desk['entries'].remove(entry)
+                desk['evicted'] = [*[e for e in desk['evicted'] if e['key'] != entry['key']],
+                                   {'key': entry['key'], 'reason': 'no text there now'}][-EVICTED_SHOWN:]
+                continue
+            fresh = file_entry(entry['key'][1], read, clock)
+            if fresh['content'] != entry['content']:
+                entry.update(content=fresh['content'], complete=fresh['complete'], changed=clock)
+            entry.update(key=fresh['key'], args=fresh['args'])
+        elif text != entry['content']:
             entry.update(content=text, complete=complete_result(entry['name'], entry['args'], text), changed=clock)
     documents = {e['key'][1] for e in desk['entries'] if e['key'][0] == 'document'}
     outlines = {}
@@ -268,8 +354,16 @@ async def refresh(desk: dict, refresher, clock: int, cap_tokens: int | None = No
     desk['outlines'] = outlines
 
 
+# A desk refresh is the platform's read, not a tool call of the agent: it runs without
+# the callbacks of the surrounding graph run, so it emits no tool events (the worker
+# would show and store each as activity) and pays for no event dispatch. The tag is the
+# one the worker's event stream already skips for context-memory runs.
+INTERNAL_RUN = {'tags': ['context_compaction'], 'callbacks': []}
+
+
 def tool_refresher(tools):
-    """A refresher that runs a read through the agent's own tools, so scope rules apply."""
+    """A refresher that runs a read through the agent's own tools, so scope rules apply.
+    One read per desk entry before every model call, so each is run as INTERNAL_RUN."""
     by_name = {t.name: t for t in tools}
 
     async def run(name: str, args: dict):
@@ -278,7 +372,11 @@ def tool_refresher(tools):
             tool, args = by_name['collaborate'], {'action': 'read', **args}
         if tool is None:
             return None
-        return await tool.ainvoke(args)
+        result = await tool.ainvoke(args, config=INTERNAL_RUN)
+        # The desk holds what the model is shown of a result, like the transcript does.
+        from app.agents.tools.validation import model_result
+        text = result if isinstance(result, str) else json.dumps(result, ensure_ascii=False)
+        return model_result(name, args, text)
     return run if by_name else None
 
 
@@ -286,8 +384,10 @@ def tool_refresher(tools):
 
 def label(key: list) -> str:
     if key[0] == 'file':
-        return f'file {key[1]}' + ('' if key[2] == 0 and key[3] >= 30000 else f' (characters {key[2]}–{key[2] + key[3]})')
+        return f'file {key[1]}' + ('' if key[3] is None else f' (characters {key[2]}–{key[3]})')
     part = {'whole': 'whole', 'outline': 'outline'}.get(key[2], f'section {key[2]}')
+    if part.endswith(SUBTREE):
+        part = part.removesuffix(SUBTREE) + ' with subsections'
     return f'document {key[1]} {part}' + (f' (offset {key[3]})' if key[3] else '')
 
 
@@ -295,13 +395,14 @@ def entry_text(entry: dict) -> str:
     key = entry['key']
     note = f' — updated since you read it (rewrite {entry["changed"]})' if entry.get('changed') else ''
     if key[0] == 'file':
-        body, sha, next_offset = parse_file(entry['content'])
+        read = file_read(entry)
         if key[2] == 0 and entry.get('complete'):
-            span = f'whole, {body.count(chr(10)) + 1} lines'
+            span = f'whole, {read.body.count(chr(10)) + 1} lines'
         else:
-            span = f'characters {key[2]}–{key[2] + len(body)}' + (f', continues at {next_offset}' if next_offset else '')
-        head = f'### file {key[1]} — {span}' + (f', sha256 {sha[:16]}' if sha else '') + note
-        return f'{head}\n{body}'
+            span = (f'characters {read.start}–{read.end}' + (f' of {read.total}' if read.total is not None else '')
+                    + (f', continues at {read.next_offset}' if read.next_offset else ''))
+        head = f'### file {key[1]} — {span}' + (f', sha256 {read.sha[:16]}' if read.sha else '') + note
+        return f'{head}\n{read.body}'
     data = parse(entry['content'])
     if not isinstance(data, dict):
         return f'### {label(key)}{note}\n{entry["content"]}'
@@ -314,7 +415,8 @@ def entry_text(entry: dict) -> str:
         return f'{head}{note}\n{data.get("content") or ""}'
     section = data.get('section') if isinstance(data.get('section'), dict) else {}
     title = f" 「{section['title']}」" if section.get('title') else ''
-    head = f'### document {key[1]}{version} — section {key[2]}{title}' + (f", continues at offset {data['next_offset']}" if data.get('next_offset') else '')
+    part = key[2].removesuffix(SUBTREE) + title + (' with subsections' if key[2].endswith(SUBTREE) else '')
+    head = f'### document {key[1]}{version} — section {part}' + (f", continues at offset {data['next_offset']}" if data.get('next_offset') else '')
     return f'{head}{note}\n{data.get("content") or ""}'
 
 

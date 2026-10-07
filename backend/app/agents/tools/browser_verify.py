@@ -10,19 +10,20 @@ from uuid import uuid4
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 from app.agents.tools.validation import tool, failure_result
 from app.agents.context_policy import RECOMPUTABLE
-from app.agents.tools._workspace import resolve_allowed
+from app.agents.tools._workspace import resolve_allowed, workspace_root
+from app.execution.browser_runner import MAX_TILES, TILE_HEIGHT
 from app.execution.processes import processes
 
 
 class BrowserAction(BaseModel):
-    model_config = ConfigDict(strict=True, extra='forbid')
+    model_config = ConfigDict(extra='forbid')
     action: Literal['click', 'fill', 'press', 'wait_visible', 'assert_text']
     selector: str = Field(min_length=1, max_length=1000)
     value: str = Field(default='', max_length=4000)
 
 
 class BrowserCheck(BaseModel):
-    model_config = ConfigDict(strict=True, extra='forbid')
+    model_config = ConfigDict(extra='forbid')
     url: str = Field(max_length=2000)
     actions: list[BrowserAction] = Field(default_factory=list, max_length=20)
     allowed_origins: list[str] = Field(default_factory=list, max_length=10)
@@ -42,17 +43,16 @@ class BrowserCheck(BaseModel):
 @tool(args_schema=BrowserCheck, context_policy=RECOMPUTABLE)
 async def browser_verify(url: str, actions: list[BrowserAction] = [], allowed_origins: list[str] = [],
                          expect_errors: bool = False) -> dict:
-    """Open a page, perform ordered selector actions, inspect text/console/page and HTTP
-    errors, and save a viewport PNG in docs/testing. Uses a fresh sandboxed Chromium
-    session with no personal cookies. Requires Playwright + its Chromium browser on
-    the backend host and reviewed network access; never installs them implicitly.
-    Other HTTP origins must be listed (e.g. the backend API used by the frontend).
-    All actions share this one session; a later call starts a new session.
-    Navigation retries for a few seconds while the page server is still starting.
-    Take selectors and expected text from the page source or a previous result's text;
-    an assert_text failure reports the actual text. For an intended failure path (e.g.
-    the API is stopped) set expect_errors=true: console/page/HTTP errors are then
-    reported but do not fail the check, while actions and assertions still must pass.
+    """Open a page, run ordered selector actions, collect text and console/page/HTTP
+    errors, and save a full-page screenshot in docs/testing that is shown to you with
+    the result: judge layout, styling and content from it instead of more checks.
+    Fresh sandboxed Chromium, no personal cookies; needs Playwright + Chromium on the
+    backend host and reviewed network access, never installed implicitly. List other
+    HTTP origins (e.g. the backend API). One session per call; navigation retries
+    briefly while the server starts. Take selectors and expected text from the page
+    source or the result; a failed assert_text reports the actual text. For an intended
+    failure path (e.g. API stopped) set expect_errors=true: errors are reported but do
+    not fail the check; actions and assertions still must pass.
     """
     try:
         from playwright.async_api import async_playwright
@@ -92,8 +92,17 @@ async def browser_verify(url: str, actions: list[BrowserAction] = [], allowed_or
         evidence.update(failure_result('Page verification found browser/HTTP errors', 'verification_failed',
             'page_errors', 'Inspect console, page_errors, http_errors and screenshot. Check service readiness or report the application defect before rechecking.',
             'inspect_before_retry'))
-    if screenshot.is_file():
-        evidence['screenshot'] = str(named_by_content(screenshot))
+    shots = [Path(p) for p in evidence.pop('screenshots', None) or [] if isinstance(p, str)]
+    shots = [named_by_content(p) for p in shots if p.is_file() and p.parent == screenshot.parent]
+    if shots:
+        # Workspace-relative: what reports cite, and how page_images finds them for the model.
+        names = [str(p.relative_to(workspace_root().resolve())) for p in shots]
+        evidence['screenshot'] = names[0]
+        if len(names) > 1:
+            evidence['screenshots'] = names
+        if isinstance(evidence.get('page_height'), int) and evidence['page_height'] > TILE_HEIGHT * MAX_TILES:
+            evidence['screenshot_covers'] = f'top {TILE_HEIGHT * MAX_TILES}px of {evidence["page_height"]}px'
+    evidence.pop('page_height', None)
     return evidence
 
 

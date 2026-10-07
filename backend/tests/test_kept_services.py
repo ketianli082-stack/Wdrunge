@@ -71,7 +71,7 @@ def test_kept_service_lifecycle_across_tasks(tmp_path, manager):
         try:
             # The backend task starts api and asks to keep it.
             tokens = task('backend', 'r-backend')
-            started = await development.execute_command.ainvoke({'command': sys.executable, 'arguments': server,
+            started = await development.execute_command.ainvoke({'argv': [sys.executable, *server],
                 'cwd': 'backend', 'background': True, 'name': 'api', 'ready_port': port, 'keep_running': True})
             assert started['kept'] is True and started['ready'] is True
             await manager.close(workspace=snapshots['backend'].resolve(), keep_services=True)  # delivered
@@ -85,7 +85,7 @@ def test_kept_service_lifecycle_across_tasks(tmp_path, manager):
             assert [p['service'] for p in (await development.manage_process.ainvoke({'action': 'list'}))['project_services']] == ['api']
             assert (await development.manage_process.ainvoke({'action': 'status', 'process_id': 'api'}))['state'] == 'running'
             with pytest.raises(ToolFailure, match='Service api is already running'):
-                await development.execute_command.ainvoke({'command': sys.executable, 'arguments': server,
+                await development.execute_command.ainvoke({'argv': [sys.executable, *server],
                     'cwd': 'backend', 'background': True, 'name': 'api', 'ready_port': port})
 
             # A later publish under the service's directory: while the copy runs from the
@@ -99,7 +99,7 @@ def test_kept_service_lifecycle_across_tasks(tmp_path, manager):
             assert 'STALE' in running and 'backend/app.py' in running
 
             # Restarting with keep_running replaces it.
-            restarted = await development.execute_command.ainvoke({'command': sys.executable, 'arguments': server,
+            restarted = await development.execute_command.ainvoke({'argv': [sys.executable, *server],
                 'cwd': 'backend', 'background': True, 'name': 'api', 'ready_port': port, 'keep_running': True})
             assert restarted['replaced_process'] == api['runtime']['process_id'] and restarted['ready'] is True
             runtime = (await service.environment(project))['services'][0]['runtime']
@@ -307,10 +307,10 @@ def test_a_proxy_does_not_own_the_port_it_forwards_to(tmp_path, manager):
         tokens = (active.set(Context(service, project, 'frontend', '', 'request:r-frontend', 'r-frontend')),
                   active_workspace.set(snapshot), source_workspace.set(project_root))
         try:
-            api = await development.execute_command.ainvoke({'command': sys.executable, 'background': True, 'name': 'api',
-                'arguments': ['-m', 'http.server', '--bind', '127.0.0.1', str(api_port)], 'ready_port': api_port})
-            web = await development.execute_command.ainvoke({'command': sys.executable, 'background': True, 'name': 'web',
-                'arguments': ['-c', PROXY, str(web_port), str(api_port)], 'ready_port': web_port})
+            api = await development.execute_command.ainvoke({'background': True, 'name': 'api',
+                'argv': [sys.executable, '-m', 'http.server', '--bind', '127.0.0.1', str(api_port)], 'ready_port': api_port})
+            web = await development.execute_command.ainvoke({'background': True, 'name': 'web',
+                'argv': [sys.executable, '-c', PROXY, str(web_port), str(api_port)], 'ready_port': web_port})
             assert api['ports'] == [api_port] and web['ports'] == [web_port]
             assert manager.service_job(project_root, name='api').id == api['id']
             assert manager.service_job(project_root, port=api_port).id == api['id']
@@ -358,7 +358,7 @@ def test_a_service_moving_to_the_root_is_restarting_not_stopped(tmp_path, manage
             assert runtime['state'] == 'restarting' and 'no action needed' in runtime_label(runtime)
             assert manager.moving_for(project_root, 'r-frontend')
             with pytest.raises(ToolFailure, match='being restarted from the project root'):
-                await development.execute_command.ainvoke({'command': server[0], 'arguments': server[1:], 'background': True,
+                await development.execute_command.ainvoke({'argv': server, 'background': True,
                     'name': 'web', 'ready_port': port, 'keep_running': True})
 
             hold.set()
@@ -388,7 +388,7 @@ def test_a_snapshot_copy_does_not_replace_the_delivered_root_service(tmp_path, m
             root_copy.service = 'web'
             active_workspace.set(snapshot)
             with pytest.raises(ToolFailure, match='already runs from the project root'):
-                await development.execute_command.ainvoke({'command': server[0], 'arguments': server[1:], 'background': True,
+                await development.execute_command.ainvoke({'argv': server, 'background': True,
                     'name': 'web', 'ready_port': port, 'keep_running': True})
             assert root_copy.process.returncode is None
         finally:

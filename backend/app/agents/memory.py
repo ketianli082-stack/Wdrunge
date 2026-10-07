@@ -34,6 +34,7 @@ from app.agents.context_meter import ratio_of
 from app.agents.resilience import ainvoke_with_retry
 from app.agents.context_fold import is_ledger, ledger_message, ledger_of, record_facts, render_ledger, verbatim_boundary
 from app.agents.context_desk import is_desk
+from app.agents.page_images import pending_tokens
 
 logger = logging.getLogger(__name__)
 
@@ -216,16 +217,21 @@ class PreparedContext:
 
 
 class ContextMemory:
-    def __init__(self, agent, scope: str, tools=(), refresher=None):
+    def __init__(self, agent, scope: str, tools=(), refresher=None, schema_tokens: int | None = None):
+        """schema_tokens: the estimate for `tools` when the caller already has it (a worker
+        builds one ContextMemory per model call; generating every schema again each time
+        cost more than a millisecond)."""
         self.agent, self.scope = agent, scope
         self.store = getattr(agent, '_store', None)
-        self.schema_tokens = estimate_tokens(json.dumps(
+        self.schema_tokens = schema_tokens if schema_tokens is not None else estimate_tokens(json.dumps(
             model_tool_schemas(tools), ensure_ascii=False,
         )) if tools else 0
         # Desk entries re-run their reads through the agent's own tools.
         self.refresher = refresher or context_desk.tool_refresher(tools)
         # actual tokens per estimated token, from the history's calibration (1.0 until measured).
         self.ratio = 1.0
+        # Actual tokens of page screenshots the next call attaches (app.agents.page_images).
+        self.reserved = 0
         self.budget = self.budget_for(self.ratio)
 
     def budget_for(self, ratio: float) -> int:
@@ -233,7 +239,7 @@ class ContextMemory:
         most three quarters of the window (room for output and protocol overhead), minus
         the tool schemas. A larger budget is a larger bill on every call, so the default
         is about what the pipeline ran at before the estimate was calibrated."""
-        actual = min(self.agent.context_window() * .75, context_tokens())
+        actual = min(self.agent.context_window() * .75, context_tokens()) - self.reserved
         return int(actual / max(ratio, 0.4)) - self.schema_tokens
 
     def in_estimate(self, actual: int) -> int:
@@ -372,6 +378,7 @@ class ContextMemory:
         return result
 
     async def prepare(self, messages: list[BaseMessage], *, force_clean=False) -> PreparedContext:
+        self.reserved = pending_tokens(messages)
         systems, body, ingested = await self.ingest(messages)
         original = [*systems, *body]
         if message_tokens(systems) >= self.budget:

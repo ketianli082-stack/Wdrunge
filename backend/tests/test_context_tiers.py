@@ -198,7 +198,7 @@ def test_read_only_calls_are_judged_by_what_they_do():
     assert not read_only_argv(['bash', '-c', 'echo x >> log'])
     assert not read_only_argv(['bash', '-c', 'cat a &> out.txt'])
     assert not read_only_argv(['bash', '-c', 'for f in *.js; do rm $f; done'])
-    assert not read_only_call({'name': 'execute_command', 'args': {'command': 'cat', 'arguments': ['a'], 'background': True}})
+    assert not read_only_call({'name': 'execute_command', 'args': {'argv': ['cat', 'a'], 'background': True}})
     reading = turn(read('a.py', 10), ('search_code', {'query': 'x'}, '{}'))
     writing = turn(('write_project_file', {'path': 'a.py', 'content': 'x'}, 'Wrote a.py'))
     assert read_streak([*writing, *reading, *reading]) == 2

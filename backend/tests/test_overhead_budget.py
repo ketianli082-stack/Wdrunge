@@ -3,7 +3,10 @@ from app.agents.overhead import role_overhead
 
 # Estimated tokens (about twice real tokens for English). Before role tool profiles and
 # prompt modules: Leader ~24.3K, workers ~18.4K-21.9K per call.
-BUDGET = {'leader': 13500, 'product': 10500, 'designer': 10500, 'backend': 13500, 'frontend': 14500, 'testing': 14500}
+# 2026-10-06: tool parameters gained one-line descriptions with examples (a weak model
+# fills arguments from the schema); backend and frontend went a little over their old
+# 13,500 / 14,500 and the budget was raised for them rather than cutting instructions.
+BUDGET = {'leader': 13500, 'product': 10500, 'designer': 10500, 'backend': 14000, 'frontend': 15000, 'testing': 14500}
 
 
 def test_role_overhead_stays_within_budget(monkeypatch):

@@ -15,3 +15,9 @@ def healthy_provider():
     resilience._failures.clear()
     yield
     resilience._failures.clear()
+
+
+@pytest.fixture(autouse=True)
+def private_runs_directory(tmp_path_factory, monkeypatch):
+    """Task snapshots go to a fresh folder outside the test's project tree."""
+    monkeypatch.setenv('WDRUNGE_RUNS_DIR', str(tmp_path_factory.mktemp('runs')))

@@ -52,13 +52,16 @@ def prompt_tokens(response) -> int | None:
     return value if isinstance(value, int) and value > 0 else None
 
 
-def calibrate(sent: list[BaseMessage], response, schema_tokens: int = 0) -> float | None:
+def calibrate(sent: list[BaseMessage], response, schema_tokens: int = 0, media_tokens: int = 0) -> float | None:
     """Record on `response` the ratio measured from this call (smoothed with the earlier
-    value), or None when the provider reported no usage or the sample is too small."""
+    value), or None when the provider reported no usage or the sample is too small.
+    media_tokens: actual tokens of images attached to `sent` for this call only
+    (app.agents.page_images); they are not text, so they are left out of the ratio."""
     actual = prompt_tokens(response)
     metadata = getattr(response, 'response_metadata', None)
     if actual is None or not isinstance(metadata, dict):
         return None
+    actual -= media_tokens
     estimated = estimated_tokens(sent) + schema_tokens
     if estimated < MINIMUM_SAMPLE:
         return None

@@ -99,3 +99,40 @@ def test_partial_edit_cannot_bypass_managed_document_guard(files):
         assert (root / 'docs/spec.md').read_text() == 'original'
     finally:
         active.reset(token)
+
+
+def test_partial_reads_say_where_they_are_and_a_read_past_the_end_says_so(files):
+    """Blog5: 77 of 198 reads were paged; the total length came only with include_hash,
+    so members guessed offsets, and 3 reads past the end returned an empty string."""
+    from app.agents.read_result import parse_read
+    root, read, _ = files
+    text = ''.join(f'line {i}\n' for i in range(1, 501))
+    (root / 'long.txt').write_text(text)
+    (root / 'short.txt').write_text('only\n')
+    # A whole-file read is the body alone: nothing is added to the common case.
+    assert read.invoke({'path': 'short.txt'}) == 'only\n' and read.invoke({'path': 'short.txt', 'force': True}) == 'only\n'
+    head = read.invoke({'path': 'long.txt', 'limit': 100})
+    assert head == text[:100] + f'\n[characters 0–100 of {len(text)}; next_offset=100]'
+    tail = read.invoke({'path': 'long.txt', 'offset': 3000})
+    assert tail == text[3000:] + f'\n[characters 3000–{len(text)} of {len(text)}]'
+    assert read.invoke({'path': 'long.txt', 'offset': len(text) + 50}) == f'[offset {len(text) + 50} 处没有内容；文件共 {len(text)} 字符]'
+    # The code index and search results give line numbers; the tool takes them directly.
+    lines = read.invoke({'path': 'long.txt', 'start_line': 12, 'line_count': 3})
+    start = text.index('line 12\n')
+    assert lines == f'line 12\nline 13\nline 14\n\n[lines 12–14, characters {start}–{start + 24} of {len(text)}; next_offset={start + 24}]'
+    assert read.invoke({'path': 'long.txt', 'start_line': 499}).endswith(f'[lines 499–500, characters {len(text) - 18}–{len(text)} of {len(text)}]')
+    assert read.invoke({'path': 'short.txt', 'start_line': 1}) == 'only\n'
+    assert '没有内容' in read.invoke({'path': 'long.txt', 'start_line': 900})
+    for args in ({'path': 'long.txt', 'start_line': 2, 'offset': 5}, {'path': 'long.txt', 'line_count': 2}):
+        with pytest.raises(ValueError):
+            read.invoke(args)
+    # One parser reads every form back, including results written before the position line.
+    for result, offset in ((head, 0), (tail, 3000), (lines, 0), ('[sha256=ab; characters=9]\nabc\n[truncated; next_offset=3]', 0)):
+        parsed = parse_read(result, offset)
+        assert parsed.body and not parsed.body.endswith(']')
+    parsed = parse_read(lines)
+    assert (parsed.start, parsed.end, parsed.total, parsed.next_offset, parsed.lines) == (start, start + 24, len(text), start + 24, (12, 14))
+    hashed = parse_read(read.invoke({'path': 'long.txt', 'offset': 10, 'limit': 20, 'include_hash': True}))
+    assert hashed.sha == sha256(text.encode()).hexdigest() and hashed.body == text[10:30] and hashed.total == len(text)
+    legacy = parse_read('abc\n[truncated; next_offset=103]', 100)
+    assert (legacy.body, legacy.start, legacy.next_offset, legacy.whole) == ('abc', 100, 103, False)

@@ -94,12 +94,12 @@ def test_folded_reads_move_to_the_desk_and_reading_them_again_returns_a_notice()
     folded = fold(body)
     desk = next(m for m in folded if is_desk(m))
     assert 'on the desk' in by_id(folded)[a[1].id].content and 'export const a = 1;' in desk.content
-    assert [e['key'] for e in desk_of(folded)['entries']] == [['file', 'src/a.ts', 0, 30000], ['file', 'src/b.ts', 0, 30000]]
+    assert [e['key'] for e in desk_of(folded)['entries']] == [['file', 'src/a.ts', 0, None], ['file', 'src/b.ts', 0, None]]
     # Reading a.ts again: the result is already shown, so the model gets a one-line notice.
     again = turn(read('src/a.ts', 'export const a = 1;\n' * 50))
     result = ingest([*folded, *again])[0]
     notice = json.loads(result[-1].content)
-    assert notice['on_desk'] is True and notice['entry'] == 'file src/a.ts' and desk_hit_of(result[-1]) == ['file', 'src/a.ts', 0, 30000]
+    assert notice['on_desk'] is True and notice['entry'] == 'file src/a.ts' and desk_hit_of(result[-1]) == ['file', 'src/a.ts', 0, None]
     # A range of a whole file on the desk is a hit too; changed content or force=true is not.
     part = turn(read('src/a.ts', ('export const a = 1;\n' * 50)[100:300], offset=100, limit=200))
     assert json.loads(ingest([*folded, *part])[0][-1].content)['on_desk'] is True
@@ -126,7 +126,7 @@ def test_whole_reads_cover_ranges_and_documents_carry_their_latest_outline(rewri
         memory = ContextMemory(agent(), 'desk-cover', refresher=files)
         prepared = await memory.prepare([SystemMessage(content='sys'), *body])
         desk = desk_of(prepared.messages)
-        assert [e['key'] for e in desk['entries']] == [['file', 'src/big.ts', 0, 30000], ['document', 'design', 's2', 0]]
+        assert [e['key'] for e in desk['entries']] == [['file', 'src/big.ts', 0, None], ['document', 'design', 's2', 0]]
         text = next(m for m in prepared.messages if is_desk(m)).content
         assert text.count('### file src/big.ts') == 1 and 'h' * 3000 + 't' * 1000 in text
         # The document shows its latest outline and version (refreshed without the pinned version).
@@ -318,10 +318,18 @@ def test_a_worker_refreshes_the_desk_through_its_own_tools(monkeypatch, tmp_path
                     return AIMessage(content='read a again', tool_calls=[{'id': 'r3', 'name': 'read_project_file', 'args': {'path': 'src/a.js'}}])
                 return AIMessage(content='done')
         monkeypatch.setattr(worker, 'model', lambda: Model())
-        async for _ in worker.stream('build', conversation_id='chat', context_mode='fresh', handoff='details'):
-            pass
+        activities = []
+        async for event, payload in worker.stream('build', conversation_id='chat', context_mode='fresh', handoff='details'):
+            if event == 'activity':
+                activities.append((payload['tool'], payload['phase']))
         desks = [next((m for m in call if is_desk(m)), None) for call in seen]
         assert desks[-1] is not None
+        # The refresh re-reads every desk entry before each model call. Those reads are the
+        # platform's: only the model's own three reads and one write are tool activity
+        # (each used to be shown and stored as one more read by the agent).
+        assert activities.count(('read_project_file', 'running')) == 3
+        assert activities.count(('read_project_file', 'completed')) == 3
+        assert activities.count(('write_project_file', 'running')) == 1
         # The desk shows a.js after the edit, read from disk, with b.js beside it.
         assert 'export const a = 42;' in desks[-1].content and 'export const b = 2;' in desks[-1].content
         # Reading a.js again after the refresh was a hit: the model got a notice, not the text.
@@ -331,3 +339,110 @@ def test_a_worker_refreshes_the_desk_through_its_own_tools(monkeypatch, tmp_path
         asyncio.run(run())
     finally:
         active_workspace.reset(token)
+
+
+def test_a_section_read_with_subsections_is_one_entry_and_covers_its_children():
+    module = ('collaboration_read', {'document_id': 'req', 'section_id': 'm1', 'subtree': True, 'version': 2},
+              {'document_id': 'req', 'version': 2, 'section': {'id': 'm1', 'title': '登录'},
+               'sections': [{'id': 'm1', 'title': '登录'}, {'id': 'r1', 'title': '需求1'}, {'id': 'ac', 'title': '验收标准'}],
+               'content': '说明\n\n## 需求1\n\n输入密码登录\n\n## 验收标准\n\n- 能登录\n', 'next_offset': None, 'fragment': False})
+    child = turn(section('req', 'r1', '输入密码登录', version=2))
+    body = [HumanMessage(content='task', id='task'), *child, *turn(module), *filler()]
+    folded = fold(body)
+    desk = desk_of(folded)
+    # The earlier read of one requirement is absorbed by the read of its module.
+    assert [e['key'] for e in desk['entries']] == [['document', 'req', 'm1/*', 0]]
+    text = next(m for m in folded if is_desk(m)).content
+    assert 'section m1 「登录」 with subsections' in text and text.count('输入密码登录') == 1
+    again = turn(section('req', 'ac', '- 能登录', version=2))
+    notice = json.loads(ingest([*folded, *again])[0][-1].content)
+    assert notice['on_desk'] is True and 'with subsections' in notice['entry']
+    # Another version of the child, or a section outside the module, is returned.
+    newer = turn(section('req', 'ac', '- 能登录', version=3))
+    assert ingest([*folded, *newer])[0][-1].content == newer[1].content
+    other = turn(section('req', 'm2', '另一个模块', version=2))
+    assert ingest([*folded, *other])[0][-1].content == other[1].content
+
+
+TEXT = ''.join(f'line {i:04d}\n' for i in range(1, 1001))  # 10,000 characters
+
+
+def part(path, start, end, text=TEXT):
+    """A read of characters [start, end) as read_project_file returns it."""
+    from app.agents.read_result import format_read
+    return 'read_project_file', {'path': path, 'offset': start, 'limit': end - start}, format_read(text[start:end], start, len(text))
+
+
+def desk_after(*reads):
+    body = [HumanMessage(content='task', id='task'), *[m for r in reads for m in turn(r)], *filler()]
+    folded = fold(body)
+    return desk_of(folded), folded
+
+
+def test_ranges_of_one_file_merge_and_a_read_inside_a_range_is_a_hit():
+    """Blog5: 24 of 68 desks held several ranges of one file, 17 with overlapping text;
+    a read inside a range on the desk got the text again."""
+    desk, folded = desk_after(part('a.py', 1000, 3000), part('a.py', 2500, 4000), part('a.py', 4000, 5000), part('b.py', 0, 2000))
+    # Overlapping (2500-3000) and touching (4000) ranges are one entry holding the text once.
+    assert [e['key'] for e in desk['entries']] == [['file', 'a.py', 1000, 5000], ['file', 'b.py', 0, 2000]]
+    entry = desk['entries'][0]
+    assert entry['args'] == {'path': 'a.py', 'offset': 1000, 'limit': 4000} and not entry['complete']
+    text = next(m for m in folded if is_desk(m)).content
+    assert '### file a.py — characters 1000–5000 of 10000, continues at 5000' in text and text.count(TEXT[2600:2700]) == 1
+    inside = turn(part('a.py', 1500, 2500))
+    notice = json.loads(ingest([*folded, *inside])[0][-1].content)
+    assert notice['on_desk'] is True and notice['entry'] == 'file a.py (characters 1000–5000)' and 'force=true' in notice['note']
+    outside = turn(part('a.py', 4500, 6000))
+    assert ingest([*folded, *outside])[0][-1].content == outside[1].content
+    # A range that reaches the start and the end makes the entry the whole file.
+    desk, _ = desk_after(part('a.py', 3000, 10000), part('a.py', 0, 3000))
+    assert [e['key'] for e in desk['entries']] == [['file', 'a.py', 0, None]] and desk['entries'][0]['args'] == {'path': 'a.py'}
+    assert desk['entries'][0]['content'] == TEXT and desk['entries'][0]['complete']
+
+
+def test_changed_overlaps_long_merges_and_empty_reads_are_not_joined_or_placed():
+    changed = TEXT.replace('line 0250', 'LINE 0250')
+    # The file changed between two overlapping reads: only what was just read stays.
+    desk, _ = desk_after(part('a.py', 1000, 3000), part('a.py', 2000, 4000, changed))
+    assert [e['key'] for e in desk['entries']] == [['file', 'a.py', 2000, 4000]] and 'LINE 0250' in desk['entries'][0]['content']
+    # Past the limit of one read, ranges stay separate so each still refreshes in one call.
+    long = 'x' * 50000
+    desk, _ = desk_after(part('big.txt', 0, 20000, long), part('big.txt', 20000, 40000, long))
+    assert [e['key'] for e in desk['entries']] == [['file', 'big.txt', 0, 20000], ['file', 'big.txt', 20000, 40000]]
+    # Blog5: 8 desks held an entry with no text (a read past the end of a file).
+    past = ('read_project_file', {'path': 'a.py', 'offset': 10100}, '[offset 10100 处没有内容；文件共 10000 字符]')
+    desk, folded = desk_after(past, part('a.py', 0, 1000))
+    assert [e['key'] for e in desk['entries']] == [['file', 'a.py', 0, 1000]]
+    assert any(isinstance(m, ToolMessage) and '文件共 10000 字符' in m.content for m in folded)
+
+
+def test_a_refresh_keys_a_file_entry_by_what_the_file_holds_now(rewrite_now):
+    async def run():
+        files = Files(**{'a.py': TEXT[:6000]})
+        reads = [m for r in (part('a.py', 0, 3000, TEXT[:6000]), part('a.py', 3000, 6000, TEXT[:6000])) for m in turn(r)]
+        memory = ContextMemory(agent(), 'desk-refresh-key', refresher=files)
+        prepared = await memory.prepare([SystemMessage(content='sys'), HumanMessage(content='task', id='task'), *reads, *filler()])
+        assert [e['key'] for e in desk_of(prepared.messages)['entries']] == [['file', 'a.py', 0, None]]
+        # The file grows: the entry read as whole is refreshed as the whole file again.
+        files.files['a.py'] = TEXT[:8000]
+        again = await memory.prepare([*prepared.messages, *filler()])
+        entry = desk_of(again.messages)['entries'][0]
+        assert entry['key'] == ['file', 'a.py', 0, None] and entry['content'] == TEXT[:8000] and entry['changed']
+    asyncio.run(run())
+
+
+def test_every_tool_whose_result_can_become_a_desk_notice_accepts_force():
+    """The notice suggests force=true only to tools that declare it, and every desk tool does."""
+    from app.agents import context_policy
+    from app.agents.tools.validation import _schemas
+    context_policy.policy_of('read_project_file')
+    desk_tools = [name for name, policy in context_policy._POLICIES.items() if policy == context_policy.DESK]
+    assert {'read_project_file', 'collaboration_read'} <= set(desk_tools)
+    for name in desk_tools:
+        assert 'force' in _schemas[name].model_fields, name
+        assert context_fold.accepts_force(name)
+    assert not context_fold.accepts_force('search_code')
+    search = turn(('search_code', {'query': 'same'}, 'r' * 500))
+    repeat = turn(('search_code', {'query': 'same'}, 'r' * 500))
+    note = json.loads(ingest([HumanMessage(content='task', id='task'), *search, *repeat])[0][-1].content)['note']
+    assert 'Repeat the same call to receive it again' in note and 'force' not in note
