@@ -512,6 +512,8 @@ class ExecutionStatusResponse(BaseModel):
     paused: bool
     pending_tasks: int
     active_goals: int
+    task_states: dict[str, int] = Field(default_factory=dict)
+    leader_running: bool = False
 
 
 async def execution_context(conversation_id):

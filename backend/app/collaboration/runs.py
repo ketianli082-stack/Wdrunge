@@ -83,7 +83,10 @@ class ConversationRuns:
             session = await self._get(c, 'leader_session', project, conversation, False)
             leader = bool(session and session['state'] == 'running' or control and control.get('pending'))
             return dict(running=bool(not stopped and (requests or goals or leader)), stopping=bool(control and control['state']=='stopping'),
-                        paused=paused, pending_tasks=0 if stopped else len(requests), active_goals=0 if stopped else len(goals))
+                        paused=paused, pending_tasks=0 if stopped else len(requests), active_goals=0 if stopped else len(goals),
+                        task_states={state: 0 if stopped else sum(r['state'] == state for r in requests)
+                                     for state in ('queued', 'running', 'blocked', 'review')},
+                        leader_running=bool(not stopped and leader))
 
     async def pause_unfinished_on_startup(self):
         """Loading history must never implicitly restart unfinished work."""

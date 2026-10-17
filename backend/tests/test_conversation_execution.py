@@ -155,6 +155,28 @@ def test_execution_http_endpoints_persist_status(tmp_path,monkeypatch):
         assert client.get('/api/conversations/missing/execution').status_code==404
 
 
+def test_review_is_pending_acceptance_not_active_worker(tmp_path):
+    async def run():
+        store, service, team, project, conversations, tasks = await setup(tmp_path)
+        conversation = conversations[0]
+        generation = await service.begin_conversation_run(project, conversation)
+        await service.end_conversation_run(project, conversation, generation)
+        async with service.transaction() as connection:
+            task = await service._get(connection, 'request', project, tasks[0]['id'])
+            task.update(state='review', result='CSS modified; awaiting acceptance')
+            await service._put(connection, 'request', project, task['id'], task)
+        status = await service.conversation_execution(project, conversation)
+        assert status['running'] and status['pending_tasks'] == 1
+        assert status['task_states'] == {'queued': 0, 'running': 0, 'blocked': 0, 'review': 1}
+        assert not status['leader_running']
+        generation = await service.stop_conversation_run(project, conversation)
+        await service.finish_conversation_stop(project, conversation, generation)
+        stopped = await service.conversation_execution(project, conversation)
+        assert not stopped['running'] and not any(stopped['task_states'].values())
+        await store.close()
+    asyncio.run(run())
+
+
 def test_startup_fences_legacy_history_without_leader_session(tmp_path):
     from app.collaboration.coordinator import LeaderCoordinator
 

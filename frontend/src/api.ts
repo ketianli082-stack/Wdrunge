@@ -278,7 +278,21 @@ export type ConversationExecution = {
   paused: boolean;
   pending_tasks: number;
   active_goals: number;
+  task_states?: Record<string, number>;
+  leader_running?: boolean;
 };
+
+export function executionLabel(state: ConversationExecution | undefined, streaming: boolean): string {
+  if (state?.stopping) return '正在停止任务';
+  const tasks = state?.task_states;
+  if (tasks?.running) return `团队正在执行 · ${tasks.running} 项任务`;
+  if (tasks?.review) return `代码已交付 · ${tasks.review} 项待 Leader 验收`;
+  if (tasks?.blocked) return `等待依赖或处理阻塞 · ${tasks.blocked} 项任务`;
+  if (tasks?.queued) return `任务排队中 · ${tasks.queued} 项`;
+  if (state?.leader_running || streaming) return 'Leader 正在处理';
+  if (state?.active_goals) return '等待目标收尾';
+  return '正在同步执行状态';
+}
 export function getConversationExecution(id: string, signal?: AbortSignal): Promise<ConversationExecution> {
   return requestJson(`/api/conversations/${encodeURIComponent(id)}/execution`, { signal });
 }

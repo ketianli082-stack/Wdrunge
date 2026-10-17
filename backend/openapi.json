@@ -2453,6 +2453,7 @@
               "update_goal",
               "complete_goal",
               "create_task",
+              "create_tasks",
               "submit_task",
               "complete_task",
               "environment",
@@ -2605,7 +2606,7 @@
             "maxLength": 240,
             "minLength": 1,
             "title": "Title",
-            "default": "新对话"
+            "default": "�¶Ի�"
           }
         },
         "type": "object",
@@ -2901,6 +2902,18 @@
           "active_goals": {
             "type": "integer",
             "title": "Active Goals"
+          },
+          "task_states": {
+            "additionalProperties": {
+              "type": "integer"
+            },
+            "type": "object",
+            "title": "Task States"
+          },
+          "leader_running": {
+            "type": "boolean",
+            "title": "Leader Running",
+            "default": false
           }
         },
         "type": "object",

@@ -17,6 +17,7 @@ import {
   type SessionUsage,
   listProjects,
   streamConversationMessage,
+  executionLabel,
   type Activity,
   type ConversationDetail,
   type ProjectSummary,
@@ -37,6 +38,7 @@ import "./App.css";
 import ExecutionPermissions from './ExecutionPermissions';
 import ResourceSettings from './ResourceSettings';
 import SessionUsagePanel from './SessionUsagePanel';
+import WebsitePreview from './WebsitePreview';
 
 type VisibleMessage = TeamChatMessage & {
   read?: boolean;
@@ -123,6 +125,8 @@ function Workspace({ onRecordsCleared }: { onRecordsCleared: () => void }) {
   useEffect(() => { setShowCollaboration(false); }, [active?.id, panel]);
   const [search, setSearch] = useState("");
   const [input, setInput] = useState("");
+  const [showWebsite, setShowWebsite] = useState(false);
+  useEffect(() => { setShowWebsite(false); }, [active?.id]);
   const [streamingConversation, setStreamingConversation] = useState<string | null>(null);
   const streaming = streamingConversation !== null;
   const [execution, setExecution] = useState<Record<string, ConversationExecution>>({});
@@ -358,7 +362,10 @@ function Workspace({ onRecordsCleared }: { onRecordsCleared: () => void }) {
 
   async function send(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    const content = input.trim();
+    try { await sendContent(input.trim()); } catch { /* Error is displayed by sendContent. */ }
+  }
+
+  async function sendContent(content: string, fromPreview = false) {
     if (!content || streaming || executionAction || !active) return;
     const conversationId = active.id;
     const updateConversation = (update: (item: ConversationView) => ConversationView) =>
@@ -369,7 +376,7 @@ function Workspace({ onRecordsCleared }: { onRecordsCleared: () => void }) {
       ...item,
       messages: [...item.messages, { id: clientMessageId, sender: "user", content, time: clockTime(), createdAt: Date.now() }],
     }));
-    setInput("");
+    if (!fromPreview) setInput("");
     setError("");
     executionVersion.current++;
     setExecution(current => ({ ...current, [conversationId]: { running: true, stopping: false, paused: current[conversationId]?.paused || false, pending_tasks: current[conversationId]?.pending_tasks || 0, active_goals: current[conversationId]?.active_goals || 0 } }));
@@ -419,6 +426,7 @@ function Workspace({ onRecordsCleared }: { onRecordsCleared: () => void }) {
       }, abort.signal);
     } catch (cause) {
       if (!abort.signal.aborted) setError(cause instanceof Error ? cause.message : "请求失败");
+      if (!abort.signal.aborted) throw cause;
     } finally {
       controller.current = null;
       setStreamingConversation(null);
@@ -473,7 +481,7 @@ function Workspace({ onRecordsCleared }: { onRecordsCleared: () => void }) {
       </div>
     </aside>
 
-    <section className="office" aria-label="Agent 办公室"><div style={{width:'100%',height:'100%'}} inert={!!openFile}><OfficeScene agents={agents} /></div>{openFile && activeProject?.id === openFile.project && <DeliveryPreview key={`${openFile.project}:${openFile.path}`} project={openFile.project} path={openFile.path} revision={deliveryFiles.revision} status={deliveryFiles.status} onClose={() => setOpenFile(null)} onOpen={showFile} />}</section>
+    <section className="office" aria-label="Agent 办公室">{showWebsite && active ? <WebsitePreview key={active.id} busy={streaming || !!executionAction} onRequest={content => sendContent(content, true)} onClose={() => setShowWebsite(false)} /> : <><div style={{width:'100%',height:'100%'}} inert={!!openFile}><OfficeScene agents={agents} /></div>{active && <button className="website-preview-toggle" onClick={() => { setOpenFile(null); setShowWebsite(true); }}>网站预览 ↗</button>}</>}{openFile && activeProject?.id === openFile.project && <DeliveryPreview key={`${openFile.project}:${openFile.path}`} project={openFile.project} path={openFile.path} revision={deliveryFiles.revision} status={deliveryFiles.status} onClose={() => setOpenFile(null)} onOpen={showFile} />}</section>
 
     <aside className="right-rail" aria-label="团队交流与工作日志">
       <div className="rail-tabs" role="tablist" aria-label="右侧内容">
@@ -493,7 +501,7 @@ function Workspace({ onRecordsCleared }: { onRecordsCleared: () => void }) {
         }}>
           {active.messages.length === 0 && <div className="chat-welcome"><span className="welcome-icon">W</span><strong>开始一段对话</strong><p>向{memberName("leader")}发送消息。团队记录会保存在项目下。</p></div>}
           {active.messages.map((message) => <article className={`chat-message ${message.sender === "user" ? "mine" : ""}`} key={message.id}><AgentAvatar agent={message.sender} /><div className="message-body"><div className="message-meta"><strong>{nameOf(message.sender)}</strong><time>{message.time}</time></div><div className="bubble"><MessageContent message={message} /></div>{!!message.completedBy?.length && <div className="message-reactions" aria-label="任务完成状态">{message.completedBy.map((worker) => <span className="done-reaction" key={worker} title={`${nameOf(worker)}已完成`}><span aria-hidden="true">✓</span> Done · {nameOf(worker)}</span>)}</div>}</div></article>)}
-          {canStop && <div className="processing"><i /><i /><i /><span>团队正在处理</span></div>}
+          {canStop && <div className="processing" role="status"><i /><i /><i /><span>{executionLabel(activeExecution, streamingConversation === active.id)}</span></div>}
         </div>
         <div className="composer-area">
           {activeExecution?.paused && <div className="composer-paused">

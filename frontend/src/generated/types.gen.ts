@@ -225,7 +225,7 @@ export type Command = {
     /**
      * Action
      */
-    action: 'catalog' | 'read' | 'publish' | 'subscribe' | 'send' | 'request' | 'inspect_request' | 'transition' | 'snapshot' | 'search' | 'diff' | 'schedule' | 'dependencies' | 'decision' | 'maintenance' | 'handoff' | 'recover' | 'inspect_message' | 'history' | 'create_goal' | 'get_goal' | 'update_goal' | 'complete_goal' | 'create_task' | 'submit_task' | 'complete_task' | 'environment' | 'register_service' | 'register_command' | 'journal' | 'check_delivery';
+    action: 'catalog' | 'read' | 'publish' | 'subscribe' | 'send' | 'request' | 'inspect_request' | 'transition' | 'snapshot' | 'search' | 'diff' | 'schedule' | 'dependencies' | 'decision' | 'maintenance' | 'handoff' | 'recover' | 'inspect_message' | 'history' | 'create_goal' | 'get_goal' | 'update_goal' | 'complete_goal' | 'create_task' | 'create_tasks' | 'submit_task' | 'complete_task' | 'environment' | 'register_service' | 'register_command' | 'journal' | 'check_delivery';
     /**
      * Payload
      */
@@ -515,6 +515,16 @@ export type ExecutionStatusResponse = {
      * Active Goals
      */
     active_goals: number;
+    /**
+     * Task States
+     */
+    task_states?: {
+        [key: string]: number;
+    };
+    /**
+     * Leader Running
+     */
+    leader_running?: boolean;
 };
 
 /**
