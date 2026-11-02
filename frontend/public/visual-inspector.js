@@ -6,6 +6,32 @@
   const pageId = crypto.randomUUID();
   let token = '', mode = 'browse', selected = [], hovered = null, region = null, truncated = false;
   let lastLocation = location.href, lastSnapshot = '', drag = null, suppressClick = false;
+  let annotations = [];
+  let reloading = false;
+  async function reloadResources() {
+    if (reloading) return;
+    reloading = true;
+    const controller = new AbortController(), timer = setTimeout(() => controller.abort(), 8000);
+    try {
+      // A new iframe or HTML cache-buster alone still reuses fresh CSS/JS cache entries.
+      // Revalidate only resources already loaded by this document, never replay XHR/API calls.
+      const resources = [location.href,
+        ...[...document.querySelectorAll('link[rel="stylesheet"][href],script[src]')].map(element => element.href || element.src),
+        ...performance.getEntriesByType('resource').filter(entry => ['link', 'script', 'css', 'img'].includes(entry.initiatorType)).map(entry => entry.name)];
+      const urls = [...new Set(resources.map(value => new URL(value, location.href)).filter(url =>
+        url.origin === location.origin && ['http:', 'https:'].includes(url.protocol)).map(url => { url.hash = ''; return url.href; }))];
+      if (urls.length > 100) throw new Error('页面资源过多，请使用浏览器强制刷新。');
+      await Promise.all(urls.map(async url => {
+        const response = await fetch(url, { cache: 'reload', credentials: 'same-origin', signal: controller.signal });
+        if (!response.ok) throw new Error(`资源刷新失败（${response.status}）：${new URL(url).pathname}`);
+        await response.arrayBuffer(); // Wait until the updated response has entered the HTTP cache.
+      }));
+      send('wdrunge:reloading'); location.reload();
+    } catch (error) {
+      controller.abort(); reloading = false;
+      send('wdrunge:reload-error', { message: error.name === 'AbortError' ? '重新获取页面资源超时，请检查网站服务后重试。' : error.message });
+    } finally { clearTimeout(timer); }
+  }
   const host = document.createElement('div');
   host.setAttribute('data-wdrunge-overlay', '');
   host.setAttribute('aria-hidden', 'true');
@@ -27,6 +53,22 @@
   }
   function draw() {
     shadow.replaceChildren();
+    annotations.forEach((annotation, index) => {
+      const context = annotation.context;
+      if (context.url !== pageUrl()) return;
+      const rects = context.region ? [context.region] : context.elements.map(element => ({ ...element.rect,
+        x: element.rect.x + context.viewport.scrollX, y: element.rect.y + context.viewport.scrollY }));
+      const r = rects[0];
+      if (!r) return;
+      rects.forEach(rect => box({ ...rect, x: rect.x - scrollX, y: rect.y - scrollY }, true));
+      const marker = document.createElement('span'); marker.textContent = String(index + 1);
+      Object.assign(marker.style, { position: 'fixed', left: `${Math.max(0, r.x + r.width - scrollX - 12)}px`,
+        top: `${r.y - scrollY - 12}px`, background: '#3975ef', color: '#fff', border: '2px solid white',
+        borderRadius: '50%', width: '24px', height: '24px', display: 'grid', placeItems: 'center',
+        font: 'bold 12px system-ui', boxShadow: '0 2px 6px #0002' });
+      // Saved coordinates mark the observation, not a newly resolved DOM identity.
+      marker.title = annotation.comment; shadow.append(marker);
+    });
     for (const element of selected) if (element.isConnected) box(element.getBoundingClientRect());
     if (hovered?.isConnected && !selected.includes(hovered)) box(hovered.getBoundingClientRect(), true);
     if (region) box({ ...region, x: region.x - scrollX, y: region.y - scrollY }, true);
@@ -86,9 +128,13 @@
     const data = event.data;
     if (!data || typeof data !== 'object' || typeof data.token !== 'string' || data.token.length > 100) return;
     if (data.type === 'wdrunge:connect') {
-      token = data.token; send('wdrunge:ready', { url: pageUrl(), mode }); return;
+      token = data.token; send('wdrunge:ready', { url: pageUrl(), mode, capabilities: ['reload'] }); return;
     }
     if (data.token !== token || data.pageId !== pageId) return;
+    if (data.type === 'wdrunge:reload') { void reloadResources(); return; }
+    if (data.type === 'wdrunge:annotations' && Array.isArray(data.annotations)) {
+      annotations = data.annotations.slice(0, 10).filter(item => item?.context?.viewport && Array.isArray(item.context.elements)); draw();
+    }
     if (data.type === 'wdrunge:mode' && ['browse','point'].includes(data.mode)) {
       mode = data.mode; hovered = null; drag = null; suppressClick = false; publish(true);
     }

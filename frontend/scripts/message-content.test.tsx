@@ -95,6 +95,25 @@ test('public mention replies render a short summary and never their detailed pay
 });
 
 import { formatTokens } from '../src/formatTokens';
+import { annotationRequest, readAnnotationMessage, type VisualContext } from '../src/visualFeedback';
+
+test('web annotations render readable paired comments while keeping DOM metadata out of the bubble', () => {
+  const context: VisualContext = { url: 'http://127.0.0.1:8101/', capturedAt: '2026-11-02T07:00:00Z',
+    elements: [{ url: 'http://127.0.0.1:8101/', tag: 'h1', text: '博客标题', selector: '#title', source: '',
+      rect: { x: 10, y: 20, width: 100, height: 30 }, styles: { color: 'rgb(0, 0, 0)' }, ancestors: [] }],
+    viewport: { width: 800, height: 600, scrollX: 0, scrollY: 0 }, truncated: false };
+  const content = annotationRequest('整体保持简洁', [{ id: 'one', comment: '标题改蓝', context },
+    { id: 'two', comment: '<script>alert(1)</script>', context }]);
+  const html = render(content, { sender: 'user' });
+  assert.ok(html.includes('整体保持简洁'));
+  assert.ok(html.includes('2 条网页批注'));
+  assert.ok(html.includes('标题改蓝'));
+  assert.ok(!html.includes('capturedAt') && !html.includes('commonAncestor'));
+  assert.ok(!html.includes('<script>'));
+  assert.equal(readAnnotationMessage('普通聊天消息'), null);
+  assert.throws(() => annotationRequest('很长的整体要求'.repeat(4000), [{ id: 'one', comment: '标题改蓝', context }]), /分批发送/);
+});
+
 test('token totals use compact units and promote rounded unit boundaries', () => {
   for (const [input, expected] of [[0, '0'], [999, '999'], [1000, '1.0k'], [12500, '12.5k'],
     [999949, '999.9k'], [999950, '1.0m'], [1000000, '1.0m'], [1500000000, '1.5b']] as const) {

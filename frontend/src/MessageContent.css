@@ -44,3 +44,5 @@
   .markdown-body pre { padding: 10px 11px; }
   .mention-line { font-size: 12.5px; }
 }
+.message-annotations{margin-top:9px;border-top:1px solid #d7dce5;padding-top:7px;font-size:12px}
+.message-annotations summary{cursor:pointer;color:#4a65a1;font-weight:600}.message-annotations>div{padding:8px 0;border-bottom:1px solid #e2e5ed}.message-annotations strong{font-size:11px;overflow-wrap:anywhere}.message-annotations p{margin:5px 0;white-space:pre-wrap;overflow-wrap:anywhere}.message-annotations small{display:block;color:#8b95a7;overflow-wrap:anywhere}

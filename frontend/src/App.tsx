@@ -39,7 +39,9 @@ import "./App.css";
 import ExecutionPermissions from './ExecutionPermissions';
 import ResourceSettings from './ResourceSettings';
 import SessionUsagePanel from './SessionUsagePanel';
-import WebsitePreview from './WebsitePreview';
+import WebsitePreview, { type WebsitePreviewHandle } from './WebsitePreview';
+import AnnotationDrafts from './AnnotationDrafts';
+import { annotationRequest, selectionIdentity, type VisualAnnotation, type VisualContext } from './visualFeedback';
 import { requestsForTurn, reviewProgress } from './DeliveryProgress';
 
 const OfficeScene = lazy(() => import("./OfficeScene"));
@@ -145,7 +147,15 @@ function Workspace({ onRecordsCleared }: { onRecordsCleared: () => void }) {
   const [search, setSearch] = useState("");
   const [input, setInput] = useState("");
   const [showWebsite, setShowWebsite] = useState(false);
-  useEffect(() => { setShowWebsite(false); }, [active?.id]);
+  const [annotationDrafts, setAnnotationDrafts] = useState<Record<string, VisualAnnotation[]>>({});
+  const [currentSelection, setCurrentSelection] = useState<VisualContext | null>(null);
+  const currentSelectionRef = useRef(currentSelection); currentSelectionRef.current = currentSelection;
+  const [preparingMessage, setPreparingMessage] = useState(false);
+  const preparing = useRef(false);
+  const website = useRef<WebsitePreviewHandle>(null);
+  const activeId = useRef(active?.id); activeId.current = active?.id;
+  const annotations = active ? annotationDrafts[active.id] || [] : [];
+  useEffect(() => { setShowWebsite(false); setCurrentSelection(null); }, [active?.id]);
   const [interfaceStyle, setInterfaceStyle] = useState("");
   const [useScenario, setUseScenario] = useState("");
   const [preferences, setPreferences] = useState<string[]>([]);
@@ -405,11 +415,34 @@ function Workspace({ onRecordsCleared }: { onRecordsCleared: () => void }) {
 
   async function send(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    try { await sendContent(composePrompt(input.trim(), interfaceStyle, useScenario, preferences)); } catch { /* Error is displayed by sendContent. */ }
+    if ((!input.trim() && !annotations.length) || streaming || executionAction || !active || preparing.current) return;
+    const conversation = active.id, draft = input;
+    const sentIds = new Set(annotations.map(item => item.id));
+    preparing.current = true; setPreparingMessage(true); setError('');
+    try {
+      if (annotations.some(item => !item.comment.trim())) throw new Error('请补全空白批注，或删除后再发送。');
+      const selection = currentSelection ? await website.current?.captureSelection() : null;
+      if (currentSelection && (!selection || !selection.elements.length && !selection.region)) throw new Error('当前选区已失效，请重新选择或移除当前选区。');
+      if (currentSelection && selectionIdentity(currentSelection) !== selectionIdentity(selection)) throw new Error('选区已变化，请确认位置后重新发送。');
+      if (activeId.current !== conversation) return;
+      const content = annotationRequest(composePrompt(draft.trim(), interfaceStyle, useScenario, preferences), annotations, selection);
+      if (content.length > 19000) throw new Error('消息过长，请缩短内容或分批发送；草稿会保留。');
+      const sent = await sendContent(content);
+      if (!sent) return;
+      setAnnotationDrafts(current => ({ ...current, [conversation]: (current[conversation] || []).filter(item => !sentIds.has(item.id)) }));
+      if (activeId.current === conversation) {
+        setInput(value => value === draft ? '' : value);
+        setInterfaceStyle(''); setUseScenario(''); setPreferences([]);
+        if (selection && selectionIdentity(currentSelectionRef.current) === selectionIdentity(selection)) {
+          website.current?.clearSelection(); setCurrentSelection(null);
+        }
+      }
+    } catch (cause) { if (activeId.current === conversation) setError(cause instanceof Error ? cause.message : '发送失败，草稿已保留'); }
+    finally { preparing.current = false; setPreparingMessage(false); }
   }
 
-  async function sendContent(content: string, fromPreview = false) {
-    if (!content || streaming || executionAction || !active) return;
+  async function sendContent(content: string) {
+    if (!content || streaming || executionAction || !active) throw new Error('当前无法发送，请稍后重试。');
     const conversationId = active.id;
     const updateConversation = (update: (item: ConversationView) => ConversationView) =>
       setActive(current => current?.id === conversationId ? update(current) : current);
@@ -419,9 +452,6 @@ function Workspace({ onRecordsCleared }: { onRecordsCleared: () => void }) {
       ...item,
       messages: [...item.messages, { id: clientMessageId, sender: "user", content, time: clockTime(), createdAt: Date.now() }],
     }));
-    if (!fromPreview) {
-      setInput(""); setInterfaceStyle(""); setUseScenario(""); setPreferences([]);
-    }
     setError("");
     executionVersion.current++;
     setExecution(current => ({ ...current, [conversationId]: { running: true, stopping: false, paused: current[conversationId]?.paused || false, pending_tasks: current[conversationId]?.pending_tasks || 0, active_goals: current[conversationId]?.active_goals || 0 } }));
@@ -469,6 +499,7 @@ function Workspace({ onRecordsCleared }: { onRecordsCleared: () => void }) {
           })));
         },
       }, abort.signal);
+      return !abort.signal.aborted;
     } catch (cause) {
       if (!abort.signal.aborted) setError(cause instanceof Error ? cause.message : "请求失败");
       if (!abort.signal.aborted) throw cause;
@@ -542,7 +573,13 @@ function Workspace({ onRecordsCleared }: { onRecordsCleared: () => void }) {
         <span className="creation-progress-label">制作进度</span>
         {progressLabels.map((label, index) => <span className={`creation-progress-step ${index < progressStep ? "complete" : index === progressStep ? "current" : ""}`} key={label}><i aria-hidden="true" />{label}</span>)}
       </div>
-      {showWebsite && active ? <WebsitePreview key={active.id} busy={streaming || !!executionAction} onRequest={content => sendContent(content, true)} onClose={() => setShowWebsite(false)} /> : <><div className="office-content" inert={!!openFile}>
+      {showWebsite && active ? <WebsitePreview key={active.id} ref={website} annotations={annotations} onSelection={setCurrentSelection}
+        busy={streaming || !!executionAction || preparingMessage} onRequest={async content => { await sendContent(content); }}
+        onAnnotation={item => {
+          const conversation = active.id;
+          setAnnotationDrafts(current => ({ ...current, [conversation]: [...(current[conversation] || []), item] }));
+          setPanel('chat'); setShowCollaboration(false);
+        }} onClose={() => { setShowWebsite(false); setCurrentSelection(null); }} /> : <><div className="office-content" inert={!!openFile}>
         <Suspense fallback={<div className="office-loading" role="status"><span aria-hidden="true" /><strong>正在准备办公场景</strong><small>首次加载 3D 资源可能需要一点时间</small></div>}>
           <OfficeScene agents={agents} />
         </Suspense>
@@ -593,7 +630,10 @@ function Workspace({ onRecordsCleared }: { onRecordsCleared: () => void }) {
           </div>}
           {error && <p className="error" role="alert">{error}</p>}
           <form className="composer" onSubmit={send}>
-            <textarea aria-label="发送消息" placeholder="给团队发消息…" value={input} onChange={(event) => setInput(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); event.currentTarget.form?.requestSubmit(); } }} rows={2} />
+            <AnnotationDrafts items={annotations} current={currentSelection} disabled={streaming || preparingMessage}
+              onChange={items => setAnnotationDrafts(current => ({ ...current, [active.id]: items }))}
+              onClearSelection={() => { website.current?.clearSelection(); setCurrentSelection(null); }} />
+            <textarea aria-label="发送消息" placeholder={annotations.length ? '补充整体要求，或直接发送全部批注…' : currentSelection ? '告诉团队这个选区要怎样修改…' : '给团队发消息…'} value={input} onChange={(event) => setInput(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) { event.preventDefault(); event.currentTarget.form?.requestSubmit(); } }} rows={2} />
             <div className="prompt-controls" aria-label="补充页面要求">
               <details className="prompt-control">
                 <summary className={interfaceStyle ? "selected" : ""}>界面风格{interfaceStyle && <span>{interfaceStyle}</span>}</summary>
@@ -612,7 +652,7 @@ function Workspace({ onRecordsCleared }: { onRecordsCleared: () => void }) {
               <span>Enter 发送 · Shift + Enter 换行</span>
               {canStop ? <button className="composer-submit" type="button" disabled={executionAction !== null} onClick={() => void controlExecution('stop')} aria-label="停止生成" title="停止当前对话的生成、任务和运行进程">
                 {executionAction === active.id ? <span className="composer-spinner" aria-hidden="true" /> : <svg viewBox="0 0 20 20" aria-hidden="true"><rect x="5.5" y="5.5" width="9" height="9" rx="1.5" fill="currentColor" stroke="none" /></svg>}
-              </button> : <button className="composer-submit" type="submit" disabled={!input.trim() || streaming || executionAction !== null} aria-label="发送" title="发送消息">
+              </button> : <button className="composer-submit" type="submit" disabled={(!input.trim() && !annotations.length) || streaming || preparingMessage || executionAction !== null} aria-label="发送" title="发送消息">
                 <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M10 15V5m-4 4 4-4 4 4" /></svg>
               </button>}
             </div>

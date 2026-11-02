@@ -3,6 +3,7 @@ import remarkGfm from "remark-gfm";
 import remarkBreaks from "remark-breaks";
 import type { TeamChatMessage } from "./api";
 import { memberName, mentionPrefix } from "./TeamIdentity";
+import { readAnnotationMessage, selectionLabel } from './visualFeedback';
 import "./MessageContent.css";
 
 type Message = TeamChatMessage & { read?: boolean; readBy?: string[] };
@@ -24,6 +25,14 @@ function Mention({ worker, read }: { worker: string; read: boolean }) {
 }
 
 export default function MessageContent({ message }: { message: Message }) {
+  const annotations = message.sender === 'user' ? readAnnotationMessage(message.content) : null;
+  if (annotations) return <>
+    <Markdown>{annotations.requirement}</Markdown>
+    <details className="message-annotations"><summary>{annotations.items.length} 条网页批注</summary>
+      {annotations.items.map((item, index) => <div key={index}><strong>{index + 1}. {selectionLabel(item.context)}</strong>
+        <p>{item.comment}</p><small>{item.context.url}</small></div>)}
+    </details>
+  </>;
   // Mentions remain structured UI, so Markdown cannot consume receipt markers.
   if (message.mentions?.length) return <>{message.mentions.map(mention => <div className="mention-line" key={mention.worker}>
     <Mention worker={mention.worker} read={(message.readBy || []).includes(mention.worker)} />{" "}

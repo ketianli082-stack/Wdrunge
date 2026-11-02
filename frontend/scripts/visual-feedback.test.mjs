@@ -1,4 +1,4 @@
-/** Run against a Vite dev server; set WDRUNGE_PLAYWRIGHT_MODULE for an existing installation. */
+/** Local browser regression; all backend/model requests below are mocked. */
 import { createServer } from 'node:http';
 import { createRequire } from 'node:module';
 import assert from 'node:assert/strict';
@@ -16,10 +16,35 @@ try {
   browser = await chromium.launch({ headless: true, ...(process.env.WDRUNGE_TEST_BROWSER ? { channel: process.env.WDRUNGE_TEST_BROWSER } : {}) });
   const page = await browser.newPage({ viewport: { width: 1200, height: 900 } });
   await page.goto(`${base}/dev/visual-feedback.html`);
-  async function waitFor(fn) { await page.waitForFunction(fn); }
+  const frame = page.frameLocator('iframe');
   async function open(path = '/') {
     await page.getByLabel('预览网站地址').fill(target + path);
     await page.getByRole('button', { name: '打开', exact: true }).click();
+  }
+  async function closePopup(surface = page) {
+    const close = surface.getByRole('button', { name: '关闭批注框', exact: true });
+    if (await close.isVisible()) { await close.click(); await close.waitFor({ state: 'hidden' }); }
+  }
+  async function select(id, options = {}) {
+    await closePopup();
+    const before = await page.evaluate(() => ({ version: window.feedbackSelectionVersion,
+      selectors: window.feedbackSelection?.elements.map(element => element.selector) || [] }));
+    const expected = before.selectors.includes(id) ? before.selectors.filter(selector => selector !== id)
+      : options.modifiers?.includes('Shift') ? [...before.selectors, id] : [id];
+    await frame.locator(id).click(options);
+    // The iframe event crosses postMessage and React effects before the new popup opens.
+    // Wait for both the new selection and its rendered popup before the next user action.
+    await page.waitForFunction(({ version, expected }) => window.feedbackSelectionVersion > version
+      && JSON.stringify(window.feedbackSelection?.elements.map(element => element.selector) || []) === JSON.stringify(expected),
+    { version: before.version, expected });
+    await page.getByRole('form', { name: '选区批注' }).waitFor({ state: expected.length ? 'visible' : 'hidden' });
+  }
+  async function add(comment, count) {
+    await page.getByLabel('选区批注意见', { exact: true }).fill(comment);
+    await page.getByRole('button', { name: '添加批注', exact: true }).click();
+    await page.waitForFunction(count => window.feedbackAnnotations.length === count, count);
+    await page.getByRole('form', { name: '选区批注' }).waitFor({ state: 'hidden' });
+    assert.equal(await page.evaluate(() => window.feedbackRequests.length), 0, 'saving a comment must not call the model');
   }
   await page.getByLabel('预览网站地址').fill('https://example.com');
   await page.getByRole('button', { name: '打开', exact: true }).click();
@@ -27,152 +52,106 @@ try {
   assert.equal(await page.locator('iframe').count(), 0);
   await open();
   await page.getByText('已连接，可点选元素', { exact: true }).waitFor();
-  const frame = page.frameLocator('iframe');
   await page.getByRole('button', { name: '选择修改位置', exact: true }).click();
-  await frame.locator('#save').click();
+  await select('#save');
   await page.getByText('已选中 button', { exact: true }).waitFor();
-  assert.equal(await frame.locator('body').evaluate(() => Boolean(window.clicked)), false, 'inspection must not trigger button action');
-  await page.getByLabel('网页修改要求').fill('点击后保存文章到数据库，同时把按钮文字加粗');
-  await page.getByRole('button', { name: '发送修改要求', exact: true }).click();
-  await waitFor(() => window.feedbackRequests.length === 1);
-  const message = await page.evaluate(() => window.feedbackRequests[0]);
-  assert.match(message, /保存文章到数据库/);
-  assert.match(message, /src\/Card.tsx:12/);
-  assert.match(message, /#save/);
-  assert.doesNotMatch(message, /private-secret|private-editable/);
-  await page.getByRole('button', { name: '选择父级区域' }).click();
+  assert.equal(await frame.locator('body').evaluate(() => Boolean(window.clicked)), false);
+  assert.equal(await page.locator('.website-annotation').count(), 0, 'no bottom modification form');
+  await add('点击后保存文章到数据库，同时把按钮文字加粗', 1);
+  const first = await page.evaluate(() => window.feedbackAnnotations[0]);
+  assert.match(first.comment, /保存文章到数据库/);
+  assert.equal(first.context.elements[0].selector, '#save');
+  assert.equal(first.context.elements[0].source, 'src/Card.tsx:12');
+  assert.doesNotMatch(JSON.stringify(first), /private-secret|private-editable/);
+  await select('#title');
+  await page.getByRole('button', { name: '选择父级区域', exact: true }).click();
   await page.getByText('已选中 section', { exact: true }).waitFor();
-  await page.getByLabel('网页修改要求').fill('这个区域背景改成浅蓝色');
-  await page.getByRole('button', { name: '发送修改要求', exact: true }).click();
-  await waitFor(() => window.feedbackRequests.length === 2);
-  assert.doesNotMatch(await page.evaluate(() => window.feedbackRequests[1]), /private-secret|private-editable/);
-  await page.getByRole('button', { name: '清空选择', exact: true }).click();
-  await page.getByRole('button', { name: '浏览网页', exact: true }).click();
-  await frame.locator('#save').click();
-  assert.equal(await frame.locator('body').evaluate(() => window.clicked), true, 'normal mode restores interaction');
-  // Parent-origin spoofing and malformed selections must not change the selected state.
-  await page.evaluate(() => window.postMessage({ type: 'wdrunge:selected', token: 'fake', selection: {} }, '*'));
-  assert.equal(await page.getByText('已选中 section', { exact: true }).count(), 0);
-  await page.getByRole('button', { name: '刷新', exact: true }).click();
-  await page.getByText('已连接，可点选元素', { exact: true }).waitFor();
-  await page.getByRole('button', { name: '选择修改位置', exact: true }).click();
-  await frame.locator('#title').hover();
-  await page.keyboard.press('Escape');
-  await page.getByText('已连接，可点选元素', { exact: true }).waitFor();
-
-  // Persistent selection mode: switch without cancel; clicking the same target toggles it off.
-  await page.getByRole('button', { name: '选择修改位置', exact: true }).click();
-  await frame.locator('#title').click();
-  await page.getByText('已选中 h2', { exact: true }).waitFor();
-  await frame.locator('#save').click();
-  await page.getByText('已选中 button', { exact: true }).waitFor();
-  await frame.locator('#save').click();
-  await page.waitForFunction(() => !document.querySelector('.website-annotation'));
-  await frame.locator('#title').click();
-  await frame.locator('#save').click({ modifiers: ['Shift'] });
+  await add('这个区域背景改成浅蓝色', 2);
+  assert.doesNotMatch(await page.evaluate(() => JSON.stringify(window.feedbackAnnotations[1])), /private-secret|private-editable/);
+  // Switching targets cannot silently bind an unsaved comment to another element.
+  await select('#title');
+  await page.getByLabel('选区批注意见', { exact: true }).fill('不应绑定到另一个按钮');
+  await select('#save');
+  assert.equal(await page.getByLabel('选区批注意见', { exact: true }).inputValue(), '');
+  await select('#save');
+  await page.waitForFunction(() => !window.feedbackSelection?.elements.length);
+  await select('#title');
+  await select('#save', { modifiers: ['Shift'] });
   await page.getByText('已选中 2 个元素', { exact: true }).waitFor();
-  await page.getByLabel('网页修改要求').fill('两个元素统一加粗');
-  await page.getByRole('button', { name: '发送修改要求', exact: true }).click();
-  await waitFor(() => window.feedbackRequests.length === 3);
-  assert.match(await page.evaluate(() => window.feedbackRequests[2]), /commonAncestor/);
-  await page.getByRole('button', { name: '移除第 2 个元素' }).click();
-  await page.getByText('已选中 h2', { exact: true }).waitFor();
-
-  // Dynamic attributes/text are refreshed, and the request reads the DOM again before sending.
-  await frame.locator('#title').evaluate(element => { element.textContent = '动态更新标题'; element.style.color = 'rgb(255, 0, 0)'; });
+  await add('两个元素统一加粗', 3);
+  assert(await page.evaluate(() => Boolean(window.feedbackAnnotations[2].context.commonAncestor)));
+  // Add-time snapshot uses current text/styles; disconnected nodes invalidate current selection.
+  await select('#title');
+  await frame.locator('#title').evaluate(element => { element.textContent = '动态更新标题'; element.style.fontWeight = '900'; });
   await page.locator('.website-selection-list').getByText('h2 · 动态更新标题', { exact: true }).waitFor();
-  await page.getByLabel('网页修改要求').fill('基于最新标题修改');
-  await frame.locator('#title').evaluate(element => { element.style.fontWeight = '900'; });
-  await page.getByRole('button', { name: '发送修改要求', exact: true }).click();
-  await waitFor(() => window.feedbackRequests.length === 4);
-  const dynamic = await page.evaluate(() => window.feedbackRequests[3]);
-  assert.match(dynamic, /动态更新标题/); assert.match(dynamic, /"fontWeight":"900"/);
+  await add('基于最新标题修改', 4);
+  const dynamic = await page.evaluate(() => window.feedbackAnnotations[3]);
+  assert.equal(dynamic.context.elements[0].styles.fontWeight, '900');
+  assert.equal(dynamic.context.elements[0].text, '动态更新标题');
+  await select('#title');
   await frame.locator('#title').evaluate(element => element.replaceWith(Object.assign(document.createElement('h2'), { id: 'title', textContent: '替换后的标题' })));
-  await page.waitForFunction(() => !document.querySelector('.website-annotation'));
-  await frame.locator('#title').click();
-  await page.getByText('已选中 h2', { exact: true }).waitFor();
-
-  // SPA routes invalidate prior references; address typing must survive heartbeat messages.
+  await page.getByRole('form', { name: '选区批注' }).waitFor({ state: 'hidden' });
+  await select('#title');
   await frame.locator('body').evaluate(() => history.pushState({}, '', '/spa?tab=design'));
-  await page.waitForFunction(() => !document.querySelector('.website-annotation'));
+  await page.waitForFunction(() => !window.feedbackSelection?.elements.length);
+  assert.equal(await page.evaluate(() => window.feedbackAnnotations.length), 4, 'saved notes survive navigation as snapshots');
   await page.waitForFunction(() => document.querySelector('[aria-label="预览网站地址"]').value.endsWith('/spa?tab=design'));
   await page.getByLabel('预览网站地址').fill(target + '/user-typing');
-  const start = Date.now();
-  await page.waitForFunction(start => Date.now() - start > 1000, start);
+  const start = Date.now(); await page.waitForFunction(start => Date.now() - start > 1000, start);
   assert.equal(await page.getByLabel('预览网站地址').inputValue(), target + '/user-typing');
   await page.getByRole('button', { name: '浏览网页', exact: true }).click();
+  await frame.locator('#save').click();
+  assert.equal(await frame.locator('body').evaluate(() => window.clicked), true);
   await frame.locator('#next-link').click();
   await page.getByText('已连接，可点选元素', { exact: true }).waitFor();
   await page.waitForFunction(() => document.querySelector('[aria-label="预览网站地址"]').value.endsWith('/next'));
   await page.getByRole('button', { name: '选择修改位置', exact: true }).click();
-  await frame.locator('#title').click();
-  await page.getByText('已选中 h2', { exact: true }).waitFor();
-
-  // Real drag selection: include title and button, not the whole card.
-  assert.equal(await page.getByRole('button', { name: '框选区域', exact: true }).count(), 0, 'point and region use one mode');
+  // Genuine drag in the same mode; popup and bottom form are not needed to start it.
   const titleBox = await frame.locator('#title').boundingBox(), buttonBox = await frame.locator('#save').boundingBox();
-  await page.mouse.move(titleBox.x - 3, titleBox.y - 3);
-  await page.mouse.down();
-  await page.mouse.move(titleBox.x + titleBox.width + 3, buttonBox.y + buttonBox.height + 3, { steps: 10 });
-  await page.mouse.up();
+  await page.mouse.move(titleBox.x - 3, titleBox.y - 3); await page.mouse.down();
+  await page.mouse.move(titleBox.x + titleBox.width + 3, buttonBox.y + buttonBox.height + 3, { steps: 10 }); await page.mouse.up();
   await page.getByText('已框选区域 · 2 个元素', { exact: true }).waitFor();
-  await page.getByLabel('网页修改要求').fill('这个区域增加间距');
-  await page.getByRole('button', { name: '发送修改要求', exact: true }).click();
-  await waitFor(() => window.feedbackRequests.length === 5);
-  const regionMessage = await page.evaluate(() => window.feedbackRequests[4]);
-  assert.match(regionMessage, /"region":/); assert.match(regionMessage, /#title/); assert.match(regionMessage, /#save/);
-  assert.doesNotMatch(regionMessage, /private-secret|private-editable/);
-
-  // Click immediately after a drag, with no mode switch; small hand jitter stays a click.
-  await frame.locator('#save').click();
-  await page.getByText('已选中 h2', { exact: true }).waitFor(); // Clicking an already selected member removes it.
-  await frame.locator('#save').click();
-  await page.getByText('已选中 button', { exact: true }).waitFor();
-  const jitterBox = await frame.locator('#title').boundingBox();
-  await page.mouse.move(jitterBox.x + 20, jitterBox.y + 10);
-  await page.mouse.down();
-  await page.mouse.move(jitterBox.x + 22, jitterBox.y + 11);
-  await page.mouse.up();
+  await add('这个区域增加间距', 5);
+  const region = await page.evaluate(() => window.feedbackAnnotations[4]);
+  assert(region.context.region); assert.equal(region.context.elements.length, 2);
+  assert.doesNotMatch(JSON.stringify(region), /private-secret|private-editable/);
+  const jitter = await frame.locator('#title').boundingBox();
+  await page.mouse.move(jitter.x + 20, jitter.y + 10); await page.mouse.down();
+  await page.mouse.move(jitter.x + 22, jitter.y + 11); await page.mouse.up();
   await page.getByText('已选中 h2', { exact: true }).waitFor();
-  assert.equal(await frame.locator('body').evaluate(() => Boolean(window.clicked)), false, 'drag and click do not execute the page button');
-  assert.equal(await frame.locator('body').evaluate(() => getSelection().toString()), '', 'drag does not select page text');
-  const additiveBox = await frame.locator('#save').boundingBox();
-  await page.keyboard.down('Shift');
-  await page.mouse.move(additiveBox.x - 2, additiveBox.y - 2);
-  await page.mouse.down();
-  await page.mouse.move(additiveBox.x + additiveBox.width + 2, additiveBox.y + additiveBox.height + 2, { steps: 6 });
-  await page.mouse.up();
-  await page.keyboard.up('Shift');
-  await page.getByText('已框选区域 · 2 个元素', { exact: true }).waitFor();
-
+  await page.keyboard.press('Escape');
+  await page.getByText('已连接，可点选元素', { exact: true }).waitFor();
+  await page.evaluate(() => window.postMessage({ type: 'wdrunge:selection', token: 'fake', pageId: 'fake', context: {} }, '*'));
+  assert.equal(await page.getByRole('form', { name: '选区批注' }).count(), 0);
   await open('/plain');
-  await page.getByRole('button', { name: '选择修改位置', exact: true }).waitFor();
-  await page.waitForFunction(() => document.querySelector('iframe')?.contentWindow !== null);
   assert.equal(await page.getByRole('button', { name: '选择修改位置', exact: true }).isDisabled(), true);
   await page.getByText('网页可以浏览，但还不能点选？接入选择脚本', { exact: true }).click();
   await page.getByRole('button', { name: '让 Agent 接入', exact: true }).click();
-  await waitFor(() => window.feedbackRequests.length === 6);
-  assert.match(await page.evaluate(() => window.feedbackRequests[5]), /仅限开发环境/);
+  await page.waitForFunction(() => window.feedbackRequests.length === 1);
+  assert.match(await page.evaluate(() => window.feedbackRequests[0]), /仅限开发环境/);
   const checks = await page.evaluate(() => {
-    const { localPreviewUrl, parseSelection } = window.feedbackTest;
-    return { bad: ['javascript:alert(1)', 'http://evil.test', 'http://localhost.evil.test', 'http://a:b@localhost:8101'].map(value => {
+    const { localPreviewUrl, parseSelection, annotationRequest } = window.feedbackTest;
+    const bad = ['javascript:alert(1)', 'http://evil.test', 'http://localhost.evil.test', 'http://a:b@localhost:8101'].every(value => {
       try { localPreviewUrl(value); return false; } catch { return true; }
-    }), malformed: parseSelection({ url: 'http://localhost', rect: {} }) };
+    });
+    let oversized = false; try { annotationRequest('x'.repeat(20000), window.feedbackAnnotations); } catch { oversized = true; }
+    return { bad, oversized, malformed: parseSelection({ url: 'http://localhost', rect: {} }) };
   });
-  assert(checks.bad.every(Boolean)); assert.equal(checks.malformed, null);
-  // Exercise the production App → existing chat stream boundary without paid model calls.
-  const app = await browser.newPage({ viewport: { width: 1500, height: 1000 } });
-  let submitted = null;
+  assert(checks.bad); assert(checks.oversized); assert.equal(checks.malformed, null);
+  // Production App: adding notes never sends; chat combines all notes into one request.
+  const app = await browser.newPage({ viewport: { width: 1600, height: 1100 } });
+  const submissions = []; let failNext = false;
   let execution = { running: false, paused: false, stopping: false, pending_tasks: 0, active_goals: 0, task_states: {} };
   const timestamp = new Date().toISOString();
-  const project = { id: 'visual-project', name: 'Visual test', workspace_path: 'E:/demo', created_at: timestamp, updated_at: timestamp,
-    conversations: [{ id: 'visual-chat', project_id: 'visual-project', title: 'Visual test', status: 'idle', created_at: timestamp, updated_at: timestamp }] };
+  const conversations = ['visual-chat', 'other-chat'].map((id, index) => ({ id, project_id: 'visual-project', title: index ? 'Other chat' : 'Visual test', status: 'idle', created_at: timestamp, updated_at: timestamp }));
+  const project = { id: 'visual-project', name: 'Visual test', workspace_path: 'E:/demo', created_at: timestamp, updated_at: timestamp, conversations };
   await app.route('**/api/**', async route => {
     const request = route.request(), path = new URL(request.url()).pathname;
-    if (request.method() === 'OPTIONS') return route.fulfill({ status: 204, headers: { 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Headers': 'content-type', 'Access-Control-Allow-Methods': 'GET,POST' } });
     const headers = { 'Access-Control-Allow-Origin': '*' };
+    if (request.method() === 'OPTIONS') return route.fulfill({ status: 204, headers: { ...headers, 'Access-Control-Allow-Headers': 'content-type', 'Access-Control-Allow-Methods': 'GET,POST' } });
     if (path.endsWith('/messages/stream')) {
-      submitted = request.postDataJSON();
+      submissions.push({ path, ...request.postDataJSON() });
+      if (failNext) { failNext = false; return route.fulfill({ status: 500, headers, contentType: 'application/json', body: '{"detail":"mock send failure"}' }); }
       return route.fulfill({ headers, contentType: 'text/event-stream', body: 'event: delta\ndata: {"content":"已收到修改要求","message_id":"reply"}\n\nevent: done\ndata: {}\n\n' });
     }
     let body = {};
@@ -180,33 +159,100 @@ try {
     else if (path === '/api/team') body = { agents: [] };
     else if (path.endsWith('/events')) body = { events: [], cursor: 0, has_more: false };
     else if (path.endsWith('/execution')) body = execution;
-    else if (path === '/api/conversations/visual-chat') body = { ...project.conversations[0], project_name: project.name, workspace_path: project.workspace_path, activities: [], messages: submitted ? [{ id: 'user', sender: 'user', content: submitted.content, kind: 'user', status: 'completed', sequence: 1, read_by: [], completed_by: [], created_at: timestamp }] : [] };
-    else if (path.includes('/delivery/')) body = { entries: [], revision: 'test', truncated: false };
+    else if (/\/api\/conversations\/[^/]+$/.test(path)) {
+      const chat = conversations.find(item => path.endsWith('/' + item.id));
+      body = { ...chat, project_name: project.name, workspace_path: project.workspace_path, activities: [], messages: [] };
+    } else if (path.includes('/delivery/')) body = { entries: [], revision: 'test', truncated: false };
     return route.fulfill({ headers, contentType: 'application/json', body: JSON.stringify(body) });
   });
   await app.goto(base);
-  await app.getByRole('button', { name: '网站预览 ↗', exact: true }).click();
-  await app.getByLabel('预览网站地址').fill(target);
-  await app.getByRole('button', { name: '打开', exact: true }).click();
-  await app.getByText('已连接，可点选元素', { exact: true }).waitFor();
-  await app.getByRole('button', { name: '选择修改位置', exact: true }).click();
-  await app.frameLocator('iframe').locator('#title').click();
-  await app.getByLabel('网页修改要求').fill('把标题改成蓝色并加粗');
-  await app.getByRole('button', { name: '发送修改要求', exact: true }).click();
-  await app.waitForFunction(() => document.querySelector('.chat-feed')?.textContent.includes('把标题改成蓝色并加粗'));
-  assert(submitted?.client_message_id);
-  assert.match(submitted.content, /把标题改成蓝色并加粗/);
-  assert.match(submitted.content, /#title/);
-  await app.waitForFunction(() => !document.querySelector('.processing'));
+  async function openPreview() {
+    await app.getByRole('button', { name: '网站预览 ↗', exact: true }).click();
+    await app.getByLabel('预览网站地址').fill(target);
+    await app.getByRole('button', { name: '打开', exact: true }).click();
+    await app.getByText('已连接，可点选元素', { exact: true }).waitFor();
+    await app.getByRole('button', { name: '选择修改位置', exact: true }).click();
+  }
+  async function appNote(id, comment) {
+    await closePopup(app); await app.frameLocator('iframe').locator(id).click();
+    await app.getByLabel('选区批注意见', { exact: true }).fill(comment);
+    await app.getByRole('button', { name: '添加批注', exact: true }).click();
+    await app.getByRole('form', { name: '选区批注' }).waitFor({ state: 'hidden' });
+  }
+  await app.getByLabel('发送消息', { exact: true }).fill('整体保持简洁');
+  await openPreview();
+  await appNote('#title', '标题改成蓝色');
+  await appNote('#save', '保存按钮加粗');
+  await app.getByText('2 条批注', { exact: false }).waitFor();
+  assert.equal(submissions.length, 0);
+  assert.equal(await app.getByLabel('发送消息', { exact: true }).inputValue(), '整体保持简洁');
+  await app.getByLabel('编辑批注 2', { exact: true }).fill('保存按钮加粗并增大圆角');
+  await app.locator('.prompt-control > summary').filter({ hasText: '界面风格' }).click();
+  await app.getByRole('button', { name: '清爽简约', exact: true }).click();
+  if (process.env.WDRUNGE_TEST_SCREENSHOT) {
+    await app.frameLocator('iframe').locator('#card').click({ position: { x: 430, y: 180 } });
+    await app.getByRole('form', { name: '选区批注' }).waitFor();
+    await app.screenshot({ path: process.env.WDRUNGE_TEST_SCREENSHOT });
+    await app.getByRole('button', { name: '移除当前选区', exact: true }).click();
+  }
+  await app.getByRole('button', { name: '发送', exact: true }).click();
+  await app.waitForFunction(() => !document.querySelector('.annotation-drafts'));
+  assert.equal(submissions.length, 1);
+  assert(submissions[0].client_message_id);
+  assert.match(submissions[0].content, /整体保持简洁/);
+  assert.match(submissions[0].content, /界面风格：清爽简约/);
+  assert.match(submissions[0].content, /标题改成蓝色/);
+  assert.match(submissions[0].content, /保存按钮加粗并增大圆角/);
+  assert.match(submissions[0].content, /#title/); assert.match(submissions[0].content, /#save/);
+  assert.doesNotMatch(submissions[0].content, /private-secret|private-editable/);
+  assert.equal(await app.getByLabel('发送消息', { exact: true }).inputValue(), '');
+  // Annotation-only messages are valid; deletion affects the actual payload.
+  await appNote('#title', '删除后不能发送的意见');
+  await app.getByRole('button', { name: '删除批注 1', exact: true }).click();
+  await appNote('#save', '只发送批注也可以');
+  await app.getByRole('button', { name: '发送', exact: true }).click();
+  await app.waitForFunction(() => !document.querySelector('.annotation-drafts'));
+  assert.equal(submissions.length, 2);
+  assert.match(submissions[1].content, /只发送批注也可以/);
+  assert.doesNotMatch(submissions[1].content, /删除后不能发送的意见/);
+  // Failed request preserves annotations and normal text for retry.
+  await appNote('#title', '失败后保留的标题批注');
+  await app.getByLabel('发送消息', { exact: true }).fill('失败后保留的群聊草稿');
+  failNext = true;
+  await app.getByRole('button', { name: '发送', exact: true }).click();
+  await app.getByRole('alert').filter({ hasText: /mock send failure|500|失败/ }).first().waitFor();
+  assert.equal(submissions.length, 3);
+  assert.equal(await app.getByLabel('编辑批注 1', { exact: true }).inputValue(), '失败后保留的标题批注');
+  assert.equal(await app.getByLabel('发送消息', { exact: true }).inputValue(), '失败后保留的群聊草稿');
+  await app.getByRole('button', { name: '发送', exact: true }).click();
+  await app.waitForFunction(() => !document.querySelector('.annotation-drafts'));
+  assert.equal(submissions.length, 4);
+  // An unsaved current selection can go directly with the chat, using a fresh snapshot.
+  await app.frameLocator('iframe').locator('#save').click();
+  await app.getByText('当前选区', { exact: false }).first().waitFor();
+  await closePopup(app);
+  await app.getByLabel('发送消息', { exact: true }).fill('直接修改当前选区');
+  await app.frameLocator('iframe').locator('#save').evaluate(element => element.style.fontWeight = '900');
+  await app.getByRole('button', { name: '发送', exact: true }).click();
+  await app.waitForFunction(() => !document.querySelector('.annotation-drafts'));
+  assert.equal(submissions.length, 5);
+  assert.match(submissions[4].content, /currentSelection/);
+  assert.match(submissions[4].content, /"fontWeight":"900"/);
+  // Saved annotation drafts are scoped to their conversation.
+  await appNote('#title', '只属于第一个会话');
+  await app.getByRole('button', { name: /Other chat/ }).click();
+  await app.getByLabel('发送消息', { exact: true }).waitFor();
+  assert.equal(await app.getByLabel('编辑批注 1', { exact: true }).count(), 0);
+  await app.locator('.history-item').filter({ hasText: 'Visual test' }).click();
+  await app.getByLabel('编辑批注 1', { exact: true }).waitFor();
+  assert.equal(await app.getByLabel('编辑批注 1', { exact: true }).inputValue(), '只属于第一个会话');
+  assert.equal(submissions.length, 5);
   execution = { ...execution, running: true, pending_tasks: 1, task_states: { review: 1 } };
   await app.getByText('代码已交付 · 1 项待 Leader 验收', { exact: true }).waitFor();
   execution = { ...execution, running: false, pending_tasks: 0, task_states: {} };
   await app.waitForFunction(() => !document.querySelector('.processing'));
-  if (process.env.WDRUNGE_TEST_SCREENSHOT) await app.screenshot({ path: process.env.WDRUNGE_TEST_SCREENSHOT });
-  console.log('PASS: cross-origin preview, selection, parent scope, private fields, editing request, normal clicks, refresh, Escape, setup, URL/message validation');
-  console.log('PASS: production App sends selected element and requirement through the existing persisted-chat stream API (mock backend, no model calls)');
-  console.log('PASS: continuous/toggle/Shift selection, live DOM updates, detached elements, SPA/full navigation, heartbeat input, drag regions, truthful review and idle status');
+  console.log('PASS: floating comments, continuous point/drag selection, live DOM, navigation, private fields, setup and URL validation');
+  console.log('PASS: batch annotations plus chat text use one mocked stream request; annotation-only send, edit/delete, failure retention and per-chat drafts');
 } finally {
-  await browser?.close();
-  await new Promise(resolve => server.close(resolve));
+  await browser?.close(); await new Promise(resolve => server.close(resolve));
 }
