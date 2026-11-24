@@ -1,4 +1,4 @@
-import { useEffect, useLayoutEffect, useRef, useState, type FormEvent } from "react";
+import { lazy, Suspense, useEffect, useLayoutEffect, useRef, useState, type FormEvent } from "react";
 import { isTauri } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import {
@@ -14,9 +14,12 @@ import {
   getConversationEvents,
   getTeamStatus,
   getConversationUsage,
+  getCollaborationSnapshot,
   type SessionUsage,
+  type CollaborationSnapshot,
   listProjects,
   streamConversationMessage,
+  executionLabel,
   type Activity,
   type ConversationDetail,
   type ProjectSummary,
@@ -25,11 +28,12 @@ import {
   type TeamUsage,
 } from "./api";
 import { applyConversationEvent } from "./conversationEvents";
+import { displayConversationTitle } from "./conversationTitle";
 import AgentContextPanel from "./AgentContextPanel";
 import CollaborationPanel from "./CollaborationPanel";
+import ConversationHistory, { conversationPreferencesKey } from "./ConversationHistory";
 import DeliveryPanel from "./DeliveryPanel";
 import { DeliveryPreview, useDeliveryFiles } from "./DeliveryFiles";
-import OfficeScene from "./OfficeScene";
 import AgentAvatar from "./AgentAvatar";
 import MessageContent from "./MessageContent";
 import { memberName, teamIdentities } from "./TeamIdentity";
@@ -37,6 +41,12 @@ import "./App.css";
 import ExecutionPermissions from './ExecutionPermissions';
 import ResourceSettings from './ResourceSettings';
 import SessionUsagePanel from './SessionUsagePanel';
+import WebsitePreview, { type WebsitePreviewHandle } from './WebsitePreview';
+import AnnotationDrafts from './AnnotationDrafts';
+import { annotationRequest, selectionIdentity, type VisualAnnotation, type VisualContext } from './visualFeedback';
+import { requestsForTurn, reviewProgress } from './DeliveryProgress';
+
+const OfficeScene = lazy(() => import("./OfficeScene"));
 
 type VisibleMessage = TeamChatMessage & {
   read?: boolean;
@@ -52,6 +62,21 @@ type ConversationView = Omit<ConversationDetail, "messages" | "activities"> & {
 };
 type Panel = "chat" | "activity" | "collaboration" | "context";
 
+const interfaceStyles = ["Blue-violet tech", "Clean & minimal", "Warm & natural", "Bright & playful", "Editorial"] as const;
+const useScenarios = ["General website", "Portfolio", "Course showcase", "Event promotion", "Content hub", "Product showcase"] as const;
+const developmentPreferences = ["Responsive layout", "Mobile first", "Accessibility first", "Subtle motion", "Dark mode support"] as const;
+
+function composePrompt(content: string, style: string, scenario: string, preferences: string[]) {
+  const constraints = [
+    style && `- Interface Style: ${style}`,
+    scenario && `- Use Case: ${scenario}`,
+    preferences.length > 0 && `- Development Preferences: ${preferences.join(", ")}`,
+  ].filter(Boolean);
+  return constraints.length
+    ? `${content}\n\nAdditional requirements to follow:\n${constraints.join("\n")}`
+    : content;
+}
+
 const initialAgents: TeamMember[] = [
   { id: "leader", name: memberName("leader"), status: "idle", tools: [], skills: [] },
   { id: "product", name: memberName("product"), status: "idle", tools: [], skills: [] },
@@ -62,7 +87,7 @@ const initialAgents: TeamMember[] = [
 ];
 
 function clockTime(value = new Date()) {
-  return new Intl.DateTimeFormat("zh-CN", { hour: "2-digit", minute: "2-digit", hour12: false }).format(value);
+  return new Intl.DateTimeFormat("en-GB", { hour: "2-digit", minute: "2-digit", hour12: false }).format(value);
 }
 
 function toConversationView(detail: ConversationDetail): ConversationView {
@@ -123,6 +148,19 @@ function Workspace({ onRecordsCleared }: { onRecordsCleared: () => void }) {
   useEffect(() => { setShowCollaboration(false); }, [active?.id, panel]);
   const [search, setSearch] = useState("");
   const [input, setInput] = useState("");
+  const [showWebsite, setShowWebsite] = useState(false);
+  const [annotationDrafts, setAnnotationDrafts] = useState<Record<string, VisualAnnotation[]>>({});
+  const [currentSelection, setCurrentSelection] = useState<VisualContext | null>(null);
+  const currentSelectionRef = useRef(currentSelection); currentSelectionRef.current = currentSelection;
+  const [preparingMessage, setPreparingMessage] = useState(false);
+  const preparing = useRef(false);
+  const website = useRef<WebsitePreviewHandle>(null);
+  const activeId = useRef(active?.id); activeId.current = active?.id;
+  const annotations = active ? annotationDrafts[active.id] || [] : [];
+  useEffect(() => { setShowWebsite(false); setCurrentSelection(null); }, [active?.id]);
+  const [interfaceStyle, setInterfaceStyle] = useState("");
+  const [useScenario, setUseScenario] = useState("");
+  const [preferences, setPreferences] = useState<string[]>([]);
   const [streamingConversation, setStreamingConversation] = useState<string | null>(null);
   const streaming = streamingConversation !== null;
   const [execution, setExecution] = useState<Record<string, ConversationExecution>>({});
@@ -152,7 +190,28 @@ function Workspace({ onRecordsCleared }: { onRecordsCleared: () => void }) {
 
   const activeProject = projects.find((project) => project.id === (active?.project_id || activeProjectId));
   const [openFile, setOpenFile] = useState<{project: string; path: string} | null>(null);
+  const [collaborationSnapshot, setCollaborationSnapshot] = useState<CollaborationSnapshot>({ request: [] });
   const deliveryFiles = useDeliveryFiles(activeProject?.id);
+  const deliveredEntries = deliveryFiles.entries.filter((entry) => entry.kind === "file");
+  const latestUserMessage = [...(active?.messages || [])].reverse().find(message => message.sender === "user");
+  const latestUserMessageAt = latestUserMessage?.createdAt || 0;
+  const currentDeliveryEntries = deliveredEntries.filter((entry) => latestUserMessageAt > 0 && entry.modified / 1_000_000 >= latestUserMessageAt);
+  const previewEntry = [...currentDeliveryEntries].sort((left, right) => {
+    const priority = (path: string) => /(^|\/)index\.html?$/i.test(path) ? 0 : /\.html?$/i.test(path) ? 1 : /(^|\/)readme\.(md|markdown)$/i.test(path) ? 2 : /\.(png|jpe?g|webp|gif|svg|pdf)$/i.test(path) ? 3 : 4;
+    return priority(left.path) - priority(right.path) || left.path.localeCompare(right.path);
+  })[0];
+  useEffect(() => {
+    const project = activeProject?.id;
+    setCollaborationSnapshot({ request: [] });
+    if (!project) return;
+    const controller = new AbortController();
+    const refresh = () => void getCollaborationSnapshot(project, controller.signal)
+      .then(snapshot => { if (!controller.signal.aborted) setCollaborationSnapshot(snapshot); })
+      .catch(() => { /* Delivery progress retains its last verified state during a transient reconnect. */ });
+    refresh();
+    const timer = setInterval(refresh, 3000);
+    return () => { controller.abort(); clearInterval(timer); };
+  }, [activeProject?.id]);
   useEffect(() => { setOpenFile(null); }, [activeProject?.id]);
   function showFile(path: string) {
     if (activeProject) {
@@ -202,7 +261,7 @@ function Workspace({ onRecordsCleared }: { onRecordsCleared: () => void }) {
         }
       }),
     ])).catch((cause) => {
-      if (!abort.signal.aborted) setError(cause instanceof Error ? cause.message : "加载项目失败");
+      if (!abort.signal.aborted) setError(cause instanceof Error ? cause.message : "Could not load projects.");
     }).finally(() => setLoading(false));
     return () => abort.abort();
   }, []);
@@ -271,7 +330,7 @@ function Workspace({ onRecordsCleared }: { onRecordsCleared: () => void }) {
       const detail = await getConversation(id);
       setActive(current => current?.id === id ? toConversationView(detail) : current);
     } catch (cause) {
-      setError(cause instanceof Error ? cause.message : '无法更新任务状态，请重试');
+      setError(cause instanceof Error ? cause.message : 'Could not update task status. Try again.');
     } finally { setExecutionAction(null); }
   }
 
@@ -299,7 +358,7 @@ function Workspace({ onRecordsCleared }: { onRecordsCleared: () => void }) {
       const created = await createConversation(projectId);
       await refreshProjects(created.id);
     } catch (cause) {
-      setError(cause instanceof Error ? cause.message : "新建对话失败");
+      setError(cause instanceof Error ? cause.message : "Could not create the chat.");
     }
   }
 
@@ -317,7 +376,7 @@ function Workspace({ onRecordsCleared }: { onRecordsCleared: () => void }) {
       setWorkspaceDraft("");
       await refreshProjects(conversation.id);
     } catch (cause) {
-      setProjectError(cause instanceof Error ? cause.message : "创建项目失败");
+      setProjectError(cause instanceof Error ? cause.message : "Could not create the project.");
     } finally {
       setProjectSaving(false);
     }
@@ -331,12 +390,12 @@ function Workspace({ onRecordsCleared }: { onRecordsCleared: () => void }) {
         directory: true,
         multiple: false,
         canCreateDirectories: true,
-        title: "选择项目文件夹",
+        title: "Choose a project folder",
         defaultPath: workspaceDraft || undefined,
       });
       if (typeof selected === "string") setWorkspaceDraft(selected);
     } catch (cause) {
-      setProjectError(cause instanceof Error ? cause.message : "无法打开文件夹选择器");
+      setProjectError(cause instanceof Error ? cause.message : "Could not open the folder picker.");
     }
   }
 
@@ -347,19 +406,47 @@ function Workspace({ onRecordsCleared }: { onRecordsCleared: () => void }) {
     controller.current?.abort.abort();
     try {
       await clearAllRecords();
+      try { window.localStorage.removeItem(conversationPreferencesKey); }
+      catch { /* Storage may be unavailable. */ }
       // Remount all project state and subscriptions; old async responses belong
       // to the discarded workspace and cannot restore deleted records.
       onRecordsCleared();
     } catch (cause) {
-      setResetError(cause instanceof Error ? cause.message : "清除失败，请重试");
+      setResetError(cause instanceof Error ? cause.message : "Could not clear records. Try again.");
       setResetting(false);
     }
   }
 
   async function send(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    const content = input.trim();
-    if (!content || streaming || executionAction || !active) return;
+    if ((!input.trim() && !annotations.length) || streaming || executionAction || !active || preparing.current) return;
+    const conversation = active.id, draft = input;
+    const sentIds = new Set(annotations.map(item => item.id));
+    preparing.current = true; setPreparingMessage(true); setError('');
+    try {
+      if (annotations.some(item => !item.comment.trim())) throw new Error('Fill in or remove empty annotations before sending.');
+      const selection = currentSelection ? await website.current?.captureSelection() : null;
+      if (currentSelection && (!selection || !selection.elements.length && !selection.region)) throw new Error('This selection is no longer available. Select the area again or remove it.');
+      if (currentSelection && selectionIdentity(currentSelection) !== selectionIdentity(selection)) throw new Error('The selection changed. Confirm the area and send again.');
+      if (activeId.current !== conversation) return;
+      const content = annotationRequest(composePrompt(draft.trim(), interfaceStyle, useScenario, preferences), annotations, selection);
+      if (content.length > 19000) throw new Error('The message is too long. Shorten it or send it in batches. Your drafts are saved.');
+      const sent = await sendContent(content);
+      if (!sent) return;
+      setAnnotationDrafts(current => ({ ...current, [conversation]: (current[conversation] || []).filter(item => !sentIds.has(item.id)) }));
+      if (activeId.current === conversation) {
+        setInput(value => value === draft ? '' : value);
+        setInterfaceStyle(''); setUseScenario(''); setPreferences([]);
+        if (selection && selectionIdentity(currentSelectionRef.current) === selectionIdentity(selection)) {
+          website.current?.clearSelection(); setCurrentSelection(null);
+        }
+      }
+    } catch (cause) { if (activeId.current === conversation) setError(cause instanceof Error ? cause.message : 'Could not send. Your drafts are saved.'); }
+    finally { preparing.current = false; setPreparingMessage(false); }
+  }
+
+  async function sendContent(content: string) {
+    if (!content || streaming || executionAction || !active) throw new Error('Could not send right now. Try again shortly.');
     const conversationId = active.id;
     const updateConversation = (update: (item: ConversationView) => ConversationView) =>
       setActive(current => current?.id === conversationId ? update(current) : current);
@@ -369,7 +456,6 @@ function Workspace({ onRecordsCleared }: { onRecordsCleared: () => void }) {
       ...item,
       messages: [...item.messages, { id: clientMessageId, sender: "user", content, time: clockTime(), createdAt: Date.now() }],
     }));
-    setInput("");
     setError("");
     executionVersion.current++;
     setExecution(current => ({ ...current, [conversationId]: { running: true, stopping: false, paused: current[conversationId]?.paused || false, pending_tasks: current[conversationId]?.pending_tasks || 0, active_goals: current[conversationId]?.active_goals || 0 } }));
@@ -417,8 +503,10 @@ function Workspace({ onRecordsCleared }: { onRecordsCleared: () => void }) {
           })));
         },
       }, abort.signal);
+      return !abort.signal.aborted;
     } catch (cause) {
-      if (!abort.signal.aborted) setError(cause instanceof Error ? cause.message : "请求失败");
+      if (!abort.signal.aborted) setError(cause instanceof Error ? cause.message : "Request failed.");
+      if (!abort.signal.aborted) throw cause;
     } finally {
       controller.current = null;
       setStreamingConversation(null);
@@ -436,97 +524,141 @@ function Workspace({ onRecordsCleared }: { onRecordsCleared: () => void }) {
     }
   }
 
-  const visibleProjects = projects.map((project) => ({
-    ...project,
-    conversations: project.name.toLowerCase().includes(search.toLowerCase())
-      ? project.conversations
-      : project.conversations.filter((conversation) => conversation.title.toLowerCase().includes(search.toLowerCase())),
-  })).filter((project) => !search || project.name.toLowerCase().includes(search.toLowerCase()) || project.conversations.length > 0);
+  const hasUserRequest = latestUserMessageAt > 0;
+  const teamWorking = canStop;
+  const testingRunning = active?.activities.some((activity) => activity.agent === "testing" && activity.phase === "running" && (activity.createdAt || 0) >= latestUserMessageAt) || false;
+  const turnRequests = requestsForTurn(collaborationSnapshot.request || [], active?.id, latestUserMessage?.id, latestUserMessageAt);
+  const review = reviewProgress(turnRequests, testingRunning);
+  const deliveryReady = currentDeliveryEntries.length > 0;
+  const finalCheckReady = deliveryReady && review.accepted && !teamWorking;
+  const progressStep = finalCheckReady ? 3 : deliveryReady || review.checking || review.accepted ? 2 : hasUserRequest ? 1 : 0;
+  const progressLabels = ["Plan", "Build", "Review", "Ready"];
 
   return <main className="workspace">
-    <aside className="sidebar" aria-label="项目与聊天历史">
+    <aside className="sidebar" aria-label="Projects and chat history">
       <div className="sidebar-head">
         <div className="brand"><span className="brand-mark">W</span><strong>Wdrunge</strong></div>
-        <button className="new-project" onClick={() => { setProjectError(""); setProjectDialog(true); }} disabled={streaming}><span>＋</span> 新建项目</button>
-        <label className="history-search"><span>⌕</span><input aria-label="搜索项目和对话" placeholder="搜索项目或对话" value={search} onChange={(event) => setSearch(event.target.value)} /></label>
+        <button className="new-project" onClick={() => { setProjectError(""); setProjectDialog(true); }} disabled={streaming}><span>＋</span> New Project</button>
+        <label className="history-search"><span>⌕</span><input aria-label="Search projects and chats" placeholder="Search projects and chats" value={search} onChange={(event) => setSearch(event.target.value)} /></label>
       </div>
-      <nav className="project-list" aria-label="项目列表">
-        {visibleProjects.map((project) => <section className={`project-group ${project.id === activeProject?.id ? "selected" : ""}`} key={project.id}>
-          <div className="project-row">
-            <button className="project-name" onClick={() => { setActiveProjectId(project.id); if (project.conversations[0]) void openConversation(project.conversations[0].id); else setActive(null); }} title={project.workspace_path}><span className="project-folder">▾</span><span>{project.name}</span></button>
-            <button className="project-new-chat" onClick={() => void startConversation(project.id)} disabled={streaming} title="新建对话">＋</button>
-          </div>
-          <div className="project-conversations">
-            {project.conversations.map((conversation) => <button key={conversation.id} className={`history-item ${conversation.id === active?.id ? "selected" : ""}`} onClick={() => void openConversation(conversation.id)} title={conversation.title}><span className="history-icon">◻</span><span>{conversation.title}</span></button>)}
-            {project.conversations.length === 0 && <button className="empty-project-chat" onClick={() => void startConversation(project.id)}>创建第一段对话</button>}
-          </div>
-        </section>)}
-        {!loading && visibleProjects.length === 0 && <div className="history-empty">{search ? "没有匹配的项目或对话" : "还没有项目"}</div>}
-      </nav>
+      <ConversationHistory projects={projects} search={search} loading={loading}
+        activeProject={activeProject?.id} activeConversation={active?.id} creating={streaming}
+        onOpenProject={(project, conversation) => {
+          setActiveProjectId(project);
+          if (conversation) void openConversation(conversation);
+          else setActive(null);
+        }} onOpenConversation={id => void openConversation(id)} onCreate={id => void startConversation(id)} />
       <ExecutionPermissions />
-      <div className="debug-tools"><small>调试工具</small><button onClick={() => { setResetError(""); setResetDialog(true); }} disabled={loading || projectSaving}>清除所有记录</button></div>
+      <div className="debug-tools"><small>Debug tools</small><button onClick={() => { setResetError(""); setResetDialog(true); }} disabled={loading || projectSaving}>Clear All Records</button></div>
       <div className="team-menu-wrap" ref={teamMenuRef} onKeyDown={(event) => { if (event.key === "Escape") setTeamMenu(false); }}>
-        {teamMenu && <div className="team-menu" role="menu" aria-label="Agent 团队">
-          <button role="menuitem" autoFocus onClick={() => { setTeamMenu(false); setResourceSettings(true); }}>服务连接与数据库<small>统一配置数据库、缓存等服务的地址和账号</small></button>
+        {teamMenu && <div className="team-menu" role="menu" aria-label="Agent Team">
+          <button role="menuitem" autoFocus onClick={() => { setTeamMenu(false); setResourceSettings(true); }}>Services & Databases<small>Manage addresses and accounts for databases, caches, and other services.</small></button>
         </div>}
-        <button className="sidebar-foot team-menu-trigger" aria-haspopup="menu" aria-expanded={teamMenu} onClick={() => setTeamMenu((open) => !open)}><span className="foot-mark">W</span><span>Agent 团队<small>{agents.length} 位成员已就位</small></span></button>
+        <button className="sidebar-foot team-menu-trigger" aria-haspopup="menu" aria-expanded={teamMenu} onClick={() => setTeamMenu((open) => !open)}><span className="foot-mark">W</span><span>Agent Team<small>{agents.length} members ready</small></span></button>
       </div>
     </aside>
 
-    <section className="office" aria-label="Agent 办公室"><div style={{width:'100%',height:'100%'}} inert={!!openFile}><OfficeScene agents={agents} /></div>{openFile && activeProject?.id === openFile.project && <DeliveryPreview key={`${openFile.project}:${openFile.path}`} project={openFile.project} path={openFile.path} revision={deliveryFiles.revision} status={deliveryFiles.status} onClose={() => setOpenFile(null)} onOpen={showFile} />}</section>
-
-    <aside className="right-rail" aria-label="团队交流与工作日志">
-      <div className="rail-tabs" role="tablist" aria-label="右侧内容">
-        <button role="tab" aria-selected={panel === "chat"} className={panel === "chat" ? "active" : ""} onClick={() => setPanel("chat")}>团队群聊</button>
-        <button role="tab" aria-selected={panel === "activity"} className={panel === "activity" ? "active" : ""} onClick={() => setPanel("activity")}>工作日志 <span>{active?.activities.length || 0}</span></button>
-        <button role="tab" aria-selected={panel === "collaboration"} className={panel === "collaboration" ? "active" : ""} onClick={() => setPanel("collaboration")}>交付文档</button>
-        <button role="tab" aria-selected={panel === "context"} className={panel === "context" ? "active" : ""} onClick={() => setPanel("context")}>Agent 上下文</button>
+    <section className="office" aria-label="Agent Office">
+      <div className="creation-progress" aria-label="Build progress" role="status">
+        <span className="creation-progress-label">Build progress</span>
+        {progressLabels.map((label, index) => <span className={`creation-progress-step ${index < progressStep ? "complete" : index === progressStep ? "current" : ""}`} key={label}><i aria-hidden="true" />{label}</span>)}
       </div>
-      {panel === "collaboration" && activeProject ? <DeliveryPanel key={activeProject.id} files={deliveryFiles} selected={openFile?.path || null} onOpen={showFile} /> : !active ? <section className="chat-panel empty-conversation"><div className="chat-welcome"><span className="welcome-icon">W</span><strong>{activeProject ? activeProject.name : "开始使用 Wdrunge"}</strong><p>{activeProject ? "在此项目中创建一段对话。" : "先创建一个项目，团队会围绕项目工作区持续协作。"}</p><button onClick={() => activeProject ? void startConversation(activeProject.id) : setProjectDialog(true)}>{activeProject ? "新建对话" : "新建项目"}</button></div></section> : panel === "context" ? <AgentContextPanel key={active.id} conversation={active.id} /> : panel === "chat" ? <section className="chat-panel" role="tabpanel" aria-label="团队群聊">
-        <header className="panel-heading"><div><strong>{active.project_name} · {active.title}</strong><span>{Object.values(teamIdentities).map((member) => member.name).join(" · ")}</span></div><div className="chat-heading-actions"><button aria-expanded={showCollaboration} onClick={() => setShowCollaboration(value => !value)}>{showCollaboration ? "返回群聊" : "任务与协作"}</button><span className="member-count">6 人</span></div></header>
+      {showWebsite && active ? <WebsitePreview key={active.id} ref={website} annotations={annotations} onSelection={setCurrentSelection}
+        busy={streaming || !!executionAction || preparingMessage} onRequest={async content => { await sendContent(content); }}
+        onAnnotation={item => {
+          const conversation = active.id;
+          setAnnotationDrafts(current => ({ ...current, [conversation]: [...(current[conversation] || []), item] }));
+          setPanel('chat'); setShowCollaboration(false);
+        }} onClose={() => { setShowWebsite(false); setCurrentSelection(null); }} /> : <><div className="office-content" inert={!!openFile}>
+        <Suspense fallback={<div className="office-loading" role="status"><span aria-hidden="true" /><strong>Loading the office…</strong><small>3D assets may take a moment to load.</small></div>}>
+          <OfficeScene agents={agents} />
+        </Suspense>
+      </div>{active && <button className="website-preview-toggle" onClick={() => { setOpenFile(null); setShowWebsite(true); }}>Site Preview ↗</button>}</>}
+      {openFile && activeProject?.id === openFile.project && <DeliveryPreview key={`${openFile.project}:${openFile.path}`} project={openFile.project} path={openFile.path} revision={deliveryFiles.revision} status={deliveryFiles.status} onClose={() => setOpenFile(null)} onOpen={showFile} />}
+    </section>
+
+    <aside className="right-rail" aria-label="Team chat and activity">
+      <div className="rail-tabs" role="tablist" aria-label="Workspace panels">
+        <button role="tab" aria-selected={panel === "chat"} className={panel === "chat" ? "active" : ""} onClick={() => setPanel("chat")}>Team Chat</button>
+        <button role="tab" aria-selected={panel === "activity"} className={panel === "activity" ? "active" : ""} onClick={() => setPanel("activity")}>Activity <span>{active?.activities.length || 0}</span></button>
+        <button role="tab" aria-selected={panel === "collaboration"} className={panel === "collaboration" ? "active" : ""} onClick={() => setPanel("collaboration")}>Deliverables</button>
+        <button role="tab" aria-selected={panel === "context"} className={panel === "context" ? "active" : ""} onClick={() => setPanel("context")}>Agent Context</button>
+      </div>
+      {panel === "collaboration" && activeProject ? <DeliveryPanel key={activeProject.id} files={deliveryFiles} selected={openFile?.path || null} onOpen={showFile} /> : !active ? <section className="chat-panel empty-conversation"><div className="chat-welcome"><span className="welcome-icon">W</span><strong>{activeProject ? activeProject.name : "Welcome to Wdrunge"}</strong><p>{activeProject ? "Start a chat in this project." : "Create a project to give your team a shared workspace."}</p><button onClick={() => activeProject ? void startConversation(activeProject.id) : setProjectDialog(true)}>{activeProject ? "New Chat" : "New Project"}</button></div></section> : panel === "context" ? <AgentContextPanel key={active.id} conversation={active.id} /> : panel === "chat" ? <section className="chat-panel" role="tabpanel" aria-label="Team Chat">
+        <header className="panel-heading"><div><strong>{active.project_name} · {displayConversationTitle(active.title)}</strong><span>{Object.values(teamIdentities).map((member) => member.name).join(" · ")}</span></div><div className="chat-heading-actions"><button aria-expanded={showCollaboration} onClick={() => setShowCollaboration(value => !value)}>{showCollaboration ? "Back to Chat" : "Tasks"}</button><span className="member-count">6 members</span></div></header>
         {showCollaboration ? <CollaborationPanel key={active.id} project={active.project_id} conversation={active.id} onOpen={showFile} /> : <>
-        <div className="workspace-banner"><span title={active.workspace_path}>项目工作区 · {active.workspace_path}</span></div>
+        <div className="workspace-banner"><span title={active.workspace_path}>Workspace · {active.workspace_path}</span></div>
         <div className="chat-feed" ref={chatFeed} onScroll={event => {
           const feed = event.currentTarget;
           chatPosition.current = feed.scrollTop;
           followChat.current = feed.scrollHeight - feed.clientHeight - feed.scrollTop <= 32;
         }}>
-          {active.messages.length === 0 && <div className="chat-welcome"><span className="welcome-icon">W</span><strong>开始一段对话</strong><p>向{memberName("leader")}发送消息。团队记录会保存在项目下。</p></div>}
-          {active.messages.map((message) => <article className={`chat-message ${message.sender === "user" ? "mine" : ""}`} key={message.id}><AgentAvatar agent={message.sender} /><div className="message-body"><div className="message-meta"><strong>{nameOf(message.sender)}</strong><time>{message.time}</time></div><div className="bubble"><MessageContent message={message} /></div>{!!message.completedBy?.length && <div className="message-reactions" aria-label="任务完成状态">{message.completedBy.map((worker) => <span className="done-reaction" key={worker} title={`${nameOf(worker)}已完成`}><span aria-hidden="true">✓</span> Done · {nameOf(worker)}</span>)}</div>}</div></article>)}
-          {canStop && <div className="processing"><i /><i /><i /><span>团队正在处理</span></div>}
+          {active.messages.length === 0 && <div className="chat-welcome"><span className="welcome-icon">W</span><strong>Start a chat</strong><p>Message {teamIdentities.leader.name} to get started. Chats are saved to the project.</p></div>}
+          {active.messages.map((message) => <article className={`chat-message ${message.sender === "user" ? "mine" : ""}`} key={message.id}><AgentAvatar agent={message.sender} /><div className="message-body"><div className="message-meta"><strong>{nameOf(message.sender)}</strong><time>{message.time}</time></div><div className="bubble"><MessageContent message={message} /></div>{!!message.completedBy?.length && <div className="message-reactions" aria-label="Task completion">{message.completedBy.map((worker) => <span className="done-reaction" key={worker} title={`${nameOf(worker)} completed`}><span aria-hidden="true">✓</span> Done · {nameOf(worker)}</span>)}</div>}</div></article>)}
+          {canStop && <div className="processing" role="status"><i /><i /><i /><span>{executionLabel(activeExecution, streamingConversation === active.id, turnRequests, active.id)}</span></div>}
         </div>
+        {hasUserRequest && <details className="delivery-ready-card" aria-label="Page status">
+          <summary><div><span className="delivery-ready-spark" aria-hidden="true">✦</span><strong>{finalCheckReady ? "Ready to preview" : deliveryReady ? (review.checking || teamWorking ? "Review in progress" : "Awaiting verified acceptance") : "Building page"}</strong></div><span className="delivery-ready-meta"><small>{deliveryFiles.status === "live" ? "Live sync" : "Connecting to files…"}</small><i aria-hidden="true">⌄</i></span></summary>
+          <div className="delivery-ready-body">
+            <div className="delivery-ready-checks">
+              {[
+                { label: "Page built", done: deliveryReady, working: teamWorking && !deliveryReady },
+                { label: "Verification accepted", done: review.accepted, working: review.checking },
+                { label: "Delivery ready", done: finalCheckReady, working: review.checking || (deliveryReady && teamWorking) },
+              ].map((item) => <span className={item.done ? "done" : item.working ? "working" : "waiting"} key={item.label}><i aria-hidden="true">{item.done ? "✓" : item.working ? "•" : "○"}</i>{item.label}<small>{item.done ? "Complete" : item.working ? "In progress" : "Pending"}</small></span>)}
+            </div>
+            <button type="button" disabled={!previewEntry} onClick={() => previewEntry && showFile(previewEntry.path)} title={previewEntry ? `Preview ${previewEntry.path}` : "Preview is available after files are delivered"}>Open Preview <span aria-hidden="true">↗</span></button>
+          </div>
+        </details>}
         <div className="composer-area">
           {activeExecution?.paused && <div className="composer-paused">
-            <span role="status"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M5.5 4.5v7m5-7v7" /></svg>上次任务已挂起</span>
-            <button className="composer-resume" type="button" disabled={executionAction !== null} onClick={() => void controlExecution('resume')} title="手动继续当前会话的未完成任务">
+            <span role="status"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M5.5 4.5v7m5-7v7" /></svg>Previous tasks paused</span>
+            <button className="composer-resume" type="button" disabled={executionAction !== null} onClick={() => void controlExecution('resume')} title="Resume unfinished tasks in this chat">
               {executionAction === active.id ? <span className="composer-spinner" aria-hidden="true" /> : <svg viewBox="0 0 16 16" aria-hidden="true"><path d="m6 4 6 4-6 4Z" /></svg>}
-              继续任务
+              Resume
             </button>
           </div>}
           {error && <p className="error" role="alert">{error}</p>}
           <form className="composer" onSubmit={send}>
-            <textarea aria-label="发送消息" placeholder="给团队发消息…" value={input} onChange={(event) => setInput(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); event.currentTarget.form?.requestSubmit(); } }} rows={2} />
+            <AnnotationDrafts items={annotations} current={currentSelection} disabled={streaming || preparingMessage}
+              onChange={items => setAnnotationDrafts(current => ({ ...current, [active.id]: items }))}
+              onClearSelection={() => { website.current?.clearSelection(); setCurrentSelection(null); }} />
+            <textarea aria-label="Message the team…" placeholder={annotations.length ? 'Add instructions or send your annotations…' : currentSelection ? 'Describe what to change in this area…' : 'Message the team…'} value={input} onChange={(event) => setInput(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) { event.preventDefault(); event.currentTarget.form?.requestSubmit(); } }} rows={2} />
+            <div className="prompt-controls" aria-label="Page requirements">
+              <details className="prompt-control">
+                <summary className={interfaceStyle ? "selected" : ""}>Interface Style{interfaceStyle && <span>{interfaceStyle}</span>}</summary>
+                <div className="prompt-popover"><strong>Choose a style</strong><small>Included in your instructions to the team.</small>{interfaceStyles.map((style) => <button type="button" className={interfaceStyle === style ? "active" : ""} onClick={(event) => { setInterfaceStyle(interfaceStyle === style ? "" : style); event.currentTarget.closest("details")?.removeAttribute("open"); }} key={style}>{style}{interfaceStyle === style && <span>✓</span>}</button>)}</div>
+              </details>
+              <details className="prompt-control">
+                <summary className={useScenario ? "selected" : ""}>Use Case{useScenario && <span>{useScenario}</span>}</summary>
+                <div className="prompt-popover"><strong>Choose a use case</strong><small>Helps the team organize the page.</small>{useScenarios.map((scenario) => <button type="button" className={useScenario === scenario ? "active" : ""} onClick={(event) => { setUseScenario(useScenario === scenario ? "" : scenario); event.currentTarget.closest("details")?.removeAttribute("open"); }} key={scenario}>{scenario}{useScenario === scenario && <span>✓</span>}</button>)}</div>
+              </details>
+              <details className="prompt-control">
+                <summary className={preferences.length ? "selected" : ""}>More Options{preferences.length > 0 && <span>{preferences.length} selected</span>}</summary>
+                <div className="prompt-popover prompt-popover-wide"><strong>Development preferences</strong><small>Select any that apply.</small>{developmentPreferences.map((preference) => <button type="button" className={preferences.includes(preference) ? "active" : ""} onClick={() => setPreferences((current) => current.includes(preference) ? current.filter((item) => item !== preference) : [...current, preference])} key={preference}>{preference}{preferences.includes(preference) && <span>✓</span>}</button>)}</div>
+              </details>
+            </div>
             <div className="composer-bottom">
-              <span>Enter 发送 · Shift + Enter 换行</span>
-              {canStop ? <button className="composer-submit" type="button" disabled={executionAction !== null} onClick={() => void controlExecution('stop')} aria-label="停止生成" title="停止当前对话的生成、任务和运行进程">
+              <span>Enter to send · Shift+Enter for a new line</span>
+              {canStop ? <button className="composer-submit" type="button" disabled={executionAction !== null} onClick={() => void controlExecution('stop')} aria-label="Stop" title="Stop generation, tasks, and running processes for this chat">
                 {executionAction === active.id ? <span className="composer-spinner" aria-hidden="true" /> : <svg viewBox="0 0 20 20" aria-hidden="true"><rect x="5.5" y="5.5" width="9" height="9" rx="1.5" fill="currentColor" stroke="none" /></svg>}
-              </button> : <button className="composer-submit" type="submit" disabled={!input.trim() || streaming || executionAction !== null} aria-label="发送" title="发送消息">
+              </button> : <button className="composer-submit" type="submit" disabled={(!input.trim() && !annotations.length) || streaming || preparingMessage || executionAction !== null} aria-label="Send" title="Send message">
                 <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M10 15V5m-4 4 4-4 4 4" /></svg>
               </button>}
             </div>
           </form>
         </div>
         </>}
-      </section> : <section className="log-panel" role="tabpanel" aria-label="工作日志">
-        <div className="usage-dashboard"><SessionUsagePanel usage={active && sessionUsage?.conversation_id === active.id ? sessionUsage : null} nameOf={nameOf} allTokens={usage.total_tokens} /><div className="context-usage"><div className="context-heading" title="按模型每次回复返回的用量更新，界面每 3 秒同步；同一角色多实例显示最高上下文占用。">上下文窗口占用</div>{agents.map((agent) => { const item = usage.agents.find((member) => member.id === agent.id); const percent = item?.context_percent ?? 0; return <div className="context-row" key={agent.id} title={`${item?.context_tokens ?? 0} / ${item?.context_window ?? 131072} tokens`}><span title={nameOf(agent.id)}>{nameOf(agent.id)}</span><div className="context-track"><i style={{ width: `${Math.min(percent, 100)}%` }} /></div><strong>{percent.toFixed(1)}%</strong></div>; })}</div></div>
-        <header className="panel-heading"><div><strong>工具调用时间线</strong><span>按时间记录 Agent 的工具调用</span></div><span className="member-count">{active.activities.length} 条</span></header>
-        <div className="activity-feed">{active.activities.length === 0 ? <div className="activity-empty">暂无工具调用记录</div> : <ol className="timeline">{[...active.activities].reverse().map((item) => <li key={item.id}><span className="timeline-avatar"><AgentAvatar agent={item.agent} /><span className={`timeline-dot ${item.phase}`} /></span><div className="timeline-top"><strong>{nameOf(item.agent)}</strong><time>{item.time}</time></div><p>{item.description}</p><div className="timeline-foot"><code>{item.tool}</code><span className={`activity-phase ${item.phase}`}>{item.phase === "running" ? "进行中" : item.phase === "completed" ? "已完成" : "失败"}</span></div></li>)}</ol>}</div>
+      </section> : <section className="log-panel" role="tabpanel" aria-label="Activity">
+        <div className="usage-dashboard"><SessionUsagePanel usage={active && sessionUsage?.conversation_id === active.id ? sessionUsage : null} nameOf={nameOf} allTokens={usage.total_tokens} /><div className="context-usage"><div className="context-heading" title="Updated every 3 seconds from model usage. For roles with multiple instances, the highest context usage is shown.">Context usage</div>{agents.map((agent) => { const item = usage.agents.find((member) => member.id === agent.id); const percent = item?.context_percent ?? 0; return <div className="context-row" key={agent.id} title={`${item?.context_tokens ?? 0} / ${item?.context_window ?? 131072} tokens`}><span title={nameOf(agent.id)}>{memberName(agent.id, false)}</span><div className="context-track"><i style={{ width: `${Math.min(percent, 100)}%` }} /></div><strong>{percent.toFixed(1)}%</strong></div>; })}</div></div>
+        <header className="panel-heading"><div><strong>Tool Activity</strong><span>Agent tool calls in chronological order</span></div><span className="member-count">{active.activities.length} calls</span></header>
+        <div className="activity-feed">{active.activities.length === 0 ? <div className="activity-empty">No tool calls yet.</div> : <ol className="timeline">{[...active.activities].reverse().map((item) => <li key={item.id}><span className="timeline-avatar"><AgentAvatar agent={item.agent} /><span className={`timeline-dot ${item.phase}`} /></span><div className="timeline-top"><strong>{nameOf(item.agent)}</strong><time>{item.time}</time></div><p>{item.description}</p><div className="timeline-foot"><code>{item.tool}</code><span className={`activity-phase ${item.phase}`}>{item.phase === "running" ? "In progress" : item.phase === "completed" ? "Complete" : "Failed"}</span></div></li>)}</ol>}</div>
       </section>}
     </aside>
 
     {resourceSettings && <ResourceSettings projects={projects} activeProject={activeProject} onClose={() => setResourceSettings(false)} />}
-    {resetDialog && <div className="workspace-dialog-backdrop" role="presentation"><section className="workspace-dialog" role="alertdialog" aria-modal="true" aria-labelledby="reset-title" aria-describedby="reset-description"><h2 id="reset-title">清除所有记录？</h2><div id="reset-description"><p>将停止正在执行的任务，并清除所有项目、对话、工作日志、协作请求、文档版本与订阅、消息、模型记忆和 Token 统计。</p><p>工作区中的实际文件会保留。已清除的记录无法撤销。</p></div>{resetError && <p className="workspace-dialog-error" role="alert">{resetError}</p>}<div className="workspace-dialog-actions"><button autoFocus onClick={() => setResetDialog(false)} disabled={resetting}>取消</button><button className="reset-confirm" onClick={() => void resetRecords()} disabled={resetting}>{resetting ? "正在停止任务并清除…" : "确认清除全部记录"}</button></div></section></div>}
-    {projectDialog && <div className="workspace-dialog-backdrop" role="presentation"><form className="workspace-dialog" onSubmit={saveProject} role="dialog" aria-modal="true" aria-label="新建项目"><h2>新建项目</h2><p>项目对应一个本机工作区，并可以包含多段独立对话。</p><label htmlFor="project-name">项目名称</label><input id="project-name" autoFocus placeholder="默认使用文件夹名称" value={projectName} onChange={(event) => setProjectName(event.target.value)} /><label htmlFor="workspace-path">工作区目录</label><div className="workspace-picker"><input id="workspace-path" placeholder="选择或输入项目文件夹" value={workspaceDraft} onChange={(event) => setWorkspaceDraft(event.target.value)} /><button type="button" onClick={() => void chooseWorkspace()} disabled={!isTauri() || projectSaving}>{isTauri() ? "选择文件夹…" : "浏览器不支持选择"}</button></div>{!isTauri() && <small className="workspace-browser-hint">浏览器无法读取文件夹的真实绝对路径，请手动输入；桌面版可直接选择。</small>}{projectError && <p className="workspace-dialog-error" role="alert">{projectError}</p>}<div className="workspace-dialog-actions"><button type="button" onClick={() => setProjectDialog(false)} disabled={projectSaving}>取消</button><button type="submit" disabled={!workspaceDraft.trim() || projectSaving}>{projectSaving ? "创建中…" : "创建项目"}</button></div></form></div>}
+    {resetDialog && <div className="workspace-dialog-backdrop" role="presentation"><section className="workspace-dialog" role="alertdialog" aria-modal="true" aria-labelledby="reset-title" aria-describedby="reset-description"><h2 id="reset-title">Clear all records?</h2><div id="reset-description"><p>This stops running tasks and clears all projects, chats, activity logs, collaboration requests, document versions and subscriptions, messages, model memory, and token usage.</p><p>Workspace files are kept. Cleared records cannot be recovered.</p></div>{resetError && <p className="workspace-dialog-error" role="alert">{resetError}</p>}<div className="workspace-dialog-actions"><button autoFocus onClick={() => setResetDialog(false)} disabled={resetting}>Cancel</button><button className="reset-confirm" onClick={() => void resetRecords()} disabled={resetting}>{resetting ? "Stopping tasks and clearing…" : "Clear All Records"}</button></div></section></div>}
+    {projectDialog && <div className="workspace-dialog-backdrop" role="presentation"><form className="workspace-dialog" onSubmit={saveProject} role="dialog" aria-modal="true" aria-label="New Project"><h2>New Project</h2><p>Each project uses a local workspace and can contain multiple chats.</p><label htmlFor="project-name">Project name</label><input id="project-name" autoFocus placeholder="Uses the folder name by default" value={projectName} onChange={(event) => setProjectName(event.target.value)} /><label htmlFor="workspace-path">Workspace folder</label><div className="workspace-picker"><input id="workspace-path" placeholder="Choose or enter a project folder" value={workspaceDraft} onChange={(event) => setWorkspaceDraft(event.target.value)} /><button type="button" onClick={() => void chooseWorkspace()} disabled={!isTauri() || projectSaving}>{isTauri() ? "Browse…" : "Desktop only"}</button></div>{!isTauri() && <small className="workspace-browser-hint">Enter the absolute path in the browser. Use the folder picker in the desktop app.</small>}{projectError && <p className="workspace-dialog-error" role="alert">{projectError}</p>}<div className="workspace-dialog-actions"><button type="button" onClick={() => setProjectDialog(false)} disabled={projectSaving}>Cancel</button><button type="submit" disabled={!workspaceDraft.trim() || projectSaving}>{projectSaving ? "Creating…" : "Create Project"}</button></div></form></div>}
   </main>;
 }
 
