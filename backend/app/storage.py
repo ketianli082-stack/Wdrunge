@@ -204,12 +204,15 @@ agent_usage = Table(
     Column("retries", Integer),
     # Part of output_tokens the model spent reasoning (thinking), when reported.
     Column("reasoning_tokens", Integer),
+    # What the failed attempts of this call were, e.g. "APIConnectionError x3".
+    Column("retry_errors", String(200)),
 )
 
 USAGE_COLUMNS = {
     "cached_tokens": "INTEGER", "project_id": "VARCHAR(36)", "conversation_id": "VARCHAR(36)",
     "request_id": "VARCHAR(200)", "attempt": "INTEGER", "purpose": "VARCHAR(32)", "model": "VARCHAR(80)",
     "output_tokens": "INTEGER", "latency_ms": "INTEGER", "retries": "INTEGER", "reasoning_tokens": "INTEGER",
+    "retry_errors": "VARCHAR(200)",
 }
 
 context_compactions = Table(
@@ -751,7 +754,8 @@ class ChatStore:
 
     async def record_agent_usage(self, agent_id: str, total: int, context: int, cached: int | None = None, *,
                                  project_id=None, conversation_id=None, request_id=None, attempt=None, purpose=None,
-                                 model=None, output_tokens=None, latency_ms=None, retries=None, reasoning_tokens=None) -> None:
+                                 model=None, output_tokens=None, latency_ms=None, retries=None, reasoning_tokens=None,
+                                 retry_errors=None) -> None:
         await self.initialize()
         async with self.write() as connection:
             await connection.execute(insert(agent_usage).values(
@@ -761,6 +765,7 @@ class ChatStore:
                 attempt=attempt, purpose=purpose, model=(model or None) and str(model)[:80], output_tokens=output_tokens,
                 latency_ms=int(latency_ms) if isinstance(latency_ms, (int, float)) else None, retries=retries,
                 reasoning_tokens=reasoning_tokens if isinstance(reasoning_tokens, int) else None,
+                retry_errors=(retry_errors or None) and str(retry_errors)[:200],
             ))
 
     async def conversation_tool_counts(self, conversation_id: str) -> dict[str, int]:

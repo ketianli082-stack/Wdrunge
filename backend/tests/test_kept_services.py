@@ -396,3 +396,61 @@ def test_a_snapshot_copy_does_not_replace_the_delivered_root_service(tmp_path, m
             source_workspace.reset(tokens[1])
             active_workspace.reset(tokens[0])
     asyncio.run(scenario())
+
+
+LISTENER = '''
+import http.server, sys, threading, time
+scheme, delay, ports = sys.argv[1], float(sys.argv[2]), [int(value) for value in sys.argv[3:]]
+servers = []
+for index, port in enumerate(ports):
+    if index:
+        time.sleep(delay)
+    servers.append(http.server.ThreadingHTTPServer(("127.0.0.1", port), http.server.SimpleHTTPRequestHandler))
+    threading.Thread(target=servers[-1].serve_forever, daemon=True).start()
+    print(f"  Local:   {scheme if not index else 'http'}://127.0.0.1:{port}/", flush=True)
+time.sleep(600)
+'''
+
+
+def test_waiting_for_a_port_ends_when_the_service_listens_on_another(tmp_path, manager, monkeypatch):
+    """Blog11: `npm run dev` with ready_port 8101 came up on its default 5173 within a
+    second, and the wait still ran its full 60 s. A process that has been serving a
+    port of its own for a few seconds is not going to open the requested one; one that
+    opens it shortly after another port is simply ready."""
+    import time
+    monkeypatch.setattr(development, 'OTHER_PORT_GRACE', 2)
+    wanted, actual, first, second = free_port(), free_port(), free_port(), free_port()
+
+    async def scenario():
+        tokens = active_workspace.set(tmp_path), source_workspace.set(tmp_path)
+        try:
+            started = time.monotonic()
+            result = await development.execute_command.ainvoke({'background': True, 'name': 'web', 'ready_port': wanted,
+                'argv': [sys.executable, '-c', LISTENER, 'http', '0', str(actual)]})
+            waited = time.monotonic() - started
+            assert result['ready'] is False and result['state'] == 'running' and result['ports'] == [actual]
+            assert result['error'] == f'Port {wanted} did not accept connections: the process is listening on {actual} instead'
+            assert result['error_details']['code'] == 'service_on_other_port'
+            assert f'start it again with port {wanted} in its command' in result['error_details']['next_action']
+            assert 2 <= waited < 15, waited
+            await manager.stop(manager.jobs[result['id']])
+            # The requested port opens a second after another one: within the grace, so it is ready.
+            late = await development.execute_command.ainvoke({'background': True, 'name': 'api', 'ready_port': second,
+                'argv': [sys.executable, '-c', LISTENER, 'http', '1', str(first), str(second)]})
+            assert late['ready'] is True and 'error' not in late and set(late['ports']) == {first, second}
+            await manager.stop(manager.jobs[late['id']])
+            # A debugger or hot-reload socket (ws://) opens long before the server: keep waiting.
+            side, main = free_port(), free_port()
+            slow = await development.execute_command.ainvoke({'background': True, 'name': 'app', 'ready_port': main,
+                'argv': [sys.executable, '-c', LISTENER, 'ws', '4', str(side), str(main)]})
+            assert slow['ready'] is True and 'error' not in slow
+            # Nothing listening at all: the wait runs to its end, as before.
+            silent = await manager.start([sys.executable, '-c', 'import time; time.sleep(30)'], '.', 30, 'idle', network=True)
+            started = time.monotonic()
+            assert await development.wait_for_port(silent, free_port(), 3, set()) == (False, set())
+            assert time.monotonic() - started >= 3
+        finally:
+            source_workspace.reset(tokens[1])
+            active_workspace.reset(tokens[0])
+            await manager.close()
+    asyncio.run(scenario())

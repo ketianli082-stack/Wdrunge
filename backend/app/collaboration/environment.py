@@ -16,6 +16,7 @@ import re
 import time
 from pathlib import Path
 
+from app.execution.environment import INSTALL_INPUTS as RUNTIME_INPUTS
 from app.execution.ports import port_open
 
 SERVICE_NAME = re.compile(r'^[a-z0-9][a-z0-9_.-]{0,39}$')
@@ -158,8 +159,7 @@ def discover(root: str) -> list[dict]:
 DEPENDENCY_FOLDERS = {'.venv': ('python', 'pyproject.toml or requirements.txt'),
                       'node_modules': ('node', 'package.json')}
 # What a root installation reads; a change to any of them calls for a new check.
-INSTALL_INPUTS = ('pyproject.toml', 'requirements.txt', 'uv.lock', '.python-version', 'package.json',
-                  'package-lock.json', 'pnpm-lock.yaml', 'yarn.lock', 'bun.lock')
+INSTALL_INPUTS = tuple(name for names in RUNTIME_INPUTS.values() for name in names)
 
 
 def _manifest_dirs(workspace: Path, runtime: str) -> list[str]:
@@ -172,7 +172,7 @@ def placement_problem(argv, cwd, workspace) -> str | None:
     root once the task's files are merged, or None. Dependency folders and build output
     are never merged; the root gets a .venv or node_modules only where the platform
     installs one, in the command's cwd from a manifest there."""
-    from app.collaboration.workspaces import unmerged_reason
+    from app.collaboration.workspaces import Ignore, unmerged_reason
     from app.execution.sandbox import resolve_executable
     workspace = Path(workspace).resolve()
     cwd = os.path.normpath(cwd or '.')
@@ -187,7 +187,7 @@ def placement_problem(argv, cwd, workspace) -> str | None:
     if not found or not Path(os.path.abspath(found)).is_relative_to(workspace):
         return None
     relative = Path(os.path.abspath(found)).relative_to(workspace)
-    reason = unmerged_reason(relative.as_posix())
+    reason = unmerged_reason(relative.as_posix(), Ignore(workspace))
     if not reason:
         return None
     for folder, (runtime, manifest) in DEPENDENCY_FOLDERS.items():
@@ -231,6 +231,26 @@ def install_fingerprint(argv, cwd, workspace) -> str:
         path = directory / name
         digest.update(name.encode() + (path.read_bytes() if path.is_file() else b'-'))
     return digest.hexdigest()[:24]
+
+
+# Registered commands a delivery is verified with, by name: test, backend-test,
+# frontend-build, build.web ...
+VERIFICATION = re.compile(r'(^|[-_.])(tests?|build)($|[-_.])')
+VERIFICATION_TIMEOUT = 600
+
+
+def verification_line(result: dict) -> str:
+    """One check as the reviewer reads it."""
+    if result.get('uncovered'):
+        return ('no registered test or build command covers the files this task changed in '
+                + ', '.join(name + '/' for name in result['uncovered']) + ', so the platform ran none for them')
+    head = f"{result['name']} ({' '.join(result['argv'])[:120]}, cwd {result['cwd']}): "
+    if result['ok'] is None:
+        return head + result['note']
+    if result['ok']:
+        return head + f"passed (exit 0, {result.get('seconds')}s, run by the platform at delivery)"
+    status = 'timed out' if result.get('timed_out') else f"exit {result.get('exit_code')}"
+    return head + f"FAILED ({status}, run by the platform at delivery); output ends: {(result.get('output') or '')[-300:]}"
 
 
 async def service_runtime(root, service) -> dict:
@@ -396,20 +416,38 @@ class EnvironmentMixin:
                             '只有代码问题才需要让后端修复迁移并重新交付。')}, conversation)
         return False
 
-    async def report_service_failure(self, job, detail):
+    async def report_service_failure(self, job, detail, stage='start'):
         """A kept service could not restart from the project root after a delivery:
-        the Leader hears about it instead of finding the service silently gone."""
+        the Leader hears about it instead of finding the service silently gone, and
+        whether a member has anything to fix. `stage`: 'install' (the platform could not
+        install dependencies at the root) or 'start' (it did not serve from there)."""
         from sqlalchemy import text
         async with self.reading() as c:
             row = (await c.execute(text('SELECT id FROM projects WHERE workspace_path=:w'), {'w': job.scope})).first()
+            record = await self._get(c, 'service', row[0], job.service, False) if row and job.service else None
         if not row:
             return
         name = job.service or job.name
+        if stage == 'install':
+            # The check before the merge installed from these same manifests in a clean
+            # copy: what fails at the root now is the root's environment, not the delivery.
+            try:
+                cwd = os.path.relpath(job.cwd, job.workspace)
+                checked = bool(record) and record.get('root_checked') == install_fingerprint(job.argv, cwd, job.scope)
+            except (OSError, ValueError):
+                checked = False
+            advice = ('这是项目根目录的环境问题，不是交付内容的问题：同一份清单在合并前已经在干净副本里安装成功。'
+                      '不要因此退回任务，也不要让成员改代码或手动复制依赖目录；平台在之后每次交付或服务重启时会再安装。'
+                      '同样的失败反复出现时请告诉用户。' if checked else
+                      '先看上面的输出再决定：清单或锁文件本身的错误（依赖不存在、锁文件和清单不一致）才需要负责的成员改清单后重新交付；'
+                      '网络、文件占用、权限这类是环境问题，平台在之后每次交付或服务重启时会再安装，不需要成员改代码。'
+                      '不要让成员手动复制依赖目录。')
+        else:
+            advice = '根目录的依赖已按清单安装，问题在启动：请按上面的信息让负责的成员修复，使项目在根目录可以启动；不要让成员手动复制依赖目录。'
         async with self.transaction() as c:
             await self._event(c, row[0], 'leader', {
-                'type': 'service_attention', 'service': name, 'request_id': job.request,
-                'summary': (f'服务 {name} 在交付后没能从项目根目录重新启动：{detail[:800]}\n'
-                            '请让负责的成员修复，使项目在根目录可以安装依赖并启动；不要让成员手动复制依赖目录。')},
+                'type': 'service_attention', 'service': name, 'request_id': job.request, 'stage': stage,
+                'summary': f'服务 {name} 在交付后没能从项目根目录重新启动：{detail[:1500]}\n{advice}'},
                 job.conversation or '')
 
     async def trusted_ports(self, project) -> dict[int, str]:
@@ -540,6 +578,67 @@ class EnvironmentMixin:
             await self._project(c, project)
             await self._put(c, 'command', project, name, record)
         return record
+
+    async def run_verification(self, project, request, root, work) -> list[dict]:
+        """Run, in the task's workspace, the registered test and build commands that
+        cover what the task changed. A developer's delivery is judged on these: the
+        platform's own run, not the member's account of one. Only commands that already
+        ran successfully somewhere are replayed (the platform does not make a first run
+        that would need the user's review); a command over unchanged code is not run."""
+        import asyncio
+        from app.agents.tools._workspace import active_workspace, source_workspace
+        from app.collaboration.workspaces import IsolatedWorkspace
+        from app.execution import sandbox
+        from app.execution.processes import processes
+        if not request.get('workspace_id'):
+            return []
+        async with self.reading() as c:
+            commands = [c for c in await self._list(c, 'command', project) if VERIFICATION.search(c['name'])]
+        changed = [path for path in await asyncio.to_thread(IsolatedWorkspace(root, request['workspace_id']).changed_paths)
+                   if Path(path).parts[0] != 'docs']
+
+        def covers(command, path):
+            cwd = os.path.normpath(command.get('cwd') or '.')
+            return cwd == '.' or path == cwd or path.startswith(cwd + '/')
+        results = []
+        # Said, not hidden: "every check passed" must not be read from an empty list.
+        # Directories only: a file at the root is a manifest or configuration, not code
+        # that a member's cases are expected to cover.
+        if uncovered := sorted({Path(path).parts[0] for path in changed
+                                if len(Path(path).parts) > 1 and not any(covers(command, path) for command in commands)}):
+            results.append({'ok': None, 'uncovered': uncovered})
+        for command in sorted(commands, key=lambda c: c['name']):
+            cwd = os.path.normpath(command.get('cwd') or '.')
+            if not any(covers(command, path) for path in changed):
+                continue
+            entry = {'name': command['name'], 'argv': command['argv'], 'cwd': cwd}
+            target = str((Path(work) / cwd).resolve())
+            ran_here = any(job.argv == list(command['argv']) and job.cwd == target and job.process.returncode == 0
+                           and not job.timed_out for job in list(processes.jobs.values()))
+            if command.get('status') not in {'verified', 'ran_in_task'} and not ran_here:
+                results.append({**entry, 'ok': None, 'note': 'registered but never run successfully, so the platform did not run it'})
+                continue
+            if not (Path(work) / cwd).is_dir():
+                results.append({**entry, 'ok': False, 'exit_code': None, 'output': f'its cwd {cwd} does not exist in the workspace'})
+                continue
+            tokens = active_workspace.set(Path(work)), source_workspace.set(Path(root))
+            started = time.monotonic()
+            try:
+                result = await processes.run(
+                    command['argv'], cwd, VERIFICATION_TIMEOUT, name=command['name'],
+                    network=sandbox.capability().get('backend') != 'seatbelt',
+                    reason='任务交付：平台在任务工作区重跑已登记的测试和构建命令',
+                    platform='重放任务中已运行通过的登记命令')
+            except Exception as error:
+                result = {'exit_code': None, 'output': f'{type(error).__name__}: {error}'}
+            finally:
+                source_workspace.reset(tokens[1])
+                active_workspace.reset(tokens[0])
+            ok = result.get('exit_code') == 0 and not result.get('timed_out')
+            results.append({**entry, 'ok': ok, 'exit_code': result.get('exit_code'), 'seconds': round(time.monotonic() - started, 1),
+                            **({'timed_out': True} if result.get('timed_out') else {}),
+                            **({} if ok else {'output': str(result.get('output') or '').strip()[-1500:]})})
+        return results
 
     async def check_root_commands(self, project, request, root, work):
         """Before a task's delivery merges: every command and service start command it

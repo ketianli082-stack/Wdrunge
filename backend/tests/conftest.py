@@ -13,8 +13,10 @@ def healthy_provider():
     """The provider circuit breaker is process-wide; start every test healthy."""
     from app.agents import resilience
     resilience._failures.clear()
+    resilience._preferred.clear()
     yield
     resilience._failures.clear()
+    resilience._preferred.clear()
 
 
 @pytest.fixture(autouse=True)

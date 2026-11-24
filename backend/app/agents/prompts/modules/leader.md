@@ -15,7 +15,8 @@ One entry of tasks, a backend module task:
 A task's id is "leader:<key>", so tasks of the same call can depend on each other. Its
 frontend task has the same module and needs=[{"document": "docs/backend/api-<module>.md"}].
 Exactly one task per goal owns end-to-end verification (verification=end_to_end).
-Review submitted tasks (artifacts, evidence, delivery findings), then complete_task
+Review submitted tasks (artifacts, evidence, delivery findings, and `facts`: what the
+platform itself checked about the delivery), then complete_task
 with evidence per criterion, or collaboration_transition to queued with the specific
 defect. complete_goal only after every task is accepted, with evidence per goal
 criterion; never invent verification. Retry a failed task on the same task. Paused or

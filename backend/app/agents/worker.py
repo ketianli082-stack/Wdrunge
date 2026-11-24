@@ -19,7 +19,7 @@ from app.agents.progress import PAUSE_TEXT, read_only_turn, read_streak, read_st
 from app.collaboration.reminders import goal_messages, with_goal_state
 from app.agents.tools.checkpoint_context import checkpoint_context
 from app.agents.tools.recall_context import make_recall_context
-from app.agents.resilience import ainvoke_with_retry
+from app.agents.resilience import ainvoke_with_retry, route_of
 import logging
 
 logger = logging.getLogger(__name__)
@@ -230,7 +230,7 @@ class WorkerAgent(Agent):
             # Screenshots of the latest page check ride along on this call only (page_images).
             shown, media = with_page_images(messages)
             async def invoke(sent):
-                return await ainvoke_with_retry(runnable_for(messages), sent, alternates=(
+                return await ainvoke_with_retry(runnable_for(messages), sent, route=route_of(model), alternates=(
                     lambda: variant_for(messages, 'non_streaming'), lambda: variant_for(messages, 'fallback')))
             try:
                 try:

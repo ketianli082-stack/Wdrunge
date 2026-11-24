@@ -53,6 +53,37 @@ def socket_denied(output):
     return bool(SOCKET_DENIED.search(output) and SOCKET_USE.search(output))
 
 
+# Without network a host name does not resolve either (the resolver is out of reach),
+# so a client that wanted another host reports a lookup failure, not EPERM: Node's
+# error codes and the resolver's own messages on macOS and Linux, as curl, uv, pip
+# and npm print them.
+LOOKUP_REFUSED = re.compile(r'\bENOTFOUND\b|\bEAI_AGAIN\b|getaddrinfo|could not resolve host|failed to lookup address|'
+                            r'nodename nor servname|name or service not known|failure in name resolution', re.I)
+LOOKUP_WARNING = ('The output reports a failed host lookup, and this command ran with network=false: the sandbox blocks '
+                  'every lookup and connection it makes. That is not a proxy or connectivity fault, and no setting of '
+                  'the tool changes it. If the command needs a registry or another host, run it again with network=true.')
+TIMEOUT_WITHOUT_NETWORK = ('This command ran with network=false. One that contacts a registry or another host '
+                           '(installing, removing or auditing packages, a download) is refused by the sandbox and can '
+                           'wait in silence until the timeout: if this one does, run it again with network=true, not '
+                           'with a longer timeout. Otherwise inspect its progress or logs before retrying.')
+
+
+def without_network(result: dict, output: str) -> dict:
+    """Say what the missing network did to a command that ran with network=false. Also
+    when an expected exit code made the run count as a success."""
+    if socket_denied(output):
+        return {**result, 'warning': 'Socket access was denied: with network=false the sandbox blocks every socket the '
+                'command opens, 127.0.0.1 included. If its code serves or connects locally, run it '
+                'again with network=true; this output does not show the code failing.'}
+    if LOOKUP_REFUSED.search(output):
+        return {**result, 'warning': LOOKUP_WARNING}
+    if result.get('timed_out') and isinstance(result.get('error_details'), dict):
+        # Nothing in the output names the cause; the generic advice (inspect the timeout)
+        # was answered with a longer timeout (Blog11: 180 s, then 300 s).
+        return {**result, 'error_details': {**result['error_details'], 'next_action': TIMEOUT_WITHOUT_NETWORK}}
+    return result
+
+
 def automatic_network(argv, background):
     """Background services listen on ports and local HTTP checks connect to them; both
     need network access in the OS sandbox. Non-loopback targets stay an explicit choice."""
@@ -78,6 +109,49 @@ async def served_ports(job, declared, ready_port, held=frozenset()):
             ports.add(port)
     job.ports.update(ports)
     return ports
+
+
+# Seconds a process that already serves another address gets to open ready_port as well.
+OTHER_PORT_GRACE = 5
+# An address a server prints as its own ("Local: http://127.0.0.1:5173/"). A ws:// URL is
+# a side channel (a debugger, hot reload) that opens long before the server itself.
+HTTP_ADDRESS = re.compile(r'https?://(?:localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1\]):(\d{2,5})')
+
+
+async def announced_ports(job, held):
+    """HTTP ports the process printed in its log and now serves. One that was served
+    before it started is its upstream (a proxy prints it), not its own."""
+    if job.process.returncode is not None:
+        return set()
+    log = processes.logs(job, 0, 65536)['output']
+    ports = set()
+    for port in {int(p) for p in HTTP_ADDRESS.findall(log) if 0 < int(p) < 65536} - set(held):
+        if await port_open(port, timeout=.3):
+            ports.add(port)
+    return ports
+
+
+async def wait_for_port(job, ready_port, timeout, held):
+    """(ready, other ports): wait until ready_port accepts connections. The wait ends
+    early when the process has announced and served another HTTP address for
+    OTHER_PORT_GRACE seconds and still not this port: a server that came up on its
+    default port does not open the requested one later (Blog11: 60 s spent waiting for
+    8101 while the development server had printed and opened 5173 at once)."""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    since = None
+    while True:
+        if await processes.wait_ready(job, ready_port, min(1.0, max(.05, deadline - loop.time()))):
+            return True, set()
+        others = await announced_ports(job, held) - {ready_port}
+        if job.process.returncode is not None or loop.time() >= deadline:
+            return False, others
+        if not others:
+            since = None
+        elif since is None:
+            since = loop.time()
+        elif loop.time() - since >= OTHER_PORT_GRACE:
+            return False, others
 
 
 async def registry_services():
@@ -245,8 +319,9 @@ async def execute_command(argv: Annotated[list[Annotated[str, Field(max_length=2
         held = await held_ports(services)
         job = await processes.start(argv, cwd, timeout, name, network, reason, keep=keep_running)
         tag_job(job, target)
+        elsewhere = set()
         if ready_port is not None:
-            ready = await processes.wait_ready(job, ready_port, min(60, timeout))
+            ready, elsewhere = await wait_for_port(job, ready_port, min(60, timeout), held)
         else:
             ready = None
             try:
@@ -280,23 +355,31 @@ async def execute_command(argv: Annotated[list[Annotated[str, Field(max_length=2
             result['ready'] = ready
             if not ready:
                 running = job.process.returncode is None
-                result.update(failure_result(f'Port {ready_port} did not accept connections '
-                    + (f'within {min(60, timeout)} seconds' if running else 'before the process exited'),
-                    'service_unavailable', 'service_not_ready',
-                    'Read manage_process logs for the listening address/port. '
-                    + ('The process is still running; wait again or stop it and correct the command.' if running
-                       else 'Correct the command or port before starting it again.'), 'after_service_ready'))
+                if running and elsewhere:
+                    # It is up, on a port nobody asked for: waiting longer changes nothing.
+                    listening = ', '.join(map(str, sorted(elsewhere)))
+                    result.update(failure_result(
+                        f'Port {ready_port} did not accept connections: the process is listening on {listening} instead',
+                        'service_unavailable', 'service_on_other_port',
+                        f'It is running and announced {listening} as its address. If the command does not set port '
+                        f'{ready_port}, stop this process and start it again with port {ready_port} in its command '
+                        f'line or environment (most servers take a port argument); if it does, it may open '
+                        f'{ready_port} later: check manage_process logs.', 'after_state_change'))
+                else:
+                    result.update(failure_result(f'Port {ready_port} did not accept connections '
+                        + (f'within {min(60, timeout)} seconds' if running else 'before the process exited'),
+                        'service_unavailable', 'service_not_ready',
+                        'Read manage_process logs for the listening address/port. '
+                        + ('The process is still running; wait again or stop it and correct the command.' if running
+                           else 'Correct the command or port before starting it again.'), 'after_service_ready'))
         return result
     result = await processes.run(argv, cwd, timeout, name=name, network=network, reason=reason, ok_exit_codes=expected)
     result['network'] = network
     job = processes.jobs.get(result.get('id'))
     # Scan the whole retained log; run() already cut the output to its last 30 KB.
     full = processes.logs(job, 0, 128 * 1024)['output'] if job else None
-    if not network and socket_denied(full if full is not None else result.get('output', '')):
-        # Also when an expected exit code made the run count as a success.
-        result['warning'] = ('Socket access was denied: with network=false the sandbox blocks every socket the '
-                             'command opens, 127.0.0.1 included. If its code serves or connects locally, run it '
-                             'again with network=true; this output does not show the code failing.')
+    if not network:
+        result = without_network(result, full if full is not None else result.get('output', ''))
     return compact_output(result, full)
 
 

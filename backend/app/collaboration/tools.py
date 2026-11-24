@@ -143,7 +143,8 @@ TRANSITION_RECEIPT = ('id', 'state', 'sender', 'recipient', 'goal_id', 'attempts
 
 # Scheduler bookkeeping and the creation spec (a copy of goal/criteria kept for
 # idempotency) carry nothing a model can act on.
-INSPECT_HIDDEN = {'spec', 'lease_owner', 'lease_until', 'instance_id', 'workspace_id', 'origin_message', 'conversation'}
+INSPECT_HIDDEN = {'spec', 'lease_owner', 'lease_until', 'instance_id', 'workspace_id', 'origin_message', 'conversation',
+                  'merged_at', 'migration', 'check_refusals'}
 
 
 # Default inspect view: the state and the whole delivery (a delivered result is at most
@@ -198,7 +199,7 @@ async def deliver(ctx, payload):
                 await s._put(c, 'request', p, ctx.request, r)
         from app.collaboration.service import AwaitingAcceptance
         try:
-            await s.publish_artifacts(p, ctx.request, ctx.instance_id, delivered=payload.get('artifacts'), references='\n'.join([
+            await s.publish_artifacts(p, ctx.request, ctx.instance_id, delivered=payload.get('artifacts'), refuse=True, references='\n'.join([
                 payload.get('result') or '', json.dumps(payload.get('evidence') or [], ensure_ascii=False), *(payload.get('artifacts') or [])]))
         except AwaitingAcceptance as waiting:
             return await s.hold_for_acceptance(p, ctx.request, ctx.instance_id, waiting.pending)
@@ -435,7 +436,15 @@ async def execute_collaboration(action: Literal['catalog', 'read', 'publish', 's
             return await s.inspect_message(p, **payload)
         if action == 'inspect_request':
             request = await s.get_request(p, payload['identifier'])
-            return inspect_view(request, await s.journal(p, request['id']), payload.get('detail', 'summary'))
+            view = inspect_view(request, await s.journal(p, request['id']), payload.get('detail', 'summary'))
+            if request['state'] == 'review':
+                # What the platform itself knows about the delivery, as of this call.
+                async with s.reading() as c:
+                    root = (await s._project(c, p))['workspace_path']
+                    if facts := await s.review_facts(c, p, request, root):
+                        view = {key: value for key, value in view.items() if key not in {'left_out', 'unmerged_screenshots', 'checks'}}
+                        view['facts'] = facts
+            return view
         if action == 'wait':
             if not ctx.request:
                 raise ValueError('No active durable request to suspend')

@@ -20,7 +20,7 @@ from app.agents.context_meter import calibrate
 from app.agents.base import AgentSpec, AgentStatus
 from app.collaboration.tools import Context, active, collaborate, COLLABORATION_TOOLS, collaboration_action, model_collaboration_tools
 from app.collaboration.context import encode_handoff, coordination_update
-from app.agents.leader import LeaderAgent
+from app.agents.leader import LEADER_READ_LIMIT, LeaderAgent, PROJECT_READ_TOOLS
 from app.agents.identity import member_name
 from app.agents.worker import WorkerAgent
 from app.agents.tools.current_utc_time import current_utc_time
@@ -558,6 +558,22 @@ class Team:
                         content, status = json.dumps(exception_result(exc, tool_name=tool_name), ensure_ascii=False), 'error'
                     yield 'activity', {**activity, 'phase': 'failed' if status == 'error' else 'completed'}
                     messages.append(ToolMessage(content=content, tool_call_id=call_id, status=status))
+                    continue
+                if tool_name in PROJECT_READ_TOOLS:
+                    activity = {'id': uuid4().hex, 'agent': 'leader', 'tool': tool_name, 'description': '核实项目里的文件'}
+                    yield 'activity', {**activity, 'phase': 'running'}
+                    try:
+                        args = dict(call.get('args', {}))
+                        if tool_name == 'read_project_file':
+                            args['limit'] = min(int(args.get('limit') or LEADER_READ_LIMIT), LEADER_READ_LIMIT)
+                        result = await PROJECT_READ_TOOLS[tool_name].ainvoke(args)
+                        content, status = result if isinstance(result, str) else json.dumps(result, ensure_ascii=False), 'success'
+                        if isinstance(result, dict) and result.get('error'):
+                            status = 'error'
+                    except Exception as exc:
+                        content, status = json.dumps(exception_result(exc, tool_name=tool_name), ensure_ascii=False), 'error'
+                    yield 'activity', {**activity, 'phase': 'failed' if status == 'error' else 'completed'}
+                    messages.append(ToolMessage(content=content[:LEADER_READ_LIMIT * 2], tool_call_id=call_id, status=status))
                     continue
                 if tool_name not in {"delegate_task", "delegate_tasks"}:
                     messages.append(ToolMessage(content="Unknown tool call", tool_call_id=call_id))

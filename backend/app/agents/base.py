@@ -28,6 +28,10 @@ class AgentSpec:
     context_window: int | None = None
 
 
+# Reasoning tokens a call may spend unless the environment says otherwise (Agent.thinking_budget).
+THINKING_BUDGET = 2000
+
+
 def build_model(agent, **options):
     """agent.model(**options), tolerating test doubles that take no arguments."""
     try:
@@ -94,7 +98,7 @@ class Agent:
             await store.record_agent_usage(
                 self.spec.id, self.total_tokens - before, self.context_tokens, self.last_cached_tokens,
                 purpose=purpose or ('coordination' if self.spec.id == 'leader' else 'work'),
-                **{key: details[key] for key in ('output_tokens', 'reasoning_tokens', 'model', 'latency_ms', 'retries')}, **current_scope())
+                **{key: details[key] for key in ('output_tokens', 'reasoning_tokens', 'model', 'latency_ms', 'retries', 'retry_errors')}, **current_scope())
         return True
 
     def usage_snapshot(self) -> dict:
@@ -134,7 +138,7 @@ class Agent:
             parts.append("开发工具：先用 detect_environment 确认环境和宿主命令约定（macOS 为 BSD 工具，不用 GNU 专有参数）。"
                          "不要把后端宿主 Python 当作项目环境；依赖用 execute_command 按锁文件装进项目 .venv 或 node_modules。"
                          "命令经审核并在沙箱中运行，出现人工授权时等待用户，不用其他工具绕过。项目外的配置用 read_external_file 请求授权，"
-                         "移动/删除文件用 manage_file；页面证据以浏览器验证结果和截图为准。")
+                         "移动/删除文件用 manage_file。")
         if collaborative:
             names = ['documents.md', 'leader.md' if self.spec.id == 'leader' else 'worker.md']
             if self.spec.id == 'leader' or runs_commands:
@@ -154,15 +158,34 @@ class Agent:
                 return os.environ[key].strip()
         return os.getenv("QWEN_MODEL", "qwen3.7-max")
 
+    def thinking_budget(self) -> int | None:
+        """Tokens a call may spend reasoning before it must answer: a role's own setting
+        (WDRUNGE_THINKING_BUDGET_<ROLE>), else WDRUNGE_THINKING_BUDGET, else 2,000 (the
+        user's decision of 2026-11-20). 0: no limit. Without one, a member that is stuck
+        reasons for thousands of tokens per call at about 21 s per thousand (Blog10: the
+        83 calls over 2,000 reasoning tokens were a third of all model time; nine calls
+        in ten stay under 2,200)."""
+        for key in (f"WDRUNGE_THINKING_BUDGET_{self.spec.id.upper()}", "WDRUNGE_THINKING_BUDGET"):
+            value = os.getenv(key, "").strip()
+            if value.isdigit():
+                return int(value) or None
+        return THINKING_BUDGET
+
     def model(self, purpose: str = "work", variant: str | None = None, scale: str | None = None) -> ChatOpenAI | None:
         """variant: None (normal streaming), 'non_streaming' (after repeated stream stalls)
         or 'fallback' (QWEN_FALLBACK_MODEL; None when not configured)."""
         # Usage must be reported on streamed calls too: inside a streaming graph even
         # ainvoke streams, and without include_usage the provider returns no usage.
         options = {"stream_usage": True}
-        if purpose == "summary" and os.getenv("WDRUNGE_SUMMARY_THINKING", "").strip().lower() not in {"1", "true"}:
-            # Summaries need no reasoning, and reasoning tokens count against max_tokens.
-            options["extra_body"] = {"enable_thinking": False}
+        if purpose == "summary":
+            if os.getenv("WDRUNGE_SUMMARY_THINKING", "").strip().lower() not in {"1", "true"}:
+                # Summaries need no reasoning, and reasoning tokens count against max_tokens.
+                options["extra_body"] = {"enable_thinking": False}
+        elif budget := self.thinking_budget():
+            # DashScope's parameter. Measured on qwen3.8-max and qwen3.7-plus: reasoning
+            # stops at exactly this many tokens and the answer or tool call that follows
+            # is complete.
+            options["extra_body"] = {"thinking_budget": budget}
         timeout = os.getenv("QWEN_STREAM_CHUNK_TIMEOUT")
         if timeout:
             # Seconds without a streamed chunk before the call is abandoned and retried.

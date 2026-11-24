@@ -36,7 +36,9 @@ def test_leader_exposes_delegation_as_optional_function_call(monkeypatch):
     fake = FakeModel()
     monkeypatch.setattr(leader, "model", lambda: fake)
     result = asyncio.run(leader.next_message([HumanMessage(content="你好")]))
-    assert fake.bound_tools == ["delegate_tasks", "checkpoint_context", "recall_context"]
+    # Coordination, plus the read-only project tools for checking a fact without a task.
+    assert fake.bound_tools[:3] == ["delegate_tasks", "checkpoint_context", "recall_context"]
+    assert sorted(fake.bound_tools[3:]) == ["browse_directory", "read_project_file", "search_code"]
     assert result.content == "你好！"
 
 

@@ -839,9 +839,20 @@ def test_identical_browser_screenshots_share_one_file(tmp_path):
     from app.agents.tools.browser_verify import named_by_content
     first, second = tmp_path/'browser-1.png', tmp_path/'browser-2.png'
     first.write_bytes(b'same'); second.write_bytes(b'same')
-    assert named_by_content(first) == named_by_content(second)
+    assert named_by_content(first, 'http://127.0.0.1:5173/admin/login?next=%2F') == named_by_content(second, 'http://127.0.0.1:5173/admin/login')
     files = list(tmp_path.iterdir())
-    assert len(files) == 1 and files[0].name.startswith('browser-') and len(files[0].stem) == len('browser-') + 16
+    # Named for the page, with four digits of the content: short enough to copy without a slip.
+    import hashlib, re
+    assert len(files) == 1 and files[0].name == f"shot-admin-login-{hashlib.sha256(b'same').hexdigest()[:4]}.png"
+    from app.collaboration.workspaces import SCREENSHOT
+    assert SCREENSHOT.match(f'docs/testing/{files[0].name}') and SCREENSHOT.match('docs/testing/browser-aaaaaaaaaaaaaaaa.png')
+    # Another picture that happens to share those four digits keeps its own file.
+    clash = tmp_path/'browser-3.png'
+    clash.write_bytes(b'other')
+    files[0].rename(tmp_path/f"shot-home-{hashlib.sha256(b'other').hexdigest()[:4]}.png")
+    (tmp_path/f"shot-home-{hashlib.sha256(b'other').hexdigest()[:4]}.png").write_bytes(b'different picture')
+    kept = named_by_content(clash, 'http://127.0.0.1:5173/')
+    assert re.fullmatch(r'shot-home-[0-9a-f]{8}\.png', kept.name) and kept.read_bytes() == b'other'
 
 
 def test_dependents_start_once_delivered_services_serve_from_the_project_root(tmp_path, monkeypatch):

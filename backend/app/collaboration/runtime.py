@@ -220,9 +220,10 @@ class Scheduler:
             if delivered:
                 # Its delivery is merged: kept services move from the task snapshot to the
                 # project root, so colleagues and the user see the project as merged.
-                processes.background(processes.relaunch_delivered(active_workspace.get(), Path(workspace),
-                                                                  before=self.service.migrations.pop((project, identifier), None)),
-                                     'move kept services to the project root')
+                processes.track_merge(workspace, identifier, processes.background(
+                    processes.relaunch_delivered(active_workspace.get(), Path(workspace),
+                                                 before=self.service.migrations.pop((project, identifier), None)),
+                    'move kept services to the project root'))
             self.team.workers[role].total_tokens += worker.total_tokens
             self.team.workers[role].cache_input_tokens += worker.cache_input_tokens
             self.team.workers[role].cached_tokens += worker.cached_tokens

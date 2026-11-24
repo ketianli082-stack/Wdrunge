@@ -113,7 +113,7 @@ def _number(name: str, default: float, minimum: float) -> float:
 
 def context_tokens() -> int:
     """Actual tokens the model-facing history may take (the window is only an upper bound)."""
-    return int(_number('WDRUNGE_CONTEXT_TOKENS', 56000, 4000))
+    return int(_number('WDRUNGE_CONTEXT_TOKENS', 100000, 4000))
 
 
 def cache_hit_price() -> float:
@@ -237,8 +237,11 @@ class ContextMemory:
     def budget_for(self, ratio: float) -> int:
         """Estimated tokens the history may take: WDRUNGE_CONTEXT_TOKENS actual tokens, at
         most three quarters of the window (room for output and protocol overhead), minus
-        the tool schemas. A larger budget is a larger bill on every call, so the default
-        is about what the pipeline ran at before the estimate was calibrated."""
+        the tool schemas. A larger budget is a larger bill on every call and fewer rewrites
+        of cached history; the first token waits little longer for it (measured on
+        qwen3.8-max: about 0.1 s per 10K tokens read from the cache, 0.5 s per 10K cold).
+        The default of 100,000 is the user's decision of 2026-11-20 (56,000 before); with
+        the default window of 131,072 the three-quarters rule holds it at 98,304."""
         actual = min(self.agent.context_window() * .75, context_tokens()) - self.reserved
         return int(actual / max(ratio, 0.4)) - self.schema_tokens
 

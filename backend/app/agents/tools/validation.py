@@ -282,6 +282,84 @@ def tool_error(exc: Exception) -> str:
     return json.dumps(exception_result(exc), ensure_ascii=False)
 
 
+DENIED_MARKERS = ('operation not permitted', 'permission denied', 'eperm', 'eacces')
+
+
+def denied_path(output: str) -> str | None:
+    """The path a command was refused, from the first output line that names one beside
+    the refusal: quoted, or just before the refusal as shells print it ("ls: path: ...")."""
+    import re
+    def pathlike(value):
+        return ('/' in value or value.startswith('.')) and '://' not in value
+    for line in output.splitlines():
+        lowered = line.lower()
+        if not any(marker in lowered for marker in DENIED_MARKERS):
+            continue
+        for quoted in re.findall(r"""['"`]([^'"`]+)['"`]""", line):
+            if pathlike(quoted):
+                return quoted
+        if before := re.search(r'^(.*?): (?:operation not permitted|permission denied)', line, re.I):
+            segment = before.group(1)
+            if (at := re.search(r'(?:^|\s)(/.*)$', segment)):
+                return at.group(1)  # an absolute path may contain spaces
+            token = segment.split()[-1] if segment.split() else ''
+            if pathlike(token):
+                return token
+    return None
+
+
+def permission_advice(output: str) -> str:
+    """Which boundary of the command sandbox a refusal hit, and what to do about it. A
+    command reads the system runtimes and reads and writes only its workspace and its
+    temporary directory; sockets need network access."""
+    import os
+    from pathlib import Path
+    from app.agents.tools._workspace import source_workspace, workspace_root
+    from app.execution.sandbox import GUARDED_NAMES
+    path = denied_path(output)
+    if path is None:
+        return ('No file path was refused, so this is the network boundary: a command that listens on a port or '
+                'connects to one needs network access. Run it again with network=true; it is reviewed, not bypassed.')
+    workspace = workspace_root().resolve()
+    source = source_workspace.get()
+    source = source.resolve() if source else workspace
+    target = Path(os.path.normpath(path))
+    outside = ('Commands read the system runtimes and read and write only the workspace and their temporary directory '
+               '($TMPDIR, also $HOME).')
+    if not target.is_absolute():
+        if '..' in target.parts:
+            return f'{path} climbs out of your workspace. {outside} Use paths inside the directory your commands start in.'
+        parts = target.parts
+    elif target == workspace or target.is_relative_to(workspace):
+        parts = target.relative_to(workspace).parts
+        cursor = workspace
+        for part in parts:
+            cursor = cursor / part
+            if cursor.is_symlink() and not cursor.resolve().is_relative_to(workspace):
+                link = cursor.relative_to(workspace).as_posix()
+                return (f'{link} is a link to {cursor.resolve()}, outside your workspace, and commands cannot write through '
+                        f'it. Remove the link itself (execute_command: rm {link}) and create your own {cursor.name} inside '
+                        'the workspace (for dependencies: install them there).')
+    elif source != workspace and (target == source or target.is_relative_to(source)):
+        return (f'{path} is in the project root. Your task works on its own copy of the project, in the directory your '
+                'commands start in, and commands cannot read or write the root. Something names the root by absolute path: '
+                'use paths relative to cwd, and delete and regenerate any cache or generated configuration that recorded '
+                'the old absolute path.'
+                + (' Your workspace has its own dependency folder: install what is missing there.'
+                   if {'node_modules', '.venv'} & set(target.parts) else ''))
+    else:
+        return (f'{path} is outside your workspace. {outside} Point the tool\'s cache, configuration or output at a path '
+                'inside the workspace or $TMPDIR.')
+    if guarded := next((part for part in parts if part in GUARDED_NAMES), None):
+        return (f'{guarded} may not be created or changed inside the project (repository metadata, agent configuration '
+                'and credentials are protected). Do the work without it.')
+    if any(part == '.env' or part.startswith('.env.') and part not in {'.env.example', '.env.sample'} for part in parts):
+        return ('Secret .env files cannot be read or written by commands. Use .env.example for templates; connected '
+                'services arrive as environment variables.')
+    return ('The path is inside your workspace, where the sandbox allows reads and writes: this is the file\'s own mode '
+            'or owner (a script that is not executable, a read-only file). Check it with ls -l and fix the mode.')
+
+
 def command_failure(message: str, output: str = '', *, timed_out=False) -> dict:
     """Only classify explicit evidence; a generic nonzero exit is not proof of outage."""
     text = output.lower()
@@ -291,9 +369,9 @@ def command_failure(message: str, output: str = '', *, timed_out=False) -> dict:
     elif any(marker in text for marker in ('address already in use', 'eaddrinuse')):
         category, code, policy = 'service_unavailable', 'port_in_use', 'after_state_change'
         advice = 'Inspect owned processes and choose a free port; synchronize the endpoint with dependent tasks. Do not terminate unowned services.'
-    elif any(marker in text for marker in ('operation not permitted', 'permission denied', 'eperm', 'eacces')):
+    elif any(marker in text for marker in DENIED_MARKERS):
         category, code, policy = 'permission_denied', 'os_permission_denied', 'after_permission'
-        advice = 'Inspect the sandbox/network boundary and command logs. A local listener also needs reviewed network permission. Do not bypass isolation or a user denial.'
+        advice = permission_advice(output)
     elif any(marker in text for marker in ('could not connect to server', 'connection refused', 'econnrefused')):
         category, code, policy = 'service_unavailable', 'connection_failed', 'after_service_ready'
         advice = 'Check the correct host/port and manage_process status/logs; start or wait for the authorized service before retrying.'

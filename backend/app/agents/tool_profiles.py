@@ -54,8 +54,12 @@ ROLE_GROUPS: dict[str, set[str]] = {
 # Core tools beyond a role's groups. Leader: inspecting and moving tasks, messaging,
 # decisions. Developers: removing the placeholders and harnesses they create, which
 # otherwise costs an enable_tools call that rewrites the tool list.
-ROLE_EXTRA = {'leader': {'collaboration_inspect_request', 'collaboration_transition', 'collaboration_send', 'collaboration_decision'},
-              'backend': {'manage_file'}, 'frontend': {'manage_file'}}
+ROLE_EXTRA = {'leader': {'collaboration_inspect_request', 'collaboration_transition', 'collaboration_send', 'collaboration_decision',
+                         # Read-only: checking a fact in the project without assigning a task for it.
+                         'read_project_file', 'search_code', 'browse_directory'},
+              # ... and registering the test and build commands their deliveries are verified with.
+              'backend': {'manage_file', 'collaboration_register_command'},
+              'frontend': {'manage_file', 'collaboration_register_command'}}
 # The Leader is offered the batch forms only: given a single-item tool, the model plans
 # everything and then spends one whole model call per item (Blog6: 11 tasks, 11 calls,
 # with a prompt that said to create them at once).

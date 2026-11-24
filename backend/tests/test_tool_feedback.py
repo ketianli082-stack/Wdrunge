@@ -128,6 +128,15 @@ def test_browser_classifies_navigation_action_and_internal_failures():
     assert action['error_details']['action_index'] == 2
     assert internal['error_details']['category'] == 'internal_error'
     assert assertion['error_details']['code'] == 'assertion_failed'
+    # The selector's own match count separates "not on the page" from "there, but not usable".
+    from app.execution.browser_runner import SelectorProblem
+    absent = browser_failure(TimeoutError('Locator.click: Timeout 10000ms exceeded.'), 'action', 0, matches=0)
+    blocked = browser_failure(TimeoutError('Locator.click: Timeout 10000ms exceeded.'), 'action', 0, matches=1)
+    several = browser_failure(SelectorProblem('click needs one element', 'ambiguous_selector', 'append >> nth=0'), 'action', 3)
+    assert absent['error_details']['code'] == 'selector_not_found' and '"dom"' in absent['error_details']['next_action']
+    assert blocked['error_details']['code'] == 'action_timeout' and blocked['error_details']['selector_matches'] == 1
+    assert several['error_details'] == {'category': 'invalid_arguments', 'code': 'ambiguous_selector', 'next_action': 'append >> nth=0',
+                                        'stage': 'action', 'action_index': 3}
 
 
 def test_worker_reports_service_failure_with_error_status_and_preserves_diagnostics(monkeypatch):

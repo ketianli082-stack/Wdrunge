@@ -69,9 +69,20 @@ def host_path() -> str:
                            if entry and Path(entry).resolve() not in own)
 
 
-def clean_environment(scratch, directory, provided=None):
+# For commands that run without network access. The sandbox refuses their lookups and
+# connections, so a client's retries can only wait: npm and pnpm retry a refused
+# request for 70 s (10 s, then 60 s) before they report it, and a command that makes
+# several requests outlasts its timeout with no output (Blog11: `npm rm` ran into 180 s
+# and 300 s timeouts). Measured in this sandbox on 2026-11-20: one registry request
+# fails after 70.3 s by default and after 0.2 s with this setting; uv (5.6 s) and curl
+# (0.1 s) give up quickly on their own.
+OFFLINE_ENVIRONMENT = {'npm_config_fetch_retries': '0'}
+
+
+def clean_environment(scratch, directory, provided=None, *, network=True):
     """`provided`: variables of the services the user connected for this project
-    (app.resources); they are the only credentials a project process ever receives."""
+    (app.resources); they are the only credentials a project process ever receives.
+    network=False: the command's sandbox blocks the network (OFFLINE_ENVIRONMENT)."""
     # Never forward provider credentials, Python injection variables or host HOME.
     environment = {key: os.environ[key] for key in ('PATH', 'LANG', 'LC_ALL', 'SYSTEMROOT', 'WINDIR') if key in os.environ}
     if 'PATH' in environment:
@@ -83,6 +94,8 @@ def clean_environment(scratch, directory, provided=None):
         GIT_CONFIG_GLOBAL=os.devnull, npm_config_userconfig=os.devnull,
         WDRUNGE_DATABASE_PATH=str(scratch / 'service.db'),
         WDRUNGE_DATABASE_URL=f'sqlite+aiosqlite:///{scratch / "service.db"}')
+    if not network:
+        environment.update(OFFLINE_ENVIRONMENT)
     environment.update(provided or {})
     venv = directory / '.venv'
     if venv.is_dir() and not venv.is_symlink():

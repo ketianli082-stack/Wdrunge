@@ -172,9 +172,29 @@ def test_summary_calls_disable_thinking_and_every_call_reports_streamed_usage(mo
     member = agent(131072)
     summary, work = member.model(purpose='summary'), member.model()
     assert summary.extra_body == {'enable_thinking': False} and summary.stream_usage is True
-    assert not work.extra_body and work.stream_usage is True
+    assert work.extra_body == {'thinking_budget': 2000} and work.stream_usage is True
     monkeypatch.setenv('WDRUNGE_SUMMARY_THINKING', '1')
     assert not member.model(purpose='summary').extra_body
+
+
+def test_a_thinking_budget_applies_to_work_calls_and_a_role_can_have_its_own(monkeypatch):
+    monkeypatch.setenv('DASHSCOPE_API_KEY', 'test')
+    for name in ('WDRUNGE_SUMMARY_THINKING', 'WDRUNGE_THINKING_BUDGET', 'WDRUNGE_THINKING_BUDGET_FRONTEND'):
+        monkeypatch.delenv(name, raising=False)
+    member = agent(131072)
+    assert member.spec.id == 'frontend' and member.model().extra_body == {'thinking_budget': 2000}, 'no setting: the default'
+    monkeypatch.setenv('WDRUNGE_THINKING_BUDGET', '0')
+    assert not member.model().extra_body, '0: no limit, the parameter is not sent'
+    monkeypatch.setenv('WDRUNGE_THINKING_BUDGET', '4000')
+    assert member.model().extra_body == {'thinking_budget': 4000}
+    assert member.model(variant='non_streaming').extra_body == {'thinking_budget': 4000}
+    assert member.model(purpose='summary').extra_body == {'enable_thinking': False}, 'a summary still does not reason at all'
+    monkeypatch.setenv('WDRUNGE_THINKING_BUDGET_FRONTEND', '1500')
+    assert member.model().extra_body == {'thinking_budget': 1500}
+    monkeypatch.setenv('WDRUNGE_THINKING_BUDGET_FRONTEND', '0')
+    assert not member.model().extra_body, '0 for a role: no limit for it, whatever the general setting'
+    monkeypatch.setenv('WDRUNGE_THINKING_BUDGET_FRONTEND', 'many')
+    assert member.model().extra_body == {'thinking_budget': 4000}, 'not a number: the general setting'
 
 
 def test_read_only_calls_are_judged_by_what_they_do():

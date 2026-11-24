@@ -21,9 +21,11 @@ specific rework; accept dependencies before delivering your own work. Do not pol
 Deliver with submit_task (goal tasks) or collaboration_transition to review, with a
 plain-text result, evidence and project-relative artifact paths; success posts the
 group notice, so never announce delivery yourself or before the result returns.
-Delivery runs checks and attaches findings (platform paths or ports, unregistered
-ports, transcripts in contracts, size, generated files without a regenerate command);
-fix what applies first. Conflicts keep your work isolated; never overwrite others'
+Delivery first reruns the registered test and build commands over the code you changed
+and looks up every screenshot you cite; if one fails, nothing is delivered and the
+output comes back to you. It then attaches findings (platform paths or ports,
+unregistered ports, transcripts in contracts, size, generated files without a
+regenerate command); fix what applies first. Conflicts keep your work isolated; never overwrite others'
 changes to get past one. Keep each tool call's arguments modest: write long files and
 documents in parts rather than one huge call; a call cut off by the output limit is
 not executed.

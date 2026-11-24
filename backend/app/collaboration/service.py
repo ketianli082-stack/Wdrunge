@@ -21,7 +21,7 @@ from sqlalchemy import text
 from app.collaboration.documents import digest, outline, section, edit_document, page
 from app.collaboration.schema import DDL
 from app.collaboration.payloads import TransitionPayload
-from app.collaboration.workspaces import MERGED_COPIES, merge_text, IsolatedWorkspace, unreferenced_screenshots, secret_leaks, unmerged_reason
+from app.collaboration.workspaces import MERGED_COPIES, merge_text, Ignore, IsolatedWorkspace, unreferenced_screenshots, secret_leaks, unmerged_reason
 from app.storage import ChatStore, StorageConflictError, StorageNotFoundError, write_transaction
 
 ROLES = {'leader', 'product', 'backend', 'frontend', 'designer', 'testing'}
@@ -37,6 +37,7 @@ from app.collaboration.runs import ConversationRuns
 from app.collaboration.environment import EnvironmentMixin
 from app.collaboration.journal import JournalMixin
 from app.collaboration.replies import ReplyMixin
+from app.collaboration.review import ReviewMixin
 from app.collaboration.basis import BasisChanged, BasisMixin, section_texts
 from app.collaboration.planning import (PlanningMixin, check_criteria_budget, check_deliverables, goal_scale,
                                         need_satisfied, normalize_needs, project_relative,
@@ -55,7 +56,7 @@ class AwaitingAcceptance(StorageConflictError):
                          + ', '.join(f"{d['id']} ({d['recipient']}, {d['state']})" for d in pending))
 
 
-class Collaboration(GoalMixin, ConversationRuns, EnvironmentMixin, JournalMixin, PlanningMixin, ReplyMixin, BasisMixin):
+class Collaboration(GoalMixin, ConversationRuns, EnvironmentMixin, JournalMixin, PlanningMixin, ReplyMixin, BasisMixin, ReviewMixin):
     def __init__(self, store: ChatStore):
         self.store = store
         self._lock = asyncio.Lock()
@@ -461,7 +462,7 @@ class Collaboration(GoalMixin, ConversationRuns, EnvironmentMixin, JournalMixin,
         context sees what earlier contexts read; a reply turn instead sees only
         messages no context of this member has read."""
         async with self.reading() as c:
-            rows = (await c.execute(text('''SELECT e.seq,e.data FROM collaboration_events e
+            rows = (await c.execute(text('''SELECT e.seq,e.data,e.created FROM collaboration_events e
               LEFT JOIN collaboration_receipts r ON r.project=e.project AND r.context=:ctx AND r.seq=e.seq
               WHERE e.project=:p AND e.recipient=:m AND (e.conversation='' OR e.conversation=:v)
               AND (json_extract(e.data,'$.target_request') IS NULL OR json_extract(e.data,'$.target_request')=:request)
@@ -476,8 +477,19 @@ class Collaboration(GoalMixin, ConversationRuns, EnvironmentMixin, JournalMixin,
                                                  reply=int(reply_turn), member_contexts=f'{member}:%'))).mappings().all()
             items = []
             size = 0
+            root = None
             for row in rows:
                 item = {'event_id': row['seq'], **json.loads(row['data'])}
+                if item.get('type') == 'request_status' and item.get('state') == 'review':
+                    delivered = await self._get(c, 'request', project, item.get('request_id'), False)
+                    if delivered and delivered['state'] == 'review':
+                        root = root or (await self._project(c, project))['workspace_path']
+                        if self.review_waits(root, delivered, row['created']):
+                            # Shown once the platform has finished migrating and restarting
+                            # services for the merge; the event stays unread until then.
+                            continue
+                        if facts := await self.review_facts(c, project, delivered, root):
+                            item['facts'] = facts
                 if request and item.get('type') == 'request' and item.get('request_id') == request and 'goal' in item:
                     # The executing task's goal is already the Assigned task message.
                     item['goal'] = '(your current assigned task; see the Assigned task message)'
@@ -1092,19 +1104,24 @@ class Collaboration(GoalMixin, ConversationRuns, EnvironmentMixin, JournalMixin,
                     await self._put(c, 'request', row['project'], row['id'], r)
 
     async def prepare_workspace(self, project, identifier):
-        async with self.transaction() as c:
+        from app.execution.processes import processes
+        async with self.reading() as c:
+            root = (await self._project(c, project))['workspace_path']
+        # A new snapshot copies the root's dependency folders: after the platform has
+        # finished installing them for a delivery just merged, never in the middle.
+        await processes.settled(root)
+        async with processes.root_lock(root), self.transaction() as c:
             r = await self._get(c, 'request', project, identifier)
             p = await self._project(c, project)
             workspace = IsolatedWorkspace(p['workspace_path'], r['workspace_id'])
             # A legacy snapshot inside the project moves out unless a process still runs from it.
-            from app.execution.processes import processes
             busy = any(Path(job.workspace) == workspace.work.resolve() and job.process.returncode is None
                        for job in processes.jobs.values())
             await asyncio.to_thread(workspace.prepare, not busy)
             await asyncio.to_thread(workspace.refresh)
             return workspace
 
-    async def publish_artifacts(self, project, identifier, instance_id, references='', delivered=None):
+    async def publish_artifacts(self, project, identifier, instance_id, references='', delivered=None, refuse=False):
         """Merge what the task snapshot changed since its last merge into the project.
         Every artifact the task declares or this delivery lists (`delivered`) is checked
         in the snapshot first, so a rejected delivery merges nothing and a corrected one
@@ -1120,9 +1137,11 @@ class Collaboration(GoalMixin, ConversationRuns, EnvironmentMixin, JournalMixin,
             pending = [d for d in [await self._get(c, 'request', project, dep) for dep in r['dependencies']] if d['state'] != 'completed']
         if pending:
             raise AwaitingAcceptance(pending)
+        checks = None
         if r.get('workspace_id'):
             # Outside the transaction: it may install dependencies for minutes.
             await self.check_root_commands(project, r, p['workspace_path'], IsolatedWorkspace(p['workspace_path'], r['workspace_id']).work)
+            checks = await self.delivery_verification(project, r, p['workspace_path'], references, refuse)
         async with self.transaction() as c:
             r = await self._get(c, 'request', project, identifier)
             if r.get('instance_id') != instance_id or r['state'] not in {'running', 'review'} or r.get('lease_until',0) <= time.time():
@@ -1136,9 +1155,11 @@ class Collaboration(GoalMixin, ConversationRuns, EnvironmentMixin, JournalMixin,
             p = await self._project(c, project)
             workspace = IsolatedWorkspace(p['workspace_path'], r['workspace_id'])
             managed = {d['path'] for d in await self._list(c, 'document', project)}
+            ignore = Ignore(workspace.work)
             for path in dict.fromkeys([*r['artifacts'], *(delivered or [])]):
                 declared = path in r['artifacts']
-                if reason := unmerged_reason(path):
+                # Shared documents live in the project and are published, not merged.
+                if reason := unmerged_reason(path, None if str(Path(path)) in managed else ignore):
                     raise ValueError(f'{path} cannot be a deliverable: {reason}. List only project files that colleagues '
                                      'and the user will use; nothing was merged, deliver again without it.')
                 # Shared documents are published to the project, not the request snapshot.
@@ -1169,6 +1190,13 @@ class Collaboration(GoalMixin, ConversationRuns, EnvironmentMixin, JournalMixin,
             await asyncio.to_thread(workspace.rebase, changes)
             r['workspace_published'] = True
             r['merged_paths'] = [item['path'] for item in changes]
+            # For the reviewer (review_facts): when it merged and what stayed behind.
+            r['merged_at'] = time.time()
+            r['left_out'] = await asyncio.to_thread(workspace.left_out)
+            r.pop('migration', None)
+            r.pop('check_refusals', None)
+            if checks is not None:
+                r['checks'] = checks
             if skipped:
                 r['unmerged_screenshots'] = skipped
             await self._put(c, 'request', project, identifier, r)
@@ -1183,12 +1211,12 @@ class Collaboration(GoalMixin, ConversationRuns, EnvironmentMixin, JournalMixin,
             from app.execution.processes import processes
             command = await self.migration_for(project, r['merged_paths'])
             if command is None:
-                processes.refresh_after_publish(p['workspace_path'], workspace.work.resolve(), r['merged_paths'])
+                processes.refresh_after_publish(p['workspace_path'], workspace.work.resolve(), r['merged_paths'], identifier)
             else:
                 # The schema changes first; services move to the merged code only after it.
-                self.migrations[(project, identifier)] = processes.background(self._migrate_then_refresh(
-                    project, identifier, p['workspace_path'], workspace.work.resolve(), r['merged_paths'], command,
-                    r.get('conversation') or ''), 'apply the project migration')
+                self.migrations[(project, identifier)] = processes.track_merge(p['workspace_path'], identifier, processes.background(
+                    self._migrate_then_refresh(project, identifier, p['workspace_path'], workspace.work.resolve(), r['merged_paths'],
+                                               command, r.get('conversation') or ''), 'apply the project migration'))
 
     async def hold_for_acceptance(self, project, identifier, instance_id, pending) -> dict:
         """A task finished while dependencies it builds on await acceptance: nothing merges
@@ -1245,9 +1273,16 @@ class Collaboration(GoalMixin, ConversationRuns, EnvironmentMixin, JournalMixin,
         from app.execution.processes import processes
         ok = await self.apply_migration(project, identifier, root, work, command, conversation)
         if ok:
-            processes.refresh_after_publish(root, work, paths)
+            processes.refresh_after_publish(root, work, paths, identifier)
         else:
             processes.mark_stale(root, work, paths)
+        try:
+            async with self.transaction() as c:
+                r = await self._get(c, 'request', project, identifier)
+                r['migration'] = {'argv': command['argv'], 'ok': bool(ok)}
+                await self._put(c, 'request', project, identifier, r)
+        except Exception:
+            logger.warning('Could not record the migration outcome', exc_info=True)
         return ok
 
     async def _known_secrets(self, project):
