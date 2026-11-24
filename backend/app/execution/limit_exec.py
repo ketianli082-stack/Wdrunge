@@ -12,10 +12,28 @@ import signal
 import sys
 import threading
 
-resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
-resource.setrlimit(resource.RLIMIT_FSIZE, (64 * 1024 * 1024, 64 * 1024 * 1024))
-resource.setrlimit(resource.RLIMIT_NOFILE, (256, 256))
-resource.setrlimit(resource.RLIMIT_CPU, (600, 600))
+# Bundlers open every module of a dependency at once (Vite/Rollup on a UI library:
+# well over a thousand files); when descriptors run out they report an unrelated
+# "failed to resolve import", never the limit.
+OPEN_FILES = 4096
+# CPU time of one process, all threads summed. A backstop for a process that escapes
+# its group's kill, not a work limit: the platform's wall-clock timers (30 minutes for
+# a command, the service lifetime for a kept service) end ordinary work first, and a
+# parallel build or a long-lived development server must never reach it.
+CPU_SECONDS = 4 * 3600
+
+
+def cap(kind, wanted):
+    """Lower a limit to `wanted`, or to the host's own hard limit when that is lower."""
+    hard = resource.getrlimit(kind)[1]
+    value = wanted if hard == resource.RLIM_INFINITY else min(wanted, hard)
+    resource.setrlimit(kind, (value, value))
+
+
+cap(resource.RLIMIT_CORE, 0)
+cap(resource.RLIMIT_FSIZE, 64 * 1024 * 1024)
+cap(resource.RLIMIT_NOFILE, OPEN_FILES)
+cap(resource.RLIMIT_CPU, CPU_SECONDS)
 if sys.platform == 'linux' and sys.argv[1] != 'browser':
     # V8 needs a large virtual address reservation even with low physical memory
     # use. This is only an address-space ceiling, not a process-tree RAM quota.

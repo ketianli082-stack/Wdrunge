@@ -21,11 +21,11 @@ def graph():
 
 
 @pytest.mark.parametrize('arguments,expected,background',[
-    ({'command':'python3','arguments':['--version']},['python3','--version'],False),
-    ({'command':'pwd','arguments':[]},['pwd'],False),
-    ({'command':'npm','arguments':['run','dev'],'background':True,'name':'frontend','timeout':1800},['npm','run','dev'],True),
-    ({'command':'npm','arguments':['ci'],'cwd':'frontend','network':True},['npm','ci'],False),
-    ({'command':'python3','arguments':['-m','venv','.venv']},['python3','-m','venv','.venv'],False),
+    ({'argv': ['python3', '--version']},['python3','--version'],False),
+    ({'argv': ['pwd']},['pwd'],False),
+    ({'argv': ['npm', 'run','dev'],'background':True,'name':'frontend','timeout':1800},['npm','run','dev'],True),
+    ({'argv': ['npm', 'ci'],'cwd':'frontend','network':True},['npm','ci'],False),
+    ({'argv': ['python3', '-m','venv','.venv']},['python3','-m','venv','.venv'],False),
 ])
 def test_model_call_reaches_execution_policy(monkeypatch,arguments,expected,background):
     calls=[]
@@ -56,16 +56,17 @@ def test_public_schemas_do_not_leak_reserved_parameters():
         schema=convert_to_openai_tool(candidate)['function']['parameters']
         assert not {'args','kwargs','v__args','v__kwargs','runtime'} & schema['properties'].keys()
     schema=convert_to_openai_tool(development.execute_command)['function']['parameters']
-    assert 'arguments' in schema['required']
-    assert schema['properties']['arguments']['items']=={'type':'string'}
-    with pytest.raises(ValueError):development.execute_command.args_schema.model_validate({'command':'echo','arguments':'[]'})
+    assert schema['required']==['argv'] and 'command' not in schema['properties']
+    assert schema['properties']['argv']['items']['type']=='string' and schema['properties']['argv']['minItems']==1
+    with pytest.raises(ValueError):development.execute_command.args_schema.model_validate({'argv':'echo hi'})
+    with pytest.raises(ValueError):development.execute_command.args_schema.model_validate({'argv':[]})
 
 
 def test_foreground_timeout_guard(monkeypatch):
     async def unexpected(*args,**kwargs):raise AssertionError('Must reject before execution')
     monkeypatch.setattr(development.processes,'run',unexpected)
     async def run():
-        result=await graph().ainvoke({'messages':[AIMessage(content='',tool_calls=[{'id':'call','name':'execute_command','args':{'command':'echo','arguments':[],'timeout':1800}}])]})
+        result=await graph().ainvoke({'messages':[AIMessage(content='',tool_calls=[{'id':'call','name':'execute_command','args':{'argv': ['echo'],'timeout':1800}}])]})
         assert result['messages'][-1].status=='error'
         assert 'Foreground timeout' in result['messages'][-1].content
     asyncio.run(run())

@@ -15,7 +15,8 @@ from app.storage import StorageConflictError
 from app.agents.tools.write_project_file import make_write_project_file
 
 
-def test_worker_can_correct_json_encoded_edits_from_returned_schema(tmp_path, monkeypatch):
+def test_edits_sent_as_a_json_encoded_string_are_decoded_instead_of_refused(tmp_path, monkeypatch):
+    """A known habit of Qwen. Refusing it cost a model turn for a call whose meaning was never in doubt."""
     target = tmp_path / 'a.txt'
     target.write_text('original')
     write = make_write_project_file(('.',))
@@ -31,18 +32,16 @@ def test_worker_can_correct_json_encoded_edits_from_returned_schema(tmp_path, mo
             if not results:
                 args = {'path': 'a.txt', 'edits': json.dumps([{'old_text': 'original', 'new_text': 'updated'}])}
             elif len(results) == 1:
-                assert target.read_text() == 'original'
-                assert results[-1].status == 'error'
+                assert results[-1].status == 'success' and target.read_text() == 'updated'
+                # A string that is not a list still fails, naming the field with one example.
+                args = {'path': 'a.txt', 'edits': 'replace updated with final'}
+            elif len(results) == 2:
+                assert results[-1].status == 'error' and target.read_text() == 'updated'
                 failure = json.loads(results[-1].content)['error_details']
-                assert failure['tool'] == 'write_project_file'
-                assert failure['category'] == 'invalid_arguments'
-                assert failure['retry_policy'] == 'correct_arguments'
+                assert failure['category'] == 'invalid_arguments' and 'retry_policy' not in failure and 'tool' not in failure
                 field = failure['fields'][0]
-                assert field['field'] == 'edits' and field['received_type'] == 'string'
-                assert field['expected_schema']['type'] == 'array'
-                assert field['expected_schema']['items']['required'] == ['old_text', 'new_text']
-                assert isinstance(field['example'], list)
-                args = {'path': 'a.txt', 'edits': [{'old_text': 'original', 'new_text': 'updated'}]}
+                assert field['field'] == 'edits' and isinstance(field['example'], list) and 'expected_schema' not in field
+                args = {'path': 'a.txt', 'edits': [{'old_text': 'updated', 'new_text': 'final'}]}
             else:
                 assert results[-1].status == 'success'
                 return AIMessage(content='Recovered')
@@ -57,8 +56,8 @@ def test_worker_can_correct_json_encoded_edits_from_returned_schema(tmp_path, mo
             result = await worker.build_graph().ainvoke({'messages': [HumanMessage(content='Edit the file')]},
                 {'configurable': {'thread_id': 'feedback'}, 'recursion_limit': 30})
             assert result['messages'][-1].content == 'Recovered'
-            assert target.read_text() == 'updated'
-            assert len(calls) == 3
+            assert target.read_text() == 'final'
+            assert len(calls) == 4
         finally:
             active_workspace.reset(token)
     asyncio.run(scenario())
@@ -77,26 +76,28 @@ def test_nested_missing_field_reports_its_structure_without_input_contents(tmp_p
         message = result['messages'][-1]
         field = json.loads(message.content)['error_details']['fields'][0]
         assert message.status == 'error'
-        assert field['field'] == 'edits.0.new_text'
-        assert field['received_type'] == 'missing'
-        assert field['expected_schema']['type'] == 'string'
+        assert field['field'] == 'edits.0.new_text' and field['message'] == 'Field required'
+        assert field['example'] == '<text>' and 'expected_schema' not in field
         assert 'PRIVATE ORIGINAL TEXT' not in message.content
     asyncio.run(scenario())
 
 
-@pytest.mark.parametrize('error,category,policy', [
-    (ConnectionRefusedError('Connection refused'), 'service_unavailable', 'after_service_ready'),
-    (TimeoutError('Service timed out'), 'service_unavailable', 'after_service_ready'),
-    (PermissionError('User denied access'), 'permission_denied', 'after_permission'),
-    (TypeError("object ServerWebSocketRoute can't be used in await expression"), 'internal_error', 'do_not_retry_unchanged'),
-    (StorageConflictError('Dependency changed: doc is v3'), 'operation_rejected', 'after_state_change'),
+@pytest.mark.parametrize('error,category,advised', [
+    (ConnectionRefusedError('Connection refused'), 'service_unavailable', True),
+    (TimeoutError('Service timed out'), 'service_unavailable', True),
+    (PermissionError('User denied access'), 'permission_denied', True),
+    (TypeError("object ServerWebSocketRoute can't be used in await expression"), 'internal_error', True),
+    (StorageConflictError('Dependency changed: doc is v3'), 'operation_rejected', True),
+    # The message of a rejected value is the diagnosis: no generic advice is attached.
+    (ValueError('old_text must match exactly once'), 'operation_rejected', False),
 ])
-def test_runtime_errors_do_not_tell_model_to_fix_valid_argument_types(error, category, policy):
-    result = exception_result(error)
+def test_runtime_errors_do_not_tell_model_to_fix_valid_argument_types(error, category, advised):
+    result = exception_result(error, tool_name='some_tool')
     assert result['error'] == str(error)
     assert result['error_details']['category'] == category
-    assert result['error_details']['retry_policy'] == policy
-    assert 'fields' not in result['error_details']
+    assert ('next_action' in result['error_details']) == advised
+    # Nothing the model cannot act on: no tool name it just called, no exception class, no policy label.
+    assert not {'fields', 'tool', 'exception_type', 'retry_policy'} & set(result['error_details'])
 
 
 @pytest.mark.parametrize('output,category,code', [
@@ -110,6 +111,8 @@ def test_command_feedback_uses_logs_without_inventing_an_outage(output, category
     result = command_failure('Command exited 1', output)
     assert result['error_details']['category'] == category
     assert result['error_details']['code'] == code
+    # Blog5: 27 non-zero exits each carried the same sentence of advice.
+    assert ('next_action' in result['error_details']) == (code != 'nonzero_exit')
 
 
 def test_browser_classifies_navigation_action_and_internal_failures():
@@ -125,6 +128,15 @@ def test_browser_classifies_navigation_action_and_internal_failures():
     assert action['error_details']['action_index'] == 2
     assert internal['error_details']['category'] == 'internal_error'
     assert assertion['error_details']['code'] == 'assertion_failed'
+    # The selector's own match count separates "not on the page" from "there, but not usable".
+    from app.execution.browser_runner import SelectorProblem
+    absent = browser_failure(TimeoutError('Locator.click: Timeout 10000ms exceeded.'), 'action', 0, matches=0)
+    blocked = browser_failure(TimeoutError('Locator.click: Timeout 10000ms exceeded.'), 'action', 0, matches=1)
+    several = browser_failure(SelectorProblem('click needs one element', 'ambiguous_selector', 'append >> nth=0'), 'action', 3)
+    assert absent['error_details']['code'] == 'selector_not_found' and '"dom"' in absent['error_details']['next_action']
+    assert blocked['error_details']['code'] == 'action_timeout' and blocked['error_details']['selector_matches'] == 1
+    assert several['error_details'] == {'category': 'invalid_arguments', 'code': 'ambiguous_selector', 'next_action': 'append >> nth=0',
+                                        'stage': 'action', 'action_index': 3}
 
 
 def test_worker_reports_service_failure_with_error_status_and_preserves_diagnostics(monkeypatch):
@@ -147,7 +159,7 @@ def test_worker_reports_service_failure_with_error_status_and_preserves_diagnost
             result = json.loads(reply.content)
             assert result['output'] == 'curl: connection refused'
             assert result['error_details']['category'] == 'service_unavailable'
-            assert result['error_details']['retry_policy'] == 'after_service_ready'
+            assert result['error_details']['next_action'] == 'Check process logs and readiness.'
             return AIMessage(content='Inspect readiness instead of correcting valid parameters')
     worker = WorkerAgent(AgentSpec(id='testing', name='Testing', prompt_file='testing.md', tools=(service_check,)))
     monkeypatch.setattr(worker, 'model', lambda: Model())
@@ -169,8 +181,7 @@ def test_leader_receives_field_schema_when_delegation_validation_fails(monkeypat
                 'args': {'worker': 'not-a-role', 'task': 'work', 'summary': 'work', 'handoff': 'context'}}])
         assert results[-1].status == 'error'
         field = json.loads(results[-1].content)['error_details']['fields'][0]
-        assert field['field'] == 'worker'
-        assert 'backend' in field['expected_schema']['enum']
+        assert field['field'] == 'worker' and "'backend'" in field['message']
         return AIMessage(content='Correct the role')
     monkeypatch.setattr(team.leader, 'next_message', reply)
     async def scenario():
@@ -188,9 +199,8 @@ def test_legacy_collaboration_feedback_includes_nested_field_schema():
                 'recipient': 'backend', 'goal': 'work', 'key': 'stable', 'dependencies': '["request-id"]'}})
             field = result['error_details']['fields'][0]
             assert result['code'] == 'invalid_arguments'
-            assert field['field'] == 'dependencies' and field['received_type'] == 'string'
-            assert field['expected_schema']['type'] == 'array'
-            assert field['expected_schema']['items']['type'] == 'string'
+            assert field['field'] == 'dependencies' and 'valid list' in field['message']
+            assert field['example'] == ['<text>']
         finally:
             active.reset(token)
     asyncio.run(scenario())

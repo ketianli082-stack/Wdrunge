@@ -1,6 +1,8 @@
 # Wdrunge
 A quite powerful web develop agent team.
 
+The integrated version combines the `agent-enhanced` backend (`a02d55d`) with the English frontend (`9d99fbc`), website selection and batched annotations. The backend is preserved without changes; frontend execution labels use its existing APIs. See [integration notes](docs/final-integration.md) and [visual feedback](docs/visual-feedback.md) for scope and verification details.
+
 ## Development
 
 Start the Python API (see [backend/README.md](backend/README.md) for setup):

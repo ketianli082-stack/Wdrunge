@@ -75,6 +75,34 @@ def base_python(directory, preferred=None):
     return shutil.which('python3', path=path) or getattr(sys, '_base_executable', sys.executable)
 
 
+# What an installation reads, by runtime; a change to any of them calls for a new one.
+INSTALL_INPUTS = {'python': ('pyproject.toml', 'requirements.txt', 'uv.lock', '.python-version'),
+                  'node': ('package.json', 'package-lock.json', 'pnpm-lock.yaml', 'yarn.lock', 'bun.lock')}
+# Left by the platform inside a dependency folder it installed at the project root: the
+# fingerprint of the manifests it was installed from.
+INSTALLED = '.wdrunge-installed'
+
+
+def dependency_fingerprint(directory, runtime) -> str:
+    """Identifies what the dependency folder of `directory` is installed from. Lock files
+    carry the manifests of workspace members in other directories."""
+    import hashlib
+    digest = hashlib.sha256(runtime.encode())
+    for name in INSTALL_INPUTS[runtime]:
+        path = Path(directory) / name
+        digest.update(name.encode() + (path.read_bytes() if path.is_file() else b'-'))
+    return digest.hexdigest()[:24]
+
+
+def installed_fingerprint(folder) -> str | None:
+    """The manifests fingerprint the platform installed this dependency folder from;
+    None for a folder it did not install (or whose installation did not finish)."""
+    try:
+        return (Path(folder) / INSTALLED).read_text().strip() or None
+    except OSError:
+        return None
+
+
 def installation_commands(directory, runtime, python=None):
     """`python`: the interpreter to build a new .venv from (see base_python)."""
     entries = inspect_environment(directory)['runtimes']
@@ -93,8 +121,8 @@ def installation_commands(directory, runtime, python=None):
     if item['manager'] == 'uv':
         return [['uv', 'sync', '--frozen']]
     commands = []
-    python = project_python(directory)
-    if not python.exists():
+    local = project_python(directory)
+    if not local.exists():
         commands.append([base_python(directory, python), '-m', 'venv', str(directory / '.venv')])
-    commands.append([str(python), '-m', 'pip', 'install', *(['-r', 'requirements.txt'] if (directory / 'requirements.txt').exists() else ['-e', '.'])])
+    commands.append([str(local), '-m', 'pip', 'install', *(['-r', 'requirements.txt'] if (directory / 'requirements.txt').exists() else ['-e', '.'])])
     return commands

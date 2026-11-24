@@ -370,7 +370,7 @@ def manager(monkeypatch):
     manager = Processes()
     reports = []
 
-    async def report(job, detail):
+    async def report(job, detail, stage):
         reports.append((job.service, detail))
     manager.failure_handler = report
     manager.reports = reports
@@ -435,7 +435,7 @@ def test_a_restart_that_does_not_serve_brings_back_the_delivered_copy(tmp_path, 
             assert restored.process.returncode is None and restored.relaunch == 'failed' and restored.from_snapshot
             assert restored.ports == {port} and restored.service == 'web'
             [(name, detail)] = manager.reports
-            assert '已恢复交付前的运行副本' in detail and 'no module named flask' in detail
+            assert '服务仍由任务快照里的交付前副本提供' in detail and 'no module named flask' in detail
         finally:
             await manager.close()
     asyncio.run(scenario())

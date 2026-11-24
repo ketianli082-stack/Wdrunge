@@ -22,6 +22,8 @@ import os
 import re
 from pathlib import Path
 
+from app.collaboration.workspaces import runs_root
+
 SKIP_DIRS = {'node_modules', '.venv', 'vendor', 'dist', 'build', '.git', '__pycache__', 'target', '.wdrunge-runs', '.wdrunge-data'}
 TEXT_SUFFIXES = {'.py', '.js', '.ts', '.tsx', '.jsx', '.vue', '.html', '.css', '.md', '.txt', '.json', '.yaml', '.yml',
                  '.toml', '.sh', '.go', '.rs', '.java', '.kt', '.rb', '.php', '.cfg', '.ini', '.env', '.example', ''}
@@ -75,7 +77,7 @@ def scan_file(relative: str, text: str, context: dict) -> list[dict]:
     contract = is_doc and bool(CONTRACT_NAME.search(relative))
     transcript_lines = 0
     for number, line in enumerate(text.splitlines(), 1):
-        if '.wdrunge-runs' in line or any(prefix in line for prefix in context['private_paths']):
+        if '.wdrunge-runs' in line or 'Wdrunge Runs' in line or any(prefix in line for prefix in context['private_paths']):
             add('platform_leak', number, line, 'Contains a Wdrunge workspace or application path; deliverables should use project-relative paths.', 'high')
         for match in LOOPBACK_URL.finditer(line):
             port = int(match.group(1))
@@ -108,7 +110,7 @@ async def delivery_findings(service, project, request, root, artifacts=None) -> 
     context = {
         'reserved_ports': set(environment['reserved_ports']),
         'registry_ports': {s['port'] for s in environment['services'] if s.get('port')},
-        'private_paths': [str(project_root.resolve() / '.wdrunge-runs')],
+        'private_paths': [str(project_root.resolve() / '.wdrunge-runs'), str(runs_root())],
     }
     from platformdirs import user_data_path
     context['private_paths'].append(str(user_data_path('Wdrunge', 'Wdrunge')))

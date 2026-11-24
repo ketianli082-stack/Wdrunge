@@ -1,4 +1,4 @@
-"""Strict schemas and recoverable agent-facing tool errors."""
+"""Tool schemas, what a model is shown of a result, and recoverable tool errors."""
 import json
 import logging
 from langchain_core.tools import tool as langchain_tool
@@ -13,21 +13,62 @@ _schemas = {}
 EXAMPLE_CALLS: dict[str, dict] = {}
 
 
-def tool(*args, context_policy=None, **kwargs):
-    """A strict tool; context_policy declares how its results may be compacted
-    (app.agents.context_policy; undeclared tools are durable)."""
-    def strict(result):
-        result.args_schema.model_config = ConfigDict(**{**result.args_schema.model_config, 'strict': True, 'extra': 'forbid'})
+# What the model is shown of a tool's successful result, by tool name; the tool-call
+# log and the UI keep the full result.
+_views = {}
+
+
+def tool(*args, context_policy=None, model_view=None, **kwargs):
+    """A tool with a closed schema. Types are validated in Pydantic's lax mode ("true"
+    is a boolean, "3" an integer): strict mode refused what LangChain itself accepts,
+    and each refusal cost a model turn. Undeclared arguments never reach a tool:
+    app.agents.tools.arguments drops them and tells the model; the schema still forbids
+    them for callers that skip that step.
+    context_policy declares how results may be compacted (app.agents.context_policy;
+    undeclared tools are durable); model_view(result, arguments) returns what the model
+    is shown of a successful result."""
+    def closed(result):
+        config = {key: value for key, value in result.args_schema.model_config.items() if key != 'strict'}
+        result.args_schema.model_config = ConfigDict(**{**config, 'extra': 'forbid'})
         result.args_schema.model_rebuild(force=True)
         _schemas[result.name] = result.args_schema
         if context_policy:
             from app.agents.context_policy import declare
             declare(result, context_policy)
+        if model_view:
+            _views[result.name] = model_view
         return result
     result = langchain_tool(*args, **kwargs)
     if hasattr(result, 'args_schema'):
-        return strict(result)
-    return lambda fn: strict(result(fn))
+        return closed(result)
+    return lambda fn: closed(result(fn))
+
+
+def model_result(name: str, arguments, content):
+    """A tool result as the model sees it: the fields its next step can use. Failures and
+    results of tools that declare no view pass unchanged."""
+    view = _views.get(name)
+    if view is None or not isinstance(content, str):
+        return content
+    try:
+        data = json.loads(content)
+    except ValueError:
+        data = content
+    if not isinstance(data, (dict, str)) or (isinstance(data, dict) and (data.get('error') or data.get('passed') is False)):
+        return content
+    try:
+        shown = view(data, arguments if isinstance(arguments, dict) else {})
+    except Exception:
+        # A view must never cost a result: a shape it does not expect is shown whole.
+        logger.warning('Model view of %s failed; showing the whole result', name, exc_info=True)
+        return content
+    return shown if isinstance(shown, str) else json.dumps(shown, ensure_ascii=False)
+
+
+def present(data: dict, *keys) -> dict:
+    """The named fields that carry information: absent, None, False and empty ones are left out."""
+    return {key: data[key] for key in keys
+            if not (data.get(key) is None or data[key] is False or data[key] == '' or data[key] == [] or data[key] == {})}
 
 
 def _collapse_optional_null(schema):
@@ -65,6 +106,12 @@ def model_tool_schemas(tools) -> list[dict]:
     for t in tools:
         schema = _collapse_optional_null(convert_to_openai_tool(t))
         schema['function']['parameters'] = _strip_titles(schema['function'].get('parameters', {}))
+        # Fields the runtime requires from a model although API callers may omit them.
+        fields = getattr(getattr(t, 'args_schema', None), 'model_fields', None) or {}
+        demanded = [name for name, field in fields.items() if (getattr(field, 'json_schema_extra', None) or {}).get('model_required')]
+        if demanded:
+            parameters = schema['function']['parameters']
+            parameters['required'] = [*parameters.get('required', ()), *(n for n in demanded if n not in parameters.get('required', ()))]
         schemas.append(schema)
     return schemas
 
@@ -77,12 +124,14 @@ def validation_error_message(exc: ValidationError) -> str:
     return 'Invalid arguments: ' + '; '.join(lines)[:2200]
 
 
-def failure_result(message: str, category: str, code: str, next_action: str,
-                   retry_policy: str = 'inspect_before_retry', **details) -> dict:
-    """Keep the legacy error string while providing machine-readable recovery advice."""
+def failure_result(message: str, category: str, code: str, next_action: str = '',
+                   retry_policy: str | None = None, **details) -> dict:
+    """The error, its category and code, and a next action only when there is a specific
+    one: advice that is the same for every failure of a kind was resent with each of
+    them and said nothing. retry_policy is accepted for older callers and not returned."""
     return {'error': message[:2500], 'error_details': {
-        'category': category, 'code': code, 'retry_policy': retry_policy,
-        'next_action': next_action, **details,
+        'category': category, 'code': code, **({'next_action': next_action} if next_action else {}),
+        **{key: value for key, value in details.items() if value not in (None, '', [], {})},
     }}
 
 
@@ -157,12 +206,6 @@ def _example(schema, root, depth=0):
     return '<text>'
 
 
-def _json_type(value):
-    if value is None:
-        return 'null'
-    return {str: 'string', list: 'array', dict: 'object', bool: 'boolean', int: 'integer', float: 'number'}.get(type(value), type(value).__name__)
-
-
 def validation_failure(exc: ValidationError, *, tool_name=None, schema=None) -> dict:
     """Describe invalid fields without echoing submitted file bodies or secrets."""
     schema = schema if schema is not None else _schemas.get(tool_name)
@@ -176,25 +219,19 @@ def validation_failure(exc: ValidationError, *, tool_name=None, schema=None) -> 
     for error in errors[:4]:
         location = error['loc']
         expected = _field_schema(root, location) if location else {}
-        item = {'field': '.'.join(map(str, location)) or 'arguments',
-                'message': error['msg'][:400], 'code': error['type']}
-        if error['type'] == 'missing':
-            item['received_type'] = 'missing'
-        elif 'input' in error:
-            item['received_type'] = _json_type(error['input'])
+        item = {'field': '.'.join(map(str, location)) or 'arguments', 'message': error['msg'][:400]}
         if expected:
-            item['expected_schema'] = _shape(expected, root)
+            # One of the two: an example when it is short, else the expected shape.
             example = _example(expected, root)
             if len(json.dumps(example, ensure_ascii=False)) <= 600:
                 item['example'] = example
+            else:
+                item['expected_schema'] = _shape(expected, root)
         if error['type'] == 'extra_forbidden':
             item['allowed_fields'] = list(_resolve(root, root).get('properties', {}))[:40]
         fields.append(item)
     return failure_result(validation_error_message(exc), 'invalid_arguments', 'invalid_arguments',
-        'Correct the named fields using expected_schema/example. Arrays and objects must be JSON values, '
-        'not JSON-encoded strings. Re-read exact source text if needed; do not repeat unchanged arguments. '
-        'The operation was not executed.', 'correct_arguments', tool=tool_name, fields=fields,
-        omitted_errors=max(0, len(errors)-len(fields)),
+        fields=fields, omitted_errors=max(0, len(errors)-len(fields)),
         **({'example_call': EXAMPLE_CALLS[tool_name]} if tool_name in EXAMPLE_CALLS else {}))
 
 
@@ -205,9 +242,12 @@ def exception_result(exc: Exception, *, tool_name=None, schema=None) -> dict:
         tool_name = exc.tool_name
     if isinstance(source, ValidationError):
         return validation_failure(source, tool_name=tool_name, schema=schema)
+    if type(source).__name__ == 'BasisChanged':
+        # Names the changed sections; the generic conflict advice would send the member
+        # back to re-read whole documents.
+        return source.result()
     if isinstance(source, ToolFailure):
-        return {**source.result, 'error_details': {**source.result['error_details'],
-                'tool': tool_name, 'exception_type': type(source).__name__}}
+        return source.result
     reason = str(source)[:2500]
     if isinstance(source, PermissionError):
         category, code, policy = 'permission_denied', 'permission_denied', 'after_permission'
@@ -228,19 +268,96 @@ def exception_result(exc: Exception, *, tool_name=None, schema=None) -> dict:
                   'document/task/goal, reconcile your change with it, then retry with the current version; if the '
                   'state does not allow this operation, report that instead of retrying.')
     elif isinstance(source, (ValueError, LookupError)):
-        category, code, policy = 'operation_rejected', 'invalid_state_or_value', 'inspect_before_retry'
-        advice = 'Inspect the stated constraint and current file/request state. Correct the value or use the documented supported operation before retrying.'
+        # The message states the constraint; generic advice would add nothing.
+        category, code, policy, advice = 'operation_rejected', 'invalid_state_or_value', 'inspect_before_retry', ''
     else:
         category, code, policy = 'internal_error', 'tool_execution_failed', 'do_not_retry_unchanged'
         advice = 'This may be a tool/runtime defect. Preserve the error and report the blocker; use another supported verification method if appropriate. Do not repeat the same failing operation or claim success.'
         logger.error('Tool execution failed', exc_info=(type(source), source, source.__traceback__))
-    return failure_result(reason, category, code, advice, policy, tool=tool_name,
-                          exception_type=type(source).__name__)
+    return failure_result(reason, category, code, advice)
 
 
 def tool_error(exc: Exception) -> str:
     # ToolNode error handlers return strings; JSON becomes the next ToolMessage.
     return json.dumps(exception_result(exc), ensure_ascii=False)
+
+
+DENIED_MARKERS = ('operation not permitted', 'permission denied', 'eperm', 'eacces')
+
+
+def denied_path(output: str) -> str | None:
+    """The path a command was refused, from the first output line that names one beside
+    the refusal: quoted, or just before the refusal as shells print it ("ls: path: ...")."""
+    import re
+    def pathlike(value):
+        return ('/' in value or value.startswith('.')) and '://' not in value
+    for line in output.splitlines():
+        lowered = line.lower()
+        if not any(marker in lowered for marker in DENIED_MARKERS):
+            continue
+        for quoted in re.findall(r"""['"`]([^'"`]+)['"`]""", line):
+            if pathlike(quoted):
+                return quoted
+        if before := re.search(r'^(.*?): (?:operation not permitted|permission denied)', line, re.I):
+            segment = before.group(1)
+            if (at := re.search(r'(?:^|\s)(/.*)$', segment)):
+                return at.group(1)  # an absolute path may contain spaces
+            token = segment.split()[-1] if segment.split() else ''
+            if pathlike(token):
+                return token
+    return None
+
+
+def permission_advice(output: str) -> str:
+    """Which boundary of the command sandbox a refusal hit, and what to do about it. A
+    command reads the system runtimes and reads and writes only its workspace and its
+    temporary directory; sockets need network access."""
+    import os
+    from pathlib import Path
+    from app.agents.tools._workspace import source_workspace, workspace_root
+    from app.execution.sandbox import GUARDED_NAMES
+    path = denied_path(output)
+    if path is None:
+        return ('No file path was refused, so this is the network boundary: a command that listens on a port or '
+                'connects to one needs network access. Run it again with network=true; it is reviewed, not bypassed.')
+    workspace = workspace_root().resolve()
+    source = source_workspace.get()
+    source = source.resolve() if source else workspace
+    target = Path(os.path.normpath(path))
+    outside = ('Commands read the system runtimes and read and write only the workspace and their temporary directory '
+               '($TMPDIR, also $HOME).')
+    if not target.is_absolute():
+        if '..' in target.parts:
+            return f'{path} climbs out of your workspace. {outside} Use paths inside the directory your commands start in.'
+        parts = target.parts
+    elif target == workspace or target.is_relative_to(workspace):
+        parts = target.relative_to(workspace).parts
+        cursor = workspace
+        for part in parts:
+            cursor = cursor / part
+            if cursor.is_symlink() and not cursor.resolve().is_relative_to(workspace):
+                link = cursor.relative_to(workspace).as_posix()
+                return (f'{link} is a link to {cursor.resolve()}, outside your workspace, and commands cannot write through '
+                        f'it. Remove the link itself (execute_command: rm {link}) and create your own {cursor.name} inside '
+                        'the workspace (for dependencies: install them there).')
+    elif source != workspace and (target == source or target.is_relative_to(source)):
+        return (f'{path} is in the project root. Your task works on its own copy of the project, in the directory your '
+                'commands start in, and commands cannot read or write the root. Something names the root by absolute path: '
+                'use paths relative to cwd, and delete and regenerate any cache or generated configuration that recorded '
+                'the old absolute path.'
+                + (' Your workspace has its own dependency folder: install what is missing there.'
+                   if {'node_modules', '.venv'} & set(target.parts) else ''))
+    else:
+        return (f'{path} is outside your workspace. {outside} Point the tool\'s cache, configuration or output at a path '
+                'inside the workspace or $TMPDIR.')
+    if guarded := next((part for part in parts if part in GUARDED_NAMES), None):
+        return (f'{guarded} may not be created or changed inside the project (repository metadata, agent configuration '
+                'and credentials are protected). Do the work without it.')
+    if any(part == '.env' or part.startswith('.env.') and part not in {'.env.example', '.env.sample'} for part in parts):
+        return ('Secret .env files cannot be read or written by commands. Use .env.example for templates; connected '
+                'services arrive as environment variables.')
+    return ('The path is inside your workspace, where the sandbox allows reads and writes: this is the file\'s own mode '
+            'or owner (a script that is not executable, a read-only file). Check it with ls -l and fix the mode.')
 
 
 def command_failure(message: str, output: str = '', *, timed_out=False) -> dict:
@@ -252,15 +369,15 @@ def command_failure(message: str, output: str = '', *, timed_out=False) -> dict:
     elif any(marker in text for marker in ('address already in use', 'eaddrinuse')):
         category, code, policy = 'service_unavailable', 'port_in_use', 'after_state_change'
         advice = 'Inspect owned processes and choose a free port; synchronize the endpoint with dependent tasks. Do not terminate unowned services.'
-    elif any(marker in text for marker in ('operation not permitted', 'permission denied', 'eperm', 'eacces')):
+    elif any(marker in text for marker in DENIED_MARKERS):
         category, code, policy = 'permission_denied', 'os_permission_denied', 'after_permission'
-        advice = 'Inspect the sandbox/network boundary and command logs. A local listener also needs reviewed network permission. Do not bypass isolation or a user denial.'
+        advice = permission_advice(output)
     elif any(marker in text for marker in ('could not connect to server', 'connection refused', 'econnrefused')):
         category, code, policy = 'service_unavailable', 'connection_failed', 'after_service_ready'
         advice = 'Check the correct host/port and manage_process status/logs; start or wait for the authorized service before retrying.'
     else:
-        category, code, policy = 'command_failed', 'nonzero_exit', 'inspect_before_retry'
-        advice = 'Inspect exit_code and output to determine whether this is a check failure, missing dependency or command-specific status. Correct the cause before retrying.'
+        # exit_code and output are the diagnosis; there is no more specific advice.
+        category, code, policy, advice = 'command_failed', 'nonzero_exit', 'inspect_before_retry', ''
     return failure_result(message, category, code, advice, policy)
 
 
@@ -268,14 +385,9 @@ def normalize_failure(output: dict, *, tool_name=None) -> dict:
     if not tool_result_failed(output):
         return output
     if output.get('error_details'):
-        details = {**output['error_details']}
-        if tool_name and not details.get('tool'):
-            details['tool'] = tool_name
-        return {**output, 'error_details': details}
+        return output
     failure = failure_result(str(output.get('error') or 'Operation reported a failed check'),
-        'operation_failed', 'failed_result',
-        'Inspect the returned diagnostics and current state; correct the cause or choose another supported method. '
-        'Do not repeat unchanged calls or report this operation as completed.', tool=tool_name)
+                             'operation_failed', 'failed_result')
     return {**output, **failure}
 
 

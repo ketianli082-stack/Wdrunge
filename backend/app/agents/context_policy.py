@@ -1,8 +1,11 @@
 """How a tool's results may be compacted, declared on the tool itself.
 
-- recomputable: the result can be obtained again (a read, a search, a listing, a
-  status, a check that can be re-run) or its decision-relevant facts are kept by the
-  fold digest and the task ledger. Older results fold to excerpts and pointers.
+- recomputable: the result can be obtained again (a search, a listing, a status, a
+  check that can be re-run) or its decision-relevant facts are kept by the fold digest
+  and the task ledger. Older results fold to excerpts and pointers.
+- desk: a recomputable read of a resource (a file range, a document section) that the
+  agent works from. Older results leave the transcript for the desk
+  (app.agents.context_desk), where the resource's current text stays while it is used.
 - durable: the result records state or a decision (a publication, a transition, a
   message, a journal note). It is never cut mechanically; only a model summary of a
   completed work segment, or of the whole history, replaces it.
@@ -11,14 +14,14 @@ Tools that declare nothing are durable, so a new tool is never folded by mistake
 """
 from __future__ import annotations
 
-RECOMPUTABLE, DURABLE = 'recomputable', 'durable'
+RECOMPUTABLE, DURABLE, DESK = 'recomputable', 'durable', 'desk'
 _POLICIES: dict[str, str] = {}
 
 
 def declare(tool, policy: str):
     """Record the policy on the tool (metadata) and by its name, which is all a stored
     history has. Returns the tool, so it can wrap a definition."""
-    if policy not in (RECOMPUTABLE, DURABLE):
+    if policy not in (RECOMPUTABLE, DURABLE, DESK):
         raise ValueError(f'Unknown context policy {policy!r}')
     tool.metadata = {**(tool.metadata or {}), 'context_policy': policy}
     _POLICIES[tool.name] = policy
@@ -46,15 +49,24 @@ def _load_builtin() -> None:
     make_file_management((), ()), make_list_project_files(()), make_read_project_file(())
 
 
+def canonical(name: str, args: dict | None = None) -> str:
+    """The tool name a stored history is judged by: the Leader's dispatcher names the
+    action in its arguments."""
+    if name == 'collaborate':
+        action = str((args or {}).get('action', ''))
+        return next((n for n in (f'collaboration_{action}', action) if n in _POLICIES), name)
+    return name
+
+
 def policy_of(name: str, args: dict | None = None) -> str:
     if not _loaded:
         _load_builtin()
-    if name == 'collaborate':
-        # The Leader's dispatcher names the action in its arguments.
-        action = str((args or {}).get('action', ''))
-        name = next((n for n in (f'collaboration_{action}', action) if n in _POLICIES), name)
-    return _POLICIES.get(name, DURABLE)
+    return _POLICIES.get(canonical(name, args), DURABLE)
 
 
 def recomputable(name: str, args: dict | None = None) -> bool:
-    return policy_of(name, args) == RECOMPUTABLE
+    return policy_of(name, args) in (RECOMPUTABLE, DESK)
+
+
+def desk(name: str, args: dict | None = None) -> bool:
+    return policy_of(name, args) == DESK

@@ -1,4 +1,5 @@
 import type { AgentContextListResponse, AgentContextResponse, ConversationUsageResponse, TeamMemberResponse, TeamStatusResponse, TeamUsageResponse } from "./generated";
+import { untitledConversation } from "./conversationTitle";
 
 export type TeamMember = TeamMemberResponse;
 export type TeamUsage = TeamUsageResponse;
@@ -80,8 +81,22 @@ export type ConversationDetail = ConversationSummary & {
   activities: PersistedActivity[];
 };
 
+export type CollaborationRequestStatus = {
+  conversation?: string;
+  recipient?: string;
+  state: string;
+  created?: number;
+  origin_message?: string;
+  verification?: string;
+  paused_on_restart?: boolean;
+};
+
+export type CollaborationSnapshot = {
+  request?: CollaborationRequestStatus[];
+};
+
 const API_BASE_URL = (
-  import.meta.env.VITE_API_BASE_URL || "http://127.0.0.1:17420"
+  import.meta.env?.VITE_API_BASE_URL || "http://127.0.0.1:17420"
 ).replace(/\/$/, "");
 
 async function requestJson<T>(path: string, init?: RequestInit): Promise<T> {
@@ -128,13 +143,17 @@ export async function validateWorkspace(path: string): Promise<string> {
     body: JSON.stringify({ path }),
   });
   const data = await response.json() as { path?: string; detail?: string };
-  if (!response.ok) throw new Error(typeof data.detail === "string" ? data.detail : `工作区校验失败 (${response.status})`);
-  if (!data.path) throw new Error("工作区校验未返回路径");
+  if (!response.ok) throw new Error(typeof data.detail === "string" ? data.detail : `Workspace validation failed (${response.status})`);
+  if (!data.path) throw new Error("Workspace validation did not return a path.");
   return data.path;
 }
 
 export function listProjects(signal?: AbortSignal): Promise<ProjectSummary[]> {
   return requestJson<ProjectSummary[]>("/api/projects", { signal });
+}
+
+export function getCollaborationSnapshot(projectId: string, signal?: AbortSignal): Promise<CollaborationSnapshot> {
+  return requestJson<CollaborationSnapshot>(`/api/projects/${encodeURIComponent(projectId)}/collaboration`, { signal });
 }
 
 export function createProject(name: string, workspacePath: string): Promise<ProjectSummary> {
@@ -149,7 +168,7 @@ export function createConversation(projectId: string): Promise<ConversationSumma
   return requestJson<ConversationSummary>(`/api/projects/${projectId}/conversations`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ title: "新对话" }),
+    body: JSON.stringify({ title: untitledConversation }),
   });
 }
 
@@ -279,6 +298,35 @@ export type ConversationExecution = {
   pending_tasks: number;
   active_goals: number;
 };
+
+export function executionLabel(
+  state: ConversationExecution | undefined,
+  streaming: boolean,
+  requests?: CollaborationRequestStatus[],
+  conversation?: string,
+): string {
+  if (state?.stopping) return 'Stopping tasks…';
+  if (!state) return streaming ? 'Leader is working' : 'Checking execution status…';
+  if (!state.running && !streaming) return state.paused ? 'Execution paused' : 'No active tasks';
+  // agent-enhanced exposes aggregate execution state. The existing collaboration
+  // snapshot supplies details; it must agree with the authoritative task count.
+  // App passes only requests from the current user turn, never old deliveries.
+  if (state.running && state.pending_tasks > 0 && requests && conversation) {
+    const relevant = requests.filter(request => request.conversation === conversation && !request.paused_on_restart
+      && ['queued', 'running', 'blocked', 'review'].includes(request.state));
+    if (relevant.length === state.pending_tasks) {
+      const count = (status: string) => relevant.filter(request => request.state === status).length;
+      if (count('running')) return `Team working · ${count('running')} active`;
+      if (count('review')) return `Code delivered · ${count('review')} awaiting Leader review`;
+      if (count('blocked')) return `Waiting on dependencies or blockers · ${count('blocked')} blocked`;
+      if (count('queued')) return `Tasks queued · ${count('queued')}`;
+    }
+  }
+  if (streaming) return 'Leader is working';
+  if (state.pending_tasks > 0) return `Team working · ${state.pending_tasks} pending`;
+  if (state.active_goals > 0) return 'Coordinating active goals';
+  return 'Agent execution is active';
+}
 export function getConversationExecution(id: string, signal?: AbortSignal): Promise<ConversationExecution> {
   return requestJson(`/api/conversations/${encodeURIComponent(id)}/execution`, { signal });
 }

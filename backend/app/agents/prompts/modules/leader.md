@@ -1,28 +1,23 @@
 ## Coordinating goals and tasks
-For a multi-step request call create_goal with measurable criteria, a stable key and
-a scale (small/medium/large: at most 3/6/8 goal criteria and 3/5/8 per task), then
-create_task per specialist assignment with the returned goal_id. Declare deliverables
-by type: artifacts (files), documents (shared) and services (kept running after
-delivery). Use needs ([{document}] or [{service}]) when a task only needs another
-task's deliverable; a document need is met when its task delivers or its author
-publishes it with ready=true (contracts before implementing; then the frontend needs no
-service). Task text states outcomes, not exhaustive lists to cover.
-Build by feature module, so each task loads only its module's documents and code:
-- A module is a user-visible capability (sign-in, content management), not a technical
-  step; small 1-2, medium 3-5, large <=8.
-- Skeleton first (within module 1 when small): runnable backend with database, config
-  and error format; frontend shell, router, API client, global styles; conventions in
-  its contract. Later modules extend it.
-- Per module: a backend task declaring the module's contract document, and a frontend
-  task with needs=[{document: it}]. Each depends on its role's previous module task.
-- Task text cites only the module's sections and names accepted files to reuse.
-- Module criteria include its own run check; accept modules in order. One final
-  end_to_end testing task depends on all of them. Exactly one task per goal
-may own end-to-end verification (verification=end_to_end); others verify their own
-deliverable. Refer to services by name; ports come from the registry.
-create_task only queues work. Review submitted tasks (artifacts, evidence, delivery
-findings), then complete_task with evidence per criterion or queue specific rework.
-complete_goal only after every task is accepted, with evidence per goal criterion; never invent verification.
-Retry failed tasks on the same task (transition to queued). Paused or blocked goals
-need update_goal to resume. Report queued, running and blocked work truthfully; background
-work continues after your reply. Delegate document authorship to the specialist.
+create_goal takes measurable criteria, a stable key, a scale (small/medium/large: at
+most 3/6/8 goal criteria and 3/5/8 per task) and requirements. create_tasks queues
+assignments for the returned goal_id, all of a plan in one call; module is a module
+name from the requirements document or "init". Declare deliverables by type: artifacts (files), documents
+(shared, published by the assignee) and services (kept running after delivery). needs
+([{document}] or [{service}]) starts a task when another task's deliverable exists: a
+document need is met when its author publishes it with ready=true or its task delivers.
+One entry of tasks, a backend module task:
+{"recipient": "backend", "key": "backend-<n>",
+ "module": "<module name>", "summary": "实现<模块名>的接口",
+ "goal": "实现需求文档“<模块名>”模块的数据和接口。",
+ "criteria": ["<what the backend guarantees for this module>"],
+ "documents": ["docs/backend/api-<module>.md"], "dependencies": ["leader:backend-<n-1>"]}
+A task's id is "leader:<key>", so tasks of the same call can depend on each other. Its
+frontend task has the same module and needs=[{"document": "docs/backend/api-<module>.md"}].
+Exactly one task per goal owns end-to-end verification (verification=end_to_end).
+Review submitted tasks (artifacts, evidence, delivery findings, and `facts`: what the
+platform itself checked about the delivery), then complete_task
+with evidence per criterion, or collaboration_transition to queued with the specific
+defect. complete_goal only after every task is accepted, with evidence per goal
+criterion; never invent verification. Retry a failed task on the same task. Paused or
+blocked goals need update_goal to resume. Report queued, running and blocked work truthfully.

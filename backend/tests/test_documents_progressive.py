@@ -79,7 +79,8 @@ def test_drafts_are_sectioned_filled_progressively_and_gate_needs_and_delivery(t
         drafts = await s.create_document_drafts(p, report)
         assert len(drafts) == 1 and await s.create_document_drafts(p, report) == []
         text = (workspace / 'docs' / 'verification-report.md').read_text()
-        assert '## 验证范围' in text and '## 证据' in text and '草稿：' in text
+        # The report draft is the example of its own structure: a table row of placeholders per module.
+        assert '## <模块名>' in text and '| 检查项 | 预期 | 实际 | 结论 | 证据 |' in text and '草稿：' in text
         assert 'docs/verification-report.md' in await s.draft_brief(p, report)
         job = (await s.claim('owner'))[2]
         assert job['id'] == report['id'] and await s.claim('owner') is None  # the placeholder does not satisfy needs
@@ -87,7 +88,7 @@ def test_drafts_are_sectioned_filled_progressively_and_gate_needs_and_delivery(t
             await s.transition(p, report['id'], 'testing', 'review', result='done', expected_instance=job['instance_id'])
         document_id = drafts[0]['document_id']
         outline = (await s.read(p, document_id))['outline']
-        scope = next(h for h in outline if h['title'] == '验证范围')
+        scope = next(h for h in outline if h['title'] == '缺陷与阻塞')
         await s.publish(p, 'testing', [{'document_id': document_id, 'base_version': 1, 'summary': 'Scope',
                                         'edits': [{'operation': 'replace_section_body', 'section_id': scope['id'], 'new_text': '接口与页面\n'}]}])
         assert await s.draft_brief(p, report) == ''

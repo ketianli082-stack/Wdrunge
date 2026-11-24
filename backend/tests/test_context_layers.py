@@ -56,7 +56,7 @@ def command(argv, exit_code=0, output='', error=None, **args):
     result = {'id': f'p{next(counter)}', 'name': 'command', 'argv': argv, 'state': 'exited', 'exit_code': exit_code, 'output': output}
     if error:
         result.update(error=error, error_details={'code': 'connection_failed', 'category': 'service_unavailable'})
-    return ('execute_command', {'command': argv[0], 'arguments': argv[1:], **args}, result)
+    return ('execute_command', {'argv': [argv[0], *argv[1:]], **args}, result)
 
 
 def agent(window=131072):
@@ -90,7 +90,9 @@ def test_superseded_results_become_stubs_but_the_current_turn_stays():
     stubs = supersession(body, len(body) - 2)
     index = {m.id: i for i, m in enumerate(body)}
     assert 'newer full read of app.py' in stubs[index[first[1].id]] and index[partial[1].id] in stubs
-    assert 'rewritten by message' in stubs[index[full[1].id]]
+    # A read of a file the agent then rewrote is not stubbed as stale (it moves to the
+    # desk, which shows the file as it is now); only a newer read of it supersedes it.
+    assert 'newer read_project_file result' in stubs[index[full[1].id]] and 'rewritten' not in stubs[index[full[1].id]]
     assert 'the same execute_command call succeeded later' in stubs[index[probe_fail[1].id]]
     assert index[probe_ok[1].id] not in stubs and index[reread[1].id] not in stubs
     # The newest result can never be stubbed by an even newer one in the same turn.
@@ -116,8 +118,10 @@ def test_digests_keep_the_facts_agents_act_on():
     browser = json.loads(kept(folded[page[1].id].content))
     assert browser['passed'] is False and browser['screenshot'] == 'docs/testing/browser-1.png'
     assert browser['actions'] == [{'action': 'assert_text', 'selector': '.state', 'passed': True}] and browser['code'] == 'page_errors'
-    file = json.loads(kept(folded[source[1].id].content))
-    assert file['path'] == 'frontend/app.js' and file['sha256'] == 'deadbeef' and file['lines'] == 1501
+    # A read leaves a pointer naming the file and its hash; its text is on the desk.
+    pointer = folded[source[1].id].content
+    assert pointer.startswith('[Folded read_project_file result') and 'frontend/app.js' in pointer and 'deadbeef' in pointer
+    assert 'on the desk' in pointer and len(pointer) < 400
     # Tools that declare no context policy are durable: never cut mechanically.
     assert folded[unknown[1].id].content == unknown[1].content and folded[text[1].id].content == text[1].content
 
@@ -139,7 +143,7 @@ def test_folded_call_arguments_cannot_be_sent_back_as_values():
 def test_ledger_records_files_processes_checks_and_open_failures():
     body = [HumanMessage(content='task', id='task'),
             *turn(('write_project_file', {'path': 'backend/app.py', 'content': 'x' * 3000}, 'Wrote backend/app.py (3000 characters; sha256=abcdef1234567890ff).')),
-            *turn(('execute_command', {'command': 'python3', 'arguments': ['backend/app.py'], 'background': True, 'ready_port': 8765},
+            *turn(('execute_command', {'argv': ['python3', 'backend/app.py'], 'background': True, 'ready_port': 8765},
                    {'id': 'svc1', 'name': 'api', 'argv': ['python3', 'backend/app.py'], 'state': 'running', 'ready': True})),
             *turn(command(['curl', 'http://127.0.0.1:8765/api/hello'], 0, '{"message": "Hello World"}')),
             *turn(command(['lsof', '-i'], 1, '', error='Command exited 1')),
@@ -169,7 +173,7 @@ def test_fold_waits_for_a_large_batch_and_records_only_changed_messages(tmp_path
         small = [SystemMessage(content='sys'), HumanMessage(content='task', id='task'),
                  *turn(read('a.py', 'a' * 4000)), *turn(('future_tool', {}, 'd' * 24000)), *turn(), *turn(), *turn()]
         assert not (await memory.prepare(small)).changed
-        big = [*small, *[m for i in range(6) for m in turn(read(f'f{i}.py', 'b' * 8000))], *turn(), *turn(), *turn()]
+        big = [*small, *[m for i in range(6) for m in turn(('search_code', {'query': f'f{i}'}, 'b' * 8000))], *turn(), *turn(), *turn()]
         # Each call that keeps the foldable bodies pays for them; once that has cost as much as
         # the rewrite would (rent-or-buy), the whole batch folds in one rewrite.
         for calls in range(1, 10):
@@ -283,8 +287,11 @@ def test_the_newest_outline_of_each_document_keeps_every_section_id_when_folded(
     outline_kept = json.loads(kept(folded[publish[1].id].content))
     assert [s["id"] for s in outline_kept["revisions"][0]["outline"]] == [s['id'] for s in outline]
     assert outline_kept["revisions"][0]["budget"] == 15000
-    # The older outline of the same document is folded to the usual short form.
-    assert len(json.loads(kept(folded[older[1].id].content))['outline']) == 20
+    # The older outline read moves to the desk, which lists every section ID.
+    from app.agents.context_desk import is_desk
+    assert 'on the desk' in folded[older[1].id].content
+    desk = next(m for m in fold(body) if is_desk(m))
+    assert '- s29 Section 29' in desk.content and 'outline' in desk.content
 
 
 def test_folded_writes_and_reads_keep_the_file_structure():
@@ -297,5 +304,27 @@ def test_folded_writes_and_reads_keep_the_file_structure():
     assert folded_call_failure(call['args'])['error_details']['code'] == 'folded_placeholder'
     body = [HumanMessage(content='task', id='task'), *(page := turn(read('backend/app.py', '[sha256=ab12; characters=9]\n' + source))),
             *filler()]
-    digest = json.loads(kept(by_id(fold(body))[page[1].id].content))
-    assert 'L9 def create_app():' in digest['structure']
+    folded = fold(body)
+    assert 'on the desk' in by_id(folded)[page[1].id].content
+    # The whole read's declarations are in the ledger's code index, with line numbers.
+    assert 'L9 def create_app():' in next(m for m in folded if is_ledger(m)).content
+
+
+def test_a_stylesheet_is_indexed_by_its_class_names():
+    """Blog5: the index listed selector lines with line numbers, 162 of 339 class names
+    in 1,500 characters a file, and members ran 31 greps over stylesheets for the rest."""
+    css = ('/* .commented-out { } */\n:root { --gap: .5rem; }\n.page, .page-header {\n  margin: .5em;\n}\n'
+           '.page .card:hover > .card-title,\n.card.is-active {\n  background: url(img/a.b.png);\n}\n'
+           '@media (min-width: 768.5px) {\n  .page { padding: 0; }\n  .sidebar { display: none; }\n}\n#app .btn--primary { color: red; }\n')
+    assert context_fold.structure('src/styles/layout.css', css) == 'classes: page page-header card card-title is-active sidebar btn--primary'
+    assert context_fold.structure('src/app.scss', '.a { .b { c: d; } }') == 'classes: a b'
+    assert context_fold.structure('src/empty.css', 'body { margin: 0; }') == ''
+    # Every class of a large stylesheet fits; past the limit the rest is counted.
+    many = ''.join(f'.component-{i:03d}-wrapper {{ margin: 0; }}\n' for i in range(140))
+    index = context_fold.structure('layout.css', many)
+    shown = index.count('component-')
+    assert 100 < shown < 140 and index.endswith(f'…(+{140 - shown} more)') and len(index) <= context_fold.STYLE_STRUCTURE_LIMIT
+    names = ''.join(f'.c{i} {{ margin: 0; }}\n' for i in range(140))
+    assert context_fold.structure('layout.css', names).count(' c') == 140
+    # Other files keep line-numbered declarations.
+    assert context_fold.structure('a.py', 'def f():\n    pass\n') == 'L1 def f():'

@@ -152,3 +152,28 @@ def test_reasoning_tokens_are_recorded_separately(tmp_path):
         assert {g['key']: g['reasoning_tokens'] for g in usage['by_agent']} == {'backend': 246, 'reviewer': 0}
         await store.close()
     asyncio.run(run())
+
+
+def test_what_failed_before_a_call_answered_is_recorded(tmp_path):
+    """Blog11: 13 calls show retries=3 and nothing says which error it was."""
+    async def run():
+        store = ChatStore(f'sqlite+aiosqlite:///{tmp_path}/retries.db')
+        project = (await store.create_project('Usage', str(tmp_path)))['id']
+        conversation = (await store.create_conversation(project))['id']
+        backend = Agent(AgentSpec(id='backend', name='Backend', prompt_file='backend.md'))
+        backend._store = store
+        retried = reply(1000, 0)
+        retried.response_metadata.update(wdrunge_retries=3, wdrunge_retry_errors='APIConnectionError x3')
+        token = usage_scope.set({'conversation_id': conversation})
+        try:
+            await backend.record_usage_durable(retried)
+            await record_call(store, 'reviewer', retried, 'review')
+            await backend.record_usage_durable(reply(1000, 0))
+        finally:
+            usage_scope.reset(token)
+        async with store.engine.connect() as connection:
+            rows = (await connection.exec_driver_sql('SELECT agent_id, retries, retry_errors FROM agent_usage ORDER BY created_at')).all()
+        assert [tuple(row) for row in rows] == [('backend', 3, 'APIConnectionError x3'), ('reviewer', 3, 'APIConnectionError x3'),
+                                               ('backend', 1, None)]
+        await store.close()
+    asyncio.run(run())

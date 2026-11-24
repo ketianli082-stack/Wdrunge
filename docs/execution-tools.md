@@ -13,11 +13,35 @@
 | `search_code` | 字面量代码搜索，返回路径、行号和分页；跳过依赖、构建输出、符号链接、二进制和秘密配置，扫描预算耗尽会明确报告不完整。 |
 | `read_external_file` | 支持绝对路径和 `~/`；审核精确到文件的只读范围，不开放父目录或写权限；最多 2 MiB UTF-8。 |
 | `manage_file` | 不覆盖目标的移动、显式递归删除；小模型审核，存在疑问转人工；不能操作根目录或绕过共享文档发布。 |
-| `browser_verify` | 一次临时会话内导航、点击、输入、按键、等待可见和文本断言；返回页面文字、控制台/页面/HTTP 错误及 `docs/testing/browser-*.png` 截图。 |
+| `browser_verify` | 一次临时会话内导航、点击、输入、按键、等待可见和文本断言；返回页面文字、控制台/页面/HTTP 错误及 `docs/testing/browser-*.png` 整页截图（长页面按 4000px 分段，最多 3 段）。截图随结果附给模型查看（见 `docs/backend/context-memory.md` 的“页面截图”），样式和布局一次看清，不靠反复断言。 |
+
+给模型的 `execute_command` 结果只有退出码和输出；后台服务另带进程 ID、名称、状态、端口和登记的服务；输出不完整时带 `truncated` 和 `next_offset`。调用参数（`argv`、`cwd`）不再原样返回，取默认值的状态字段不出现。完整结果仍在工具调用记录里。
+
+`read_project_file` 可以按行读（`start_line`、`line_count`，代码索引和检索结果给的是行号）或按字符读（`offset`、`limit`）。只读到文件一部分时，结果末尾带一行位置：`[lines 12–40, characters 9800–13400 of 23528; next_offset=13400]`（读到末尾时没有 `next_offset`）；一次读完整份文件的结果不变。偏移超过文件长度时返回 `[offset 10100 处没有内容；文件共 9352 字符]`。`force=true` 在工作台已显示该内容时仍返回正文。这个格式只在 `app/agents/read_result.py` 一处生成和解析。
 
 原有 `run_project_check`、`refresh_api_contract`、`refresh_frontend_client` 和 `run_service_check` 同样通过统一执行层。Python 验证优先使用任务自己的环境，必要时只读使用来源项目的 `.venv`，不会悄悄使用 Wdrunge 宿主的依赖冒充项目环境。
 
 任务快照中共享的依赖只能只读使用。需要修改依赖时，通过受审核的命令解除任务内的依赖符号链接，再创建任务自己的依赖目录；不得删除或覆盖链接目标。运行产生的缓存、HOME 和 Wdrunge 测试数据库位于私有临时目录。任务快照中的 `.task-scratch/` 供成员存放只给自己用的辅助文件（mock 服务、探测脚本），可跨命令使用，但不会合并进项目。
+
+## 工具参数的容错（`tools/arguments.py`）
+
+LangGraph 不做模糊解析，LangChain 只在流式路径上补全缺失的括号。平台在所有工具调用的同一个入口（成员的工具节点、Leader 的循环）处理模型写的参数：
+
+- **类型**：校验用 Pydantic 的默认（宽松）模式，`"true"` 是布尔值、`"3"` 是整数。此前的严格模式比 LangChain 默认更严，Blog5 里 `ready: "true"` 因此被拒 5 次。
+- **不认识的参数**：去掉后照常执行，返回的最前面加一条 `notice`（“X 不是 <工具> 的参数，已忽略。”），任何层级都一样。例外：名字和一个没传的参数很像（`dependancies` 对 `dependencies`、`sectionId` 对 `section_id`）时拒绝，并提示正确的名字，因为忽略会让调用少一个模型本想设置的选项。
+- **数组或对象写成了 JSON 字符串**：解码后使用。
+- **可选的文字参数传了空字符串**（而这个参数不允许为空）：当作没有传。真实模型给没有模块的任务写过 `module: ""`。必填参数为空仍然报错。
+- **无法解析的调用**（参数不是合法 JSON）：只做语法修复——代码块标记和 JSON 前后的文字、结尾多余的逗号、单引号、`True`/`False`/`None`、没加引号的键名、字符串里的裸换行、只缺结尾的括号。修不了的返回一条正常的工具错误（带该工具的示例调用），不再没有回应。
+- **被截断的调用不修复也不执行**：响应的 `finish_reason` 是 `length`，或者要闭合一个没写完的字符串才能解析时，返回“调用被截断，没有执行；把内容分成几次写”。
+- **不做**：不猜缺失的必填参数，不把单个值当数组，不改键名的大小写，不拆多包的一层，不改变值的含义。
+
+被忽略的参数、结构修正和语法修复记在工具调用记录的 `notes` 列里（不写进给模型的返回），可以统计哪些工具的说明容易让模型写错。工具调用记录保存模型发来的原始参数和完整结果，被拒绝执行的调用（无法解析、被截断、读取暂停）也在记录里。`scripts/replay_tool_calls.py` 把一次运行的调用重放一遍：原来成功的调用处理后必须不变。
+
+## 给模型的结果（`validation.model_result`）
+
+存库和界面保留完整结果，给模型的只留下一步用得到的字段：不原样返回调用参数，不返回取默认值的状态字段和没有工具接收的内部标识。每个工具在定义处声明自己的视图（`tool(..., model_view=...)`），没有声明的按原样返回；`tests/test_model_views.py` 固定每个视图的字段，新增字段必须改测试。目前有视图的工具：`execute_command`、`write_project_file`（回执不带哈希）、`create_goal`、`create_task`、`collaboration_request`、`collaboration_send`、`collaboration_publish`、`collaboration_read`（章节不带偏移量）、`submit_task`、`complete_task`、`collaboration_transition`、`collaboration_register_service`。工作台刷新读取时用同一个视图。
+
+失败结果是 `error` 加 `error_details`（`category`、`code`）；`next_action` 只在有针对性内容时出现（命令非零退出、值被拒绝这类不再附通用建议）。参数校验失败列出字段名、消息和一个示例（示例过长时给期望结构），出过错的工具还带一个完整的示例调用。
 
 ## 小模型与人工授权
 

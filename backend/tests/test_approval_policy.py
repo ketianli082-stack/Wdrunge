@@ -332,7 +332,7 @@ def test_long_command_output_is_compacted_but_full_log_remains(tmp_path, monkeyp
     async def run():
         token, source = active_workspace.set(tmp_path), source_workspace.set(tmp_path)
         try:
-            result = await execute_command.ainvoke({'command': sys.executable, 'arguments': ['-c', script]})
+            result = await execute_command.ainvoke({'argv': [sys.executable, '-c', script]})
             assert result['exit_code'] == 0 and result['output_truncated']
             assert len(result['output'].encode()) < 5000
             assert result['output'].startswith('line 0 ok') and result['output'].rstrip().endswith('tail 2999')
@@ -341,7 +341,7 @@ def test_long_command_output_is_compacted_but_full_log_remains(tmp_path, monkeyp
             rest = await manage_process.ainvoke({'action': 'logs', 'process_id': result['id'],
                                                  'offset': first['next_offset'], 'limit': 30000})
             assert first['output'].startswith('line 0 ok') and 'ERROR: build step 7 failed' in rest['output']
-            short = await execute_command.ainvoke({'command': sys.executable, 'arguments': ['-c', 'print("hi")']})
+            short = await execute_command.ainvoke({'argv': [sys.executable, '-c', 'print("hi")']})
             assert short['output'] == 'hi\n' and 'output_truncated' not in short
         finally:
             await manager.close()

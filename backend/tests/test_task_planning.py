@@ -36,8 +36,12 @@ def test_goal_scale_bounds_criteria_and_is_required_from_leader(tmp_path):
         try:
             refused = await execute_collaboration('create_goal', {'objective': 'X', 'criteria': ['x'], 'key': 'g3'})
             assert 'Choose the goal scale' in refused['error']
-            scaled = await execute_collaboration('create_goal', {'objective': 'X', 'criteria': ['x'], 'key': 'g3', 'scale': 'small'})
-            assert scaled['task_criteria_limit'] == 3
+            unstated = await execute_collaboration('create_goal', {'objective': 'X', 'criteria': ['x'], 'key': 'g3', 'scale': 'small'})
+            assert 'requirements' in unstated['error']
+            scaled = await execute_collaboration('create_goal', {'objective': 'X', 'criteria': ['x'], 'key': 'g3', 'scale': 'small',
+                                                                 'requirements': {'none': '修一个已定位的 Bug'}})
+            assert scaled['task_criteria_limit'] == 3 and scaled['requirements'] == {'none': '修一个已定位的 Bug'}
+            assert scaled['project'] == {'backend_initialized': False, 'frontend_initialized': False}
         finally:
             active.reset(token)
         token = active.set(Context(s, p, 'leader', conv, 'user'))
@@ -200,3 +204,201 @@ def test_a_service_has_one_delivering_task_per_goal(tmp_path):
                                goal_id=other['id'], acceptance_criteria=['works'])
         await store.close()
     asyncio.run(run())
+
+
+REQUIREMENTS = ('博客：作者写文章，访客阅读。\n\n# 账号与登录\n\n## 需求1：作者登录\n\n作者在登录页输入密码进入后台。\n\n'
+                '## 验收标准\n\n- 输入正确密码后进入后台\n\n# 文章管理\n\n## 需求1：发布文章\n\n作者在后台写文章并发布。\n\n'
+                '## 验收标准\n\n- 发布后文章出现在列表里\n')
+PATH = 'docs/product/requirements.md'
+
+
+async def leader_call(action, **payload):
+    return await execute_collaboration(action, payload)
+
+
+def test_requirements_come_first_and_each_task_builds_one_module(tmp_path):
+    """Blog5: the same prompt used product in Blog4 and not in Blog5, and the first backend
+    task was skeleton plus three features (143 + 127 turns). The platform holds the flow."""
+    async def run():
+        store, s, p, conv = await setup(tmp_path)
+        token = active.set(Context(s, p, 'leader', conv, 'leader-ctx'))
+        try:
+            goal = await leader_call('create_goal', objective='博客', criteria=['能发文章'], key='g', scale='medium',
+                                     requirements={'document': PATH})
+            assert goal['requirements'] == {'document': PATH, 'ready': False} and '只给产品建一个任务' in goal['next_action']
+            task = dict(goal_id=goal['id'], criteria=['done'])
+            early = await leader_call('create_task', recipient='backend', goal='登录接口', key='b1', module='账号与登录', **task)
+            assert '还没有发布' in early['error'] and '只给产品建一个任务' in early['error']
+            product = await leader_call('create_task', recipient='product', goal='写需求文档', key='prd', documents=[PATH], **task)
+            assert product['state'] == 'queued'
+            await s.publish(p, 'product', [{'path': PATH, 'base_version': 0, 'summary': '需求', 'content': REQUIREMENTS, 'ready': True}])
+            # Developers get exactly one module, or only the initialization.
+            vague = await leader_call('create_task', recipient='backend', goal='全部接口', key='b0', **task)
+            assert 'module' in vague['error'] and "['账号与登录', '文章管理']" in vague['error']
+            unknown = await leader_call('create_task', recipient='backend', goal='评论', key='b0', module='评论', **task)
+            assert '没有模块“评论”' in unknown['error'] and '账号与登录' in unknown['error']
+            uninitialized = await leader_call('create_task', recipient='backend', goal='登录接口', key='b1', module='账号与登录', **task)
+            assert 'module="init"' in uninitialized['error']
+            init = await leader_call('create_task', recipient='backend', goal='后端初始化', key='b-init', module='init',
+                                     documents=['docs/backend/api-conventions.md'], **task)
+            login = await leader_call('create_task', recipient='backend', goal='登录接口', key='b1', module='账号与登录',
+                                      documents=['docs/backend/api-auth.md'], **task)
+            # The module waits for its role's initialization without the Leader saying so.
+            assert login['dependencies'] == [init['id']] and login['module'] == '账号与登录'
+            assert login['module_ref']['path'] == PATH and login['module_ref']['section_id']
+            assert await leader_call('create_task', recipient='backend', goal='登录接口', key='b1', module='账号与登录',
+                                     documents=['docs/backend/api-auth.md'], **task) == login  # idempotent retry
+            brief = await s.task_brief(p, login)
+            assert f"section_id=\"{login['module_ref']['section_id']}\", subtree=true" in brief and '账号与登录' in brief
+            assert 'module="init"' in await s.task_brief(p, init) and '文章管理' in await s.task_brief(p, init)
+            again = await leader_call('create_task', recipient='backend', goal='登录接口再来', key='b1-again', module='账号与登录', **task)
+            assert '已经有模块“账号与登录”的任务' in again['error'] and '不新建' in again['error']
+            # One contract per module: a later module neither shares nor waits on another module's.
+            shared = await leader_call('create_task', recipient='backend', goal='文章接口', key='b2', module='文章管理',
+                                       documents=['docs/backend/api-auth.md'], dependencies=[login['id']], **task)
+            assert '契约文档一个模块一份' in shared['error']
+            posts = await leader_call('create_task', recipient='backend', goal='文章接口', key='b2', module='文章管理',
+                                      documents=['docs/backend/api-posts.md'], dependencies=[login['id']], **task)
+            assert posts['dependencies'] == [login['id'], init['id']]
+            await leader_call('create_task', recipient='frontend', goal='前端初始化', key='f-init', module='init', **task)
+            wrong = await leader_call('create_task', recipient='frontend', goal='文章页面', key='f2', module='文章管理',
+                                      needs=[{'document': 'docs/backend/api-auth.md'}], **task)
+            assert '是模块“账号与登录”的任务' in wrong['error']
+            page = await leader_call('create_task', recipient='frontend', goal='文章页面', key='f2', module='文章管理',
+                                     needs=[{'document': 'docs/backend/api-posts.md'}, {'document': 'docs/backend/api-conventions.md'}], **task)
+            assert 'error' not in page
+            # Other roles are not held to a module.
+            assert 'error' not in await leader_call('create_task', recipient='testing', goal='验证全部模块', key='e2e', **task)
+            # A goal that needs no requirements document says why, on the record.
+            fix = await leader_call('create_goal', objective='修复登录按钮', criteria=['按钮可点'], key='fix', scale='small',
+                                    requirements={'none': '已定位的 Bug'})
+            assert fix['requirements'] == {'none': '已定位的 Bug'} and 'next_action' not in fix
+            assert (await s.get_goal(p, fix['id'], conv))['requirements'] == {'none': '已定位的 Bug'}
+            patch = await leader_call('create_task', goal_id=fix['id'], criteria=['done'], recipient='frontend', goal='修按钮', key='patch')
+            assert patch['state'] == 'queued'
+            stray = await leader_call('create_task', goal_id=fix['id'], criteria=['done'], recipient='frontend', goal='x', key='stray', module='文章管理')
+            assert '没有登记需求文档' in stray['error']
+        finally:
+            active.reset(token)
+        await store.close()
+    asyncio.run(run())
+
+
+def test_a_requirements_file_the_user_wrote_is_adopted_and_initialized_projects_need_no_init(tmp_path):
+    async def run():
+        store, s, p, conv = await setup(tmp_path)
+        workspace = tmp_path / 'workspace'
+        (workspace / 'docs/product').mkdir(parents=True)
+        (workspace / PATH).write_text(REQUIREMENTS)
+        (workspace / 'backend').mkdir()
+        (workspace / 'backend/pyproject.toml').write_text('[project]\nname = "x"\n')
+        token = active.set(Context(s, p, 'leader', conv, 'leader-ctx'))
+        try:
+            goal = await leader_call('create_goal', objective='博客', criteria=['能发文章'], key='g', scale='medium',
+                                     requirements={'document': PATH})
+            assert goal['requirements'] == {'document': PATH, 'ready': True, 'document_id': goal['requirements']['document_id'],
+                                            'modules': ['账号与登录', '文章管理']}
+            assert (await s.read(p, goal['requirements']['document_id']))['version'] == 1
+            assert goal['project'] == {'backend_initialized': True, 'frontend_initialized': False}
+            login = await leader_call('create_task', goal_id=goal['id'], criteria=['done'], recipient='backend', goal='登录接口',
+                                      key='b1', module='账号与登录')
+            assert login['dependencies'] == []
+            # A document that does not follow the module structure cannot be planned from.
+            (workspace / 'docs/product/loose.md').write_text('# 需求\n\n随便写的一段话。\n')
+            loose = await leader_call('create_goal', objective='另一个', criteria=['x'], key='g2', scale='small',
+                                      requirements={'document': 'docs/product/loose.md'})
+            assert loose['requirements']['ready'] is False and '结构不符合' in loose['next_action']
+        finally:
+            active.reset(token)
+        await store.close()
+    asyncio.run(run())
+
+
+def test_a_document_only_task_is_delivered_by_its_ready_publication(tmp_path):
+    """Publishing ready only released waiting tasks; with none created yet nobody woke.
+    The product's task now reaches review, which wakes the Leader, without a submit."""
+    async def run():
+        store, s, p, conv = await setup(tmp_path)
+        goal = await s.create_goal(p, 'leader', conv, '博客', ['能发文章'], 'g', scale='medium', requirements={'document': PATH})
+        product = await s.create_request(p, 'leader', 'product', '写需求文档', 'prd', conversation=conv, goal_id=goal['id'],
+                                         acceptance_criteria=['done'], documents=[PATH])
+        job = (await s.claim('owner'))[2]
+        await s.prepare_workspace(p, job['id'])
+        [draft] = await s.create_document_drafts(p, job)
+        token = active.set(Context(s, p, 'product', conv, 'ctx', request=job['id'], instance_id=job['instance_id']))
+        try:
+            saved = await execute_collaboration('publish', {'changes': [{'document_id': draft['document_id'], 'base_version': 1,
+                                                                         'summary': '需求', 'content': REQUIREMENTS}]})
+            assert 'task' not in saved and (await s.get_request(p, product['id']))['state'] == 'running'
+            ready = await execute_collaboration('publish', {'changes': [{'document_id': draft['document_id'], 'base_version': 2,
+                                                                         'summary': '就绪', 'ready': True}]})
+            assert ready['task']['state'] == 'review' and '任务已交付' in ready['task']['note']
+        finally:
+            active.reset(token)
+        delivered = await s.get_request(p, product['id'])
+        assert delivered['state'] == 'review' and PATH in delivered['result']
+        events = await s.inbox(p, 'leader', f'leader:{conv}', conv)
+        assert [e['state'] for e in events if e.get('type') == 'request_status'] == ['review']
+        # A developer who declares only a contract also delivers code: it submits itself.
+        fix = await s.create_goal(p, 'leader', conv, '接口', ['x'], 'g2', scale='small', requirements={'none': '只改接口'})
+        await s.create_request(p, 'leader', 'backend', '契约与实现', 'api', conversation=conv, goal_id=fix['id'],
+                               acceptance_criteria=['done'], documents=['docs/backend/api.md'])
+        job = (await s.claim('owner'))[2]
+        await s.prepare_workspace(p, job['id'])
+        token = active.set(Context(s, p, 'backend', conv, 'ctx2', request=job['id'], instance_id=job['instance_id']))
+        try:
+            contract = await execute_collaboration('publish', {'changes': [{'path': 'docs/backend/api.md', 'base_version': 0,
+                                                                            'summary': '契约', 'content': '# API\n', 'ready': True}]})
+            assert 'task' not in contract and (await s.get_request(p, job['id']))['state'] == 'running'
+        finally:
+            active.reset(token)
+        await store.close()
+    asyncio.run(run())
+
+
+def test_a_whole_plan_is_created_by_one_call_in_order(tmp_path):
+    """Blog6: told to create the remaining tasks at once, the Leader created 11 tasks in
+    11 model calls. The batch tool takes the list; the Leader is offered only that form."""
+    from app.agents.overhead import role_overhead
+    from app.agents.tools.validation import model_result
+    import json
+
+    async def run():
+        store, s, p, conv = await setup(tmp_path)
+        workspace = tmp_path / 'workspace'
+        (workspace / 'docs/product').mkdir(parents=True)
+        (workspace / PATH).write_text(REQUIREMENTS)
+        token = active.set(Context(s, p, 'leader', conv, 'leader-ctx'))
+        try:
+            goal = await leader_call('create_goal', objective='博客', criteria=['能发文章'], key='g', scale='medium',
+                                     requirements={'document': PATH})
+            base = dict(goal='做', criteria=['done'])
+            plan = await leader_call('create_tasks', goal_id=goal['id'], tasks=[
+                dict(recipient='backend', key='backend-init', module='init', **base),
+                dict(recipient='backend', key='backend-1', module='账号与登录', documents=['docs/backend/api-auth.md'],
+                     dependencies=['leader:backend-init'], **base),
+                dict(recipient='backend', key='backend-2', module='评论', dependencies=['leader:backend-1'], **base),
+                dict(recipient='backend', key='backend-3', module='文章管理', dependencies=['leader:backend-2'], **base),
+                dict(recipient='testing', key='e2e', verification='end_to_end', dependencies=['leader:backend-1'], **base)])
+            assert plan['created'] == 3 and plan['failed'] == 2 and '只重发失败的任务' in plan['next_action']
+            first, second, unknown, orphan, e2e = plan['tasks']
+            # Created in order: the second depends on the first of the same call.
+            assert (first['id'], second['id'], second['dependencies']) == ('leader:backend-init', 'leader:backend-1', ['leader:backend-init'])
+            assert unknown['key'] == 'backend-2' and '没有模块“评论”' in unknown['error']
+            assert orphan['key'] == 'backend-3' and 'Dependency leader:backend-2 does not exist' in orphan['error']
+            assert e2e['id'] == 'leader:e2e'
+            assert [r['id'] for r in (await s.snapshot(p))['request']] == ['leader:backend-init', 'leader:backend-1', 'leader:e2e']
+            shown = json.loads(model_result('create_tasks', {}, json.dumps(plan, ensure_ascii=False)))
+            assert shown['tasks'][0] == {'id': 'leader:backend-init', 'state': 'queued'} and shown['tasks'][2] == unknown
+            # Resending only what failed completes the plan; a repeated entry returns the same task.
+            again = await leader_call('create_tasks', goal_id=goal['id'], tasks=[
+                dict(recipient='backend', key='backend-1', module='账号与登录', documents=['docs/backend/api-auth.md'],
+                     dependencies=['leader:backend-init'], **base),
+                dict(recipient='backend', key='backend-3', module='文章管理', dependencies=['leader:backend-1'], **base)])
+            assert 'failed' not in again and [t['id'] for t in again['tasks']] == ['leader:backend-1', 'leader:backend-3']
+        finally:
+            active.reset(token)
+        await store.close()
+    asyncio.run(run())
+    tools = role_overhead()['leader']['tools']
+    assert 'create_tasks' in tools and 'create_task' not in tools and 'delegate_tasks' in tools and 'delegate_task' not in tools

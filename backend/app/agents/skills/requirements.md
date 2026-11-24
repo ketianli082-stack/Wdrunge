@@ -1,1 +1,0 @@
-Product skill: turn the user's request into testable acceptance criteria. Keep the document concise, identify dependencies between team stages, and distinguish confirmed requirements from assumptions.

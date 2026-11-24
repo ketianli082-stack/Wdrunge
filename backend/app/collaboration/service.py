@@ -21,7 +21,7 @@ from sqlalchemy import text
 from app.collaboration.documents import digest, outline, section, edit_document, page
 from app.collaboration.schema import DDL
 from app.collaboration.payloads import TransitionPayload
-from app.collaboration.workspaces import MERGED_COPIES, merge_text, IsolatedWorkspace, unreferenced_screenshots, secret_leaks, unmerged_reason
+from app.collaboration.workspaces import MERGED_COPIES, merge_text, Ignore, IsolatedWorkspace, unreferenced_screenshots, secret_leaks, unmerged_reason
 from app.storage import ChatStore, StorageConflictError, StorageNotFoundError, write_transaction
 
 ROLES = {'leader', 'product', 'backend', 'frontend', 'designer', 'testing'}
@@ -37,13 +37,26 @@ from app.collaboration.runs import ConversationRuns
 from app.collaboration.environment import EnvironmentMixin
 from app.collaboration.journal import JournalMixin
 from app.collaboration.replies import ReplyMixin
+from app.collaboration.review import ReviewMixin
+from app.collaboration.basis import BasisChanged, BasisMixin, section_texts
 from app.collaboration.planning import (PlanningMixin, check_criteria_budget, check_deliverables, goal_scale,
-                                        need_satisfied, normalize_needs, project_relative, serial_dependency, still_draft)
+                                        need_satisfied, normalize_needs, project_relative,
+                                        serial_dependency, still_draft)
 
 logger = logging.getLogger(__name__)
 
 
-class Collaboration(GoalMixin, ConversationRuns, EnvironmentMixin, JournalMixin, PlanningMixin, ReplyMixin):
+class AwaitingAcceptance(StorageConflictError):
+    """A task's dependencies are delivered but not yet accepted: its delivery cannot merge
+    yet (they may still be sent back for rework). `pending`: those dependency records."""
+
+    def __init__(self, pending):
+        self.pending = pending
+        super().__init__('Accept dependency deliveries before publishing artifacts: '
+                         + ', '.join(f"{d['id']} ({d['recipient']}, {d['state']})" for d in pending))
+
+
+class Collaboration(GoalMixin, ConversationRuns, EnvironmentMixin, JournalMixin, PlanningMixin, ReplyMixin, BasisMixin, ReviewMixin):
     def __init__(self, store: ChatStore):
         self.store = store
         self._lock = asyncio.Lock()
@@ -52,7 +65,9 @@ class Collaboration(GoalMixin, ConversationRuns, EnvironmentMixin, JournalMixin,
         # services to the project root waits for them.
         self.migrations: dict = {}
         self.max_running = max(1, min(32, int(os.getenv('WDRUNGE_MAX_CONCURRENCY', '4'))))
-        self.role_concurrency = max(1, min(8, int(os.getenv('WDRUNGE_ROLE_CONCURRENCY', '2'))))
+        # One live session per member until tasks get their own database and service names
+        # (Blog9 P0-4): two sessions of one member share them and overwrite each other.
+        self.role_concurrency = max(1, min(8, int(os.getenv('WDRUNGE_ROLE_CONCURRENCY', '1'))))
 
     async def initialize(self):
         if self._ready:
@@ -144,12 +159,6 @@ class Collaboration(GoalMixin, ConversationRuns, EnvironmentMixin, JournalMixin,
         # Delegators often declare a directory such as "backend/".
         return target.is_file() or target.is_dir() and any(item.is_file() for item in target.rglob('*'))
 
-    async def _dependencies(self, c, project, based_on):
-        for dependency in based_on:
-            doc = await self._get(c, 'document', project, dependency['document_id'])
-            if doc['version'] != dependency['version']:
-                raise StorageConflictError(f"Dependency changed: {doc['id']} is v{doc['version']}")
-
     async def publish(self, project, author, changes, conversation=''):
         """Validate all documents/dependencies, journal a batch, then publish together."""
         if author not in ROLES or not isinstance(changes, list) or not changes or len(changes) > 20:
@@ -225,6 +234,12 @@ class Collaboration(GoalMixin, ConversationRuns, EnvironmentMixin, JournalMixin,
                         raise StorageConflictError('Existing file differs; import its current content first')
                 if len(content) > 500_000:
                     raise ValueError('Document too large')
+                if change.get('ready'):
+                    # A requirements document is planned from its modules, so a malformed one
+                    # would only fail later, at the first module task; a theme holds no styles.
+                    problems = await self.document_problems(c, project, path, content)
+                    if problems:
+                        raise ValueError(f'{path} 还不能以 ready=true 发布，这次发布没有执行：' + ' '.join(problems[:6]))
                 revision = dict(id=identifier, path=path, title=change.get('title', current['title'] if current else target.stem), version=version+1,
                     content=content, hash=digest(content), outline=outline(content), summary=summary,
                     author=author, conversation=conversation, based_on=change.get('based_on', []), batch_id=batch_id,
@@ -272,11 +287,12 @@ class Collaboration(GoalMixin, ConversationRuns, EnvironmentMixin, JournalMixin,
                             await self._put(c, 'revision', pid, f"{r['id']}:{r['version']}", r)
                             await self._index_sections(c, pid, r)
                             await self._put(c, 'document', pid, r['id'], {k: r[k] for k in ('id', 'path', 'title', 'version', 'hash', 'author', 'created')})
+                        changed_by = {}
                         for r in pending['revisions']:
                             previous = await self._get(c, 'revision', pid, f"{r['id']}:{r['version']-1}", False)
-                            old_sections = {s['id']: previous['content'][s['start']:s['body_end']] for s in previous['outline']} if previous else {}
-                            new_sections = {s['id']: r['content'][s['start']:s['body_end']] for s in r['outline']}
+                            old_sections, new_sections = (section_texts(previous) if previous else {}), section_texts(r)
                             changed = [key for key in old_sections.keys() | new_sections.keys() if old_sections.get(key) != new_sections.get(key)]
+                            changed_by[r['id']] = set(changed)
                             notified = set()
                             for sub in await self._list(c, 'subscription', pid):
                                 if sub['document_id'] == r['id'] and sub.get('section_id'):
@@ -291,12 +307,31 @@ class Collaboration(GoalMixin, ConversationRuns, EnvironmentMixin, JournalMixin,
                                     await self._event(c, pid, sub['member'], {'type': 'document_changed', 'document_id': r['id'], 'version': r['version'], 'summary': r['summary'], 'batch_id': r['batch_id'], 'changed_sections': changed})
                         changed_versions = {r['id']: r['version'] for r in pending['revisions']}
                         for request in await self._list(c, 'request', pid):
+                            if request['state'] in TERMINAL:
+                                continue
+                            # References an API caller declared are compared by whole version.
                             affected = [ref for ref in request['based_on'] if ref['document_id'] in changed_versions and ref['version'] != changed_versions[ref['document_id']]]
-                            if affected and request['state'] not in TERMINAL:
+                            if affected:
                                 request['needs_review'] = True
                                 await self._put(c, 'request', pid, request['id'], request)
                                 for member in {request['sender'], request['recipient']}:
                                     await self._event(c, pid, member, {'type': 'request_basis_changed', 'request_id': request['id'], 'dependencies': affected}, request['conversation'])
+                            # A task is told only when this publication changed a section it
+                            # read, with the sections, while it works instead of at delivery.
+                            details, _ = await self.basis_changes(c, pid, request, only=set(changed_versions))
+                            touched = [item for key in ('changed_sections', 'removed_sections') for item in details.get(key, [])
+                                       if item['section_id'] in changed_by.get(item['document_id'], ())]
+                            if touched:
+                                request['needs_review'] = True
+                                await self._put(c, 'request', pid, request['id'], request)
+                                delivered = request['state'] == 'review'
+                                await self._event(c, pid, request['sender'] if delivered else request['recipient'], {
+                                    'type': 'request_basis_changed', 'request_id': request['id'],
+                                    **({} if delivered else {'target_request': request['id']}),
+                                    'documents': [d for d in details.get('documents', []) if d['document_id'] in changed_by],
+                                    'changed_sections': [i for i in details.get('changed_sections', []) if i in touched],
+                                    'removed_sections': [i for i in details.get('removed_sections', []) if i in touched],
+                                    'hint': '只读这几节；和你的任务无关就继续，有关就只改受影响的部分。'}, request['conversation'])
                         await c.execute(text("DELETE FROM collaboration_records WHERE kind='pending' AND project=:p AND id=:i"), {'p': pid, 'i': pending['id']})
 
     async def catalog(self, project):
@@ -308,11 +343,23 @@ class Collaboration(GoalMixin, ConversationRuns, EnvironmentMixin, JournalMixin,
                 d['external_change'] = not path.exists() or digest(path.read_text()) != d['hash']
             return docs
 
-    async def read(self, project, document_id, version=None, section_id=None, offset=0, limit=6000, whole=False):
+    async def read(self, project, document_id, version=None, section_id=None, offset=0, limit=6000, whole=False, subtree=False):
         if offset < 0 or not 1 <= limit <= 12000:
             raise ValueError('Invalid read window')
+        if subtree and section_id is None:
+            raise ValueError('subtree=true reads a section with its subsections: pass section_id (use whole=true for the whole document)')
         async with self.reading() as c:
-            doc = await self._get(c, 'document', project, document_id)
+            doc = await self._get(c, 'document', project, document_id, False)
+            if doc is None:
+                # Models often pass the path they know instead of the ID (seen with the
+                # real Leader: three "document not found" in one turn).
+                from app.collaboration.planning import same_document
+                documents = await self._list(c, 'document', project)
+                doc = next((d for d in documents if same_document(document_id, d)), None)
+                if doc is None:
+                    listed = '; '.join(f"{d['path']} (document_id={d['id']})" for d in documents[:20]) or 'none yet'
+                    raise StorageNotFoundError(f'No managed document {document_id!r}. Managed documents: {listed}')
+                document_id = doc['id']
             r = await self._get(c, 'revision', project, f"{document_id}:{version or doc['version']}")
             if whole:
                 # The full text in one call (paged), with section IDs for later edits.
@@ -326,9 +373,15 @@ class Collaboration(GoalMixin, ConversationRuns, EnvironmentMixin, JournalMixin,
                 s = section(r['content'], section_id)
             except ValueError as exc:
                 raise ValueError(f"Document {document_id} v{r['version']}: {exc}") from exc
-            body = r['content'][s['body_start']:s['body_end']]
+            # A parent's direct body excludes its subsections; subtree returns them too, so
+            # a module of a requirements document is one read instead of one per heading.
+            body = r['content'][s['body_start']:s['end' if subtree else 'body_end']]
             content, next_offset, fragment = page(body, offset, limit)
-            return {'document_id': document_id, 'version': r['version'], 'section': s, 'content': content, 'next_offset': next_offset, 'fragment': fragment}
+            result = {'document_id': document_id, 'version': r['version'], 'section': s, 'content': content, 'next_offset': next_offset, 'fragment': fragment}
+            if subtree:
+                result['sections'] = [{'id': h['id'], 'title': h['title'], 'level': h['level']} for h in r['outline']
+                                      if s['start'] <= h['start'] < s['end']]
+            return result
 
 
     async def subscribe(self, project, member, document_id, enabled=True, section_id=None):
@@ -409,7 +462,7 @@ class Collaboration(GoalMixin, ConversationRuns, EnvironmentMixin, JournalMixin,
         context sees what earlier contexts read; a reply turn instead sees only
         messages no context of this member has read."""
         async with self.reading() as c:
-            rows = (await c.execute(text('''SELECT e.seq,e.data FROM collaboration_events e
+            rows = (await c.execute(text('''SELECT e.seq,e.data,e.created FROM collaboration_events e
               LEFT JOIN collaboration_receipts r ON r.project=e.project AND r.context=:ctx AND r.seq=e.seq
               WHERE e.project=:p AND e.recipient=:m AND (e.conversation='' OR e.conversation=:v)
               AND (json_extract(e.data,'$.target_request') IS NULL OR json_extract(e.data,'$.target_request')=:request)
@@ -424,8 +477,19 @@ class Collaboration(GoalMixin, ConversationRuns, EnvironmentMixin, JournalMixin,
                                                  reply=int(reply_turn), member_contexts=f'{member}:%'))).mappings().all()
             items = []
             size = 0
+            root = None
             for row in rows:
                 item = {'event_id': row['seq'], **json.loads(row['data'])}
+                if item.get('type') == 'request_status' and item.get('state') == 'review':
+                    delivered = await self._get(c, 'request', project, item.get('request_id'), False)
+                    if delivered and delivered['state'] == 'review':
+                        root = root or (await self._project(c, project))['workspace_path']
+                        if self.review_waits(root, delivered, row['created']):
+                            # Shown once the platform has finished migrating and restarting
+                            # services for the merge; the event stays unread until then.
+                            continue
+                        if facts := await self.review_facts(c, project, delivered, root):
+                            item['facts'] = facts
                 if request and item.get('type') == 'request' and item.get('request_id') == request and 'goal' in item:
                     # The executing task's goal is already the Assigned task message.
                     item['goal'] = '(your current assigned task; see the Assigned task message)'
@@ -474,8 +538,9 @@ class Collaboration(GoalMixin, ConversationRuns, EnvironmentMixin, JournalMixin,
 
 
     async def create_request(self, project, sender, recipient, goal, key, conversation='', based_on=None, dependencies=None, artifacts=None, parent=None, priority=1, deadline=None, summary=None, origin_message=None, goal_id=None, acceptance_criteria=None,
-                             documents=None, services=None, needs=None, serial_reason=None, verification=None):
+                             documents=None, services=None, needs=None, serial_reason=None, verification=None, module=None):
         summary = self._summary(summary, '请协作完成这项任务，详见任务记录。')
+        module = (module or '').strip() or None
         if not key or len(key) > 160:
             raise ValueError('A bounded idempotency key is required')
         if priority not in range(4) or (deadline is not None and deadline <= 0):
@@ -507,6 +572,7 @@ class Collaboration(GoalMixin, ConversationRuns, EnvironmentMixin, JournalMixin,
             if verification not in (None, 'self', 'end_to_end'):
                 raise ValueError("verification must be 'self' or 'end_to_end'")
             spec.update({k: v for k, v in extra.items() if v})
+            planned, added = {}, []
             if parent:
                 parent_request = await self._get(c, 'request', project, parent)
                 if parent_request.get('goal_id'):
@@ -532,13 +598,24 @@ class Collaboration(GoalMixin, ConversationRuns, EnvironmentMixin, JournalMixin,
                         raise ValueError(f"Service {name} is already delivered by task {other['id']}; declare services only on "
                                          f"the delivering task and use needs=[{{service: '{name}'}}] in tasks that use it")
                 for dep in spec['dependencies']:
-                    if (await self._get(c, 'request', project, dep)).get('goal_id') != goal_id:
+                    dependency = await self._get(c, 'request', project, dep, False)
+                    if dependency is None:
+                        raise ValueError(f'Dependency {dep} does not exist. A task id is "<sender>:<key>", e.g. "leader:backend-init"; '
+                                         'create that task first, or list it earlier in the same create_tasks call.')
+                    if dependency.get('goal_id') != goal_id:
                         raise ValueError('Task dependencies must belong to the same goal')
+            if module:
+                spec['module'] = module
             old = await self._get(c, 'request', project, identifier, False)
             if old:
                 if old['spec'] != spec:
                     raise StorageConflictError('Idempotency key was used for another request')
                 return old
+            if goal_id:
+                # Requirements first, one module per task (app.collaboration.planning).
+                planned, added = await self.plan_task(c, project, linked_goal, identifier, recipient, module, spec, planned=not parent)
+            elif module:
+                raise ValueError('module applies to tasks of a goal')
             if goal_id and linked_goal['state'] != 'active':
                 raise ValueError('Tasks require an active goal')
             await self._dependencies(c, project, spec['based_on'])
@@ -552,6 +629,9 @@ class Collaboration(GoalMixin, ConversationRuns, EnvironmentMixin, JournalMixin,
             for path in [*spec['artifacts'], *spec.get('documents', [])]:
                 self._path(project_info['workspace_path'], path)
             request = dict(id=identifier, **spec, spec=spec, state='queued', created=time.time(), attempts=0, result='', delivered=[], needs_review=False)
+            request.update(planned)
+            if added:
+                request['dependencies'] = [*request['dependencies'], *added]
             if origin_message:
                 if not await c.scalar(text('SELECT 1 FROM messages WHERE id=:i AND conversation_id=:c'), {'i': origin_message, 'c': conversation}):
                     raise ValueError('Origin message must belong to the request conversation')
@@ -624,8 +704,11 @@ class Collaboration(GoalMixin, ConversationRuns, EnvironmentMixin, JournalMixin,
             if based_on is not None:
                 await self._dependencies(c, project, based_on)
                 r['based_on'] = based_on
+            basis_notes = []
             if state in {'review', 'completed'}:
                 await self._dependencies(c, project, r['based_on'])
+                if state == 'review':
+                    basis_notes = await self.basis_check(c, project, r)
                 if not (result or r['result']).strip():
                     raise ValueError('A delivery summary is required')
                 if state == 'review':
@@ -653,7 +736,7 @@ class Collaboration(GoalMixin, ConversationRuns, EnvironmentMixin, JournalMixin,
             await self._event(c, project, r['sender'], status_event, r['conversation'])
             if state == 'completed' and r.get('origin_message') and r['conversation']:
                 await self.store.add_reaction_in_transaction(c, r['conversation'], {'message_id': r['origin_message'], 'worker': r['recipient'], 'reaction': 'done'})
-            return r
+            return {**r, 'basis_notes': basis_notes} if basis_notes else r
 
     async def requeue_interrupted(self, project, identifier, instance_id, reason, limit=2):
         """Requeue an execution that a transient provider failure interrupted, to resume
@@ -678,6 +761,12 @@ class Collaboration(GoalMixin, ConversationRuns, EnvironmentMixin, JournalMixin,
         if unfilled:
             raise ValueError(f'Declared documents are still the platform drafts: {unfilled}. Fill their sections with '
                              'collaboration_publish edits before delivering.')
+        for path in r.get('documents', []):
+            document = published[path]
+            revision = await self._get(c, 'revision', project, f"{document['id']}:{document['version']}")
+            problems = await self.document_problems(c, project, path, revision['content'])
+            if problems:
+                raise ValueError(f'{path} 还不能交付：' + ' '.join(problems[:6]) + ' 用 collaboration_publish 改好后再交付。')
         from app.execution.processes import processes
         root = (await self._project(c, project))['workspace_path'] if r.get('services') else None
         for name in r.get('services', []):
@@ -754,7 +843,13 @@ class Collaboration(GoalMixin, ConversationRuns, EnvironmentMixin, JournalMixin,
                         await self._put(c, 'request', project, r['id'], r)
                         await self._event(c, project, 'leader', {'type': 'dependency_failed', 'request_id': r['id']}, r['conversation'])
                     continue
-                if any(d['state'] not in {'completed', 'review'} for d in deps):
+                # A delivery waiting for review may still be sent back. Colleagues of other
+                # roles may build on it meanwhile; the same member's next task, which changes
+                # the same code, waits until it is accepted, and so does a finished task whose
+                # own delivery is held for its dependencies' acceptance.
+                held = r.get('blocked_reason') == 'awaiting_acceptance'
+                if any(d['state'] != 'completed' if held or d['recipient'] == r['recipient'] else d['state'] not in {'completed', 'review'}
+                       for d in deps):
                     continue
                 if any([not await need_satisfied(self, c, project, need) for need in r.get('needs', [])]):
                     continue
@@ -1009,34 +1104,62 @@ class Collaboration(GoalMixin, ConversationRuns, EnvironmentMixin, JournalMixin,
                     await self._put(c, 'request', row['project'], row['id'], r)
 
     async def prepare_workspace(self, project, identifier):
-        async with self.transaction() as c:
+        from app.execution.processes import processes
+        async with self.reading() as c:
+            root = (await self._project(c, project))['workspace_path']
+        # A new snapshot copies the root's dependency folders: after the platform has
+        # finished installing them for a delivery just merged, never in the middle.
+        await processes.settled(root)
+        async with processes.root_lock(root), self.transaction() as c:
             r = await self._get(c, 'request', project, identifier)
             p = await self._project(c, project)
             workspace = IsolatedWorkspace(p['workspace_path'], r['workspace_id'])
-            await asyncio.to_thread(workspace.prepare)
+            # A legacy snapshot inside the project moves out unless a process still runs from it.
+            busy = any(Path(job.workspace) == workspace.work.resolve() and job.process.returncode is None
+                       for job in processes.jobs.values())
+            await asyncio.to_thread(workspace.prepare, not busy)
             await asyncio.to_thread(workspace.refresh)
             return workspace
 
-    async def publish_artifacts(self, project, identifier, instance_id, references='', delivered=None):
+    async def publish_artifacts(self, project, identifier, instance_id, references='', delivered=None, refuse=False):
         """Merge what the task snapshot changed since its last merge into the project.
         Every artifact the task declares or this delivery lists (`delivered`) is checked
         in the snapshot first, so a rejected delivery merges nothing and a corrected one
         merges everything. `references` is the delivery text (result, evidence, artifact
         paths) used to keep only screenshots it cites."""
         credentials = await self._known_secrets(project)
+        async with self.reading() as c:
+            r = await self._get(c, 'request', project, identifier)
+            p = await self._project(c, project)
+        if r.get('instance_id') != instance_id or r['state'] not in {'running', 'review'}:
+            raise StorageConflictError('Request execution lease is no longer valid')
+        async with self.reading() as c:
+            pending = [d for d in [await self._get(c, 'request', project, dep) for dep in r['dependencies']] if d['state'] != 'completed']
+        if pending:
+            raise AwaitingAcceptance(pending)
+        checks = None
+        if r.get('workspace_id'):
+            # Outside the transaction: it may install dependencies for minutes.
+            await self.check_root_commands(project, r, p['workspace_path'], IsolatedWorkspace(p['workspace_path'], r['workspace_id']).work)
+            checks = await self.delivery_verification(project, r, p['workspace_path'], references, refuse)
         async with self.transaction() as c:
             r = await self._get(c, 'request', project, identifier)
             if r.get('instance_id') != instance_id or r['state'] not in {'running', 'review'} or r.get('lease_until',0) <= time.time():
                 raise StorageConflictError('Request execution lease is no longer valid')
             await self._dependencies(c, project, r['based_on'])
-            if any(dep['state'] != 'completed' for dep in [await self._get(c, 'request', project, identifier) for identifier in r['dependencies']]):
-                raise StorageConflictError('Accept dependency deliveries before publishing artifacts')
+            # Before anything merges: a delivery resting on changed sections merges nothing.
+            await self.basis_check(c, project, r, bump=False)
+            if pending := [dep for dep in [await self._get(c, 'request', project, identifier) for identifier in r['dependencies']]
+                           if dep['state'] != 'completed']:
+                raise AwaitingAcceptance(pending)
             p = await self._project(c, project)
             workspace = IsolatedWorkspace(p['workspace_path'], r['workspace_id'])
             managed = {d['path'] for d in await self._list(c, 'document', project)}
+            ignore = Ignore(workspace.work)
             for path in dict.fromkeys([*r['artifacts'], *(delivered or [])]):
                 declared = path in r['artifacts']
-                if reason := unmerged_reason(path):
+                # Shared documents live in the project and are published, not merged.
+                if reason := unmerged_reason(path, None if str(Path(path)) in managed else ignore):
                     raise ValueError(f'{path} cannot be a deliverable: {reason}. List only project files that colleagues '
                                      'and the user will use; nothing was merged, deliver again without it.')
                 # Shared documents are published to the project, not the request snapshot.
@@ -1067,6 +1190,13 @@ class Collaboration(GoalMixin, ConversationRuns, EnvironmentMixin, JournalMixin,
             await asyncio.to_thread(workspace.rebase, changes)
             r['workspace_published'] = True
             r['merged_paths'] = [item['path'] for item in changes]
+            # For the reviewer (review_facts): when it merged and what stayed behind.
+            r['merged_at'] = time.time()
+            r['left_out'] = await asyncio.to_thread(workspace.left_out)
+            r.pop('migration', None)
+            r.pop('check_refusals', None)
+            if checks is not None:
+                r['checks'] = checks
             if skipped:
                 r['unmerged_screenshots'] = skipped
             await self._put(c, 'request', project, identifier, r)
@@ -1081,12 +1211,36 @@ class Collaboration(GoalMixin, ConversationRuns, EnvironmentMixin, JournalMixin,
             from app.execution.processes import processes
             command = await self.migration_for(project, r['merged_paths'])
             if command is None:
-                processes.refresh_after_publish(p['workspace_path'], workspace.work.resolve(), r['merged_paths'])
+                processes.refresh_after_publish(p['workspace_path'], workspace.work.resolve(), r['merged_paths'], identifier)
             else:
                 # The schema changes first; services move to the merged code only after it.
-                self.migrations[(project, identifier)] = processes.background(self._migrate_then_refresh(
-                    project, identifier, p['workspace_path'], workspace.work.resolve(), r['merged_paths'], command,
-                    r.get('conversation') or ''), 'apply the project migration')
+                self.migrations[(project, identifier)] = processes.track_merge(p['workspace_path'], identifier, processes.background(
+                    self._migrate_then_refresh(project, identifier, p['workspace_path'], workspace.work.resolve(), r['merged_paths'],
+                                               command, r.get('conversation') or ''), 'apply the project migration'))
+
+    async def hold_for_acceptance(self, project, identifier, instance_id, pending) -> dict:
+        """A task finished while dependencies it builds on await acceptance: nothing merges
+        and the task is suspended, keeping its snapshot and its context. It resumes once all
+        of them are accepted (claim) and delivers again, so a dependency sent back for
+        rework never has dependents merged on top of the rejected version."""
+        names = ', '.join(f"{d['id']} ({d['recipient']})" for d in pending)
+        async with self.transaction() as c:
+            r = await self._get(c, 'request', project, identifier)
+            if r.get('instance_id') != instance_id or r['state'] != 'running':
+                raise StorageConflictError('Request execution lease is no longer valid')
+            r.update(state='blocked', blocked_reason='awaiting_acceptance', resume=True, lease_owner=None, lease_until=0,
+                     interrupted_reason=(f'{names} accepted; your delivery was held until then. Their accepted files are now '
+                                         'in your snapshot: check your work still fits them, then submit again'))
+            await self._put(c, 'request', project, identifier, r)
+            await self._event(c, project, 'leader', {
+                'type': 'delivery_waiting', 'request_id': identifier, 'waiting_for': [d['id'] for d in pending],
+                'summary': (f"任务 {identifier}（{r['recipient']}）已完成，但它依赖的 {names} 还没有验收，交付暂不合并。"
+                            '验收这些任务后它会自动继续并重新交付；如果要退回它们，它会等返工验收后再继续。')},
+                r['conversation'])
+        return {'state': 'blocked', 'waiting_for': [d['id'] for d in pending],
+                'note': (f'Not merged yet: your task builds on {names}, which the Leader has not accepted '
+                         '(they may still be sent back). Your work is kept and your task resumes in this context once they '
+                         'are accepted; then check it still fits and submit again. Nothing to do now: your turn ends.')}
 
     async def share_merged(self, project, delivered, paths):
         """Bring the files a delivery just merged into the snapshots of tasks running now.
@@ -1119,9 +1273,16 @@ class Collaboration(GoalMixin, ConversationRuns, EnvironmentMixin, JournalMixin,
         from app.execution.processes import processes
         ok = await self.apply_migration(project, identifier, root, work, command, conversation)
         if ok:
-            processes.refresh_after_publish(root, work, paths)
+            processes.refresh_after_publish(root, work, paths, identifier)
         else:
             processes.mark_stale(root, work, paths)
+        try:
+            async with self.transaction() as c:
+                r = await self._get(c, 'request', project, identifier)
+                r['migration'] = {'argv': command['argv'], 'ok': bool(ok)}
+                await self._put(c, 'request', project, identifier, r)
+        except Exception:
+            logger.warning('Could not record the migration outcome', exc_info=True)
         return ok
 
     async def _known_secrets(self, project):
@@ -1142,12 +1303,15 @@ class Collaboration(GoalMixin, ConversationRuns, EnvironmentMixin, JournalMixin,
         if r.get('workspace_id'):
             await asyncio.to_thread(IsolatedWorkspace(p['workspace_path'], r['workspace_id']).sync, list(paths))
 
-    async def mark_conflict(self, project, identifier, detail, instance_id=None):
+    async def mark_conflict(self, project, identifier, error, instance_id=None):
+        """Block a task whose delivery conflicted; the reason comes from the error's type."""
+        basis = isinstance(error, BasisChanged)
+        detail = str(error) + (' ' + json.dumps(error.details, ensure_ascii=False) if basis and error.details else '')
         async with self.transaction() as c:
             r = await self._get(c, 'request', project, identifier)
             if r['state'] not in {'running', 'review'} or (instance_id and r.get('instance_id') != instance_id):
                 return
-            r.update(state='blocked', blocked_reason='basis_changed' if 'Dependency changed:' in detail else 'merge_conflict', result=detail[:2000])
+            r.update(state='blocked', blocked_reason='basis_changed' if basis else 'merge_conflict', result=detail[:2000])
             await self._put(c, 'request', project, identifier, r)
             await self._event(c, project, 'leader', {'type': 'merge_conflict', 'request_id': identifier, 'detail': detail[:1000]}, r['conversation'])
 

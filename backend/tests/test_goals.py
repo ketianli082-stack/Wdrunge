@@ -253,3 +253,44 @@ def test_leader_refreshes_goal_after_context_overflow(tmp_path,monkeypatch):
         assert len(calls)==2
         await store.close()
     asyncio.run(run())
+
+
+def test_the_goal_reminder_changes_with_the_goal_not_with_task_progress(tmp_path):
+    """Blog6: the reminder carried task counts, so each create_task changed it and the
+    Leader's context got a new copy after every one of 14 calls in a single turn."""
+    from langchain_core.messages import HumanMessage
+    from app.collaboration.reminders import goal_messages, with_goal_state
+
+    async def run():
+        store, s, p, c, g = await setup(tmp_path)
+        token = active.set(Context(s, p, 'leader', c, f'leader:{c}'))
+        try:
+            messages = with_goal_state([HumanMessage(content='Finish the goal')], await goal_messages())
+            assert [m.additional_kwargs.get('goal_state') for m in messages] == [None, True]
+            first = await task(s, p, c, g, 'one')
+            await task(s, p, c, g, 'two')
+            job = (await s.claim('owner'))[2]
+            await s.transition(p, first['id'], 'backend', 'review', result='done', expected_instance=job['instance_id'])
+            # Tasks were created, started and delivered: the goal itself did not change.
+            assert with_goal_state(messages, await goal_messages()) == messages
+            assert 'task_counts' not in messages[-1].content and (await s.get_goal(p, g['id'], c))['task_counts'] == {'queued': 1, 'review': 1}
+            await s.update_goal(p, 'leader', c, g['id'], 'paused', 'User asked to wait')
+            changed = with_goal_state(messages, await goal_messages())
+            assert len(changed) == 3 and '"state": "paused"' in changed[-1].content and 'User asked to wait' in changed[-1].content
+        finally:
+            active.reset(token)
+        # An assignee's copy names its own task and is as stable.
+        other = await store.create_conversation(p)
+        goal = await s.create_goal(p, 'leader', other['id'], 'Another', ['x'], 'another', 60)
+        mine = await task(s, p, other['id'], goal, 'mine')
+        running = (await s.claim('owner'))[2]
+        token = active.set(Context(s, p, 'backend', other['id'], 'worker', running['id'], running['instance_id']))
+        try:
+            before = await goal_messages()
+            assert f'"id": "{mine["id"]}"' in before[0].content
+            await task(s, p, other['id'], goal, 'sibling')
+            assert (await goal_messages())[0].content == before[0].content
+        finally:
+            active.reset(token)
+        await store.close()
+    asyncio.run(run())

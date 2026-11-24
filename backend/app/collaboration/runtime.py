@@ -5,6 +5,7 @@ import logging
 import time
 from uuid import uuid4
 from app.storage import StorageConflictError
+from app.collaboration.service import AwaitingAcceptance
 from app.agents.tools._workspace import source_workspace
 from pathlib import Path
 
@@ -144,7 +145,7 @@ class Scheduler:
                 handoff = brief or 'No newer facts were recorded.'
             else:
                 task = request['goal']
-                handoff = (f"Durable request {identifier}. Requirements: {request['based_on']}. Expected artifacts: {request['artifacts']}. "
+                handoff = (f"Durable request {identifier}. Expected artifacts: {request['artifacts']}. "
                            f"Prior result: {request['result']}. Dependencies: {request['dependencies']}. Use collaboration_inspect_request, "
                            'collaboration_transition or collaboration_wait to inspect dependencies, deliver, or wait.'
                            + (f'\n{plan}' if (plan := await self.service.task_brief(project, request)) else '')
@@ -175,9 +176,12 @@ class Scheduler:
         except asyncio.CancelledError:
             outcome, reason = 'cancelled', 'execution stopped'
             raise
+        except AwaitingAcceptance as exc:
+            outcome, reason = 'suspended', str(exc)
+            await self.service.hold_for_acceptance(project, identifier, instance, exc.pending)
         except StorageConflictError as exc:
             outcome, reason = 'conflict', str(exc)
-            await self.service.mark_conflict(project, identifier, str(exc), instance)
+            await self.service.mark_conflict(project, identifier, exc, instance)
         except Exception as exc:
             logger.exception('Collaboration request failed')
             reason = f'{type(exc).__name__}: {exc}'
@@ -216,9 +220,10 @@ class Scheduler:
             if delivered:
                 # Its delivery is merged: kept services move from the task snapshot to the
                 # project root, so colleagues and the user see the project as merged.
-                processes.background(processes.relaunch_delivered(active_workspace.get(), Path(workspace),
-                                                                  before=self.service.migrations.pop((project, identifier), None)),
-                                     'move kept services to the project root')
+                processes.track_merge(workspace, identifier, processes.background(
+                    processes.relaunch_delivered(active_workspace.get(), Path(workspace),
+                                                 before=self.service.migrations.pop((project, identifier), None)),
+                    'move kept services to the project root'))
             self.team.workers[role].total_tokens += worker.total_tokens
             self.team.workers[role].cache_input_tokens += worker.cache_input_tokens
             self.team.workers[role].cached_tokens += worker.cached_tokens

@@ -49,8 +49,11 @@ class Summarizer:
 
 
 def test_tools_declare_their_context_policy():
-    assert policy_of('read_project_file') == policy_of('search_code') == policy_of('execute_command') == RECOMPUTABLE
-    assert policy_of('collaboration_read') == policy_of('collaborate', {'action': 'read'}) == RECOMPUTABLE
+    from app.agents.context_policy import DESK, desk, recomputable
+    assert policy_of('search_code') == policy_of('execute_command') == RECOMPUTABLE
+    # Reads of resources go to the desk; they count as recomputable everywhere else.
+    assert policy_of('read_project_file') == policy_of('collaboration_read') == policy_of('collaborate', {'action': 'read'}) == DESK
+    assert desk('read_project_file') and recomputable('read_project_file') and not desk('search_code')
     assert policy_of('collaboration_publish') == policy_of('collaborate', {'action': 'transition'}) == DURABLE
     assert policy_of('write_project_file') == policy_of('a_tool_nobody_declared') == DURABLE
 
@@ -73,7 +76,7 @@ def test_a_large_result_is_capped_on_entry_and_recoverable(monkeypatch):
 def test_capped_command_output_keeps_head_and_tail_and_json_keeps_its_shape(monkeypatch):
     monkeypatch.setenv('WDRUNGE_RESULT_TOKENS', '800')
     output = 'start\n' + 'noise line\n' * 2000 + 'ERROR: tests failed\n'
-    body = [*turn(('execute_command', {'command': 'npm', 'arguments': ['test']},
+    body = [*turn(('execute_command', {'argv': ['npm', 'test']},
                    {'id': 'p1', 'exit_code': 1, 'output': output}))]
     capped = ingest(body)[0][-1]
     data = json.loads(capped.content)
@@ -134,11 +137,11 @@ def test_durable_results_are_never_cut_mechanically(monkeypatch):
 
 def test_redundant_turns_are_pruned_outside_the_verbatim_tier(monkeypatch):
     monkeypatch.setenv('WDRUNGE_FOLD_VERBATIM_TOKENS', '1000')
-    failing = turn(('execute_command', {'command': 'curl', 'arguments': ['http://x']}, {'error': 'refused', 'exit_code': 7}))
+    failing = turn(('execute_command', {'argv': ['curl', 'http://x']}, {'error': 'refused', 'exit_code': 7}))
     same = turn(('collaboration_check_delivery', {}, {'findings': []}))
     repeated = turn(('collaboration_check_delivery', {}, {'findings': []}))
     thinking = turn(read('a.py', 'a' * 100), text='The service is down; retrying.')
-    ok = turn(('execute_command', {'command': 'curl', 'arguments': ['http://x']}, {'exit_code': 0, 'output': 'hi'}))
+    ok = turn(('execute_command', {'argv': ['curl', 'http://x']}, {'exit_code': 0, 'output': 'hi'}))
     goal = HumanMessage(content='goal v1', id='goal-1', additional_kwargs={'goal_state': True})
     body = [HumanMessage(content='task', id='task'), goal, *failing, *same, *thinking, *repeated, *ok,
             HumanMessage(content='goal v2', id='goal-2', additional_kwargs={'goal_state': True}),
@@ -158,7 +161,7 @@ def test_tiers_count_per_result_so_one_large_turn_does_not_flatten_history(monke
     monkeypatch.setenv('WDRUNGE_FOLD_VERBATIM_TOKENS', '10000')
     monkeypatch.setenv('WDRUNGE_FOLD_EXCERPT_TOKENS', '15000')
     monkeypatch.setenv('WDRUNGE_RESULT_TOKENS', '4000')
-    older = [m for i in range(3) for m in turn(read(f'old{i}.py', 'o' * 2000))]
+    older = [m for i in range(3) for m in turn(('search_code', {'query': f'old{i}'}, 'o' * 2000))]
     large = turn(*[read(f'big{i}.md', 'b' * 7000) for i in range(4)])  # ~14K counted, more than the verbatim tier
     body = [HumanMessage(content='task', id='task'), *older, *large, *turn(read('now.py', 'x' * 2000))]
     folded = by_id(fold(body))
@@ -201,7 +204,7 @@ def test_work_segments_end_at_durable_changes(monkeypatch):
     monkeypatch.setenv('WDRUNGE_FOLD_VERBATIM_TOKENS', '2000')
     reads = [m for i in range(3) for m in turn(read(f'docs/s{i}.md', 's' * 1500))]
     write = turn(('write_project_file', {'path': 'src/a.py', 'content': 'a' * 3000}, 'Wrote src/a.py (3000 characters; sha256=ab).'))
-    broken = turn(('execute_command', {'command': 'npm', 'arguments': ['build']}, {'error': 'build failed', 'exit_code': 1, 'output': 'e' * 3000}))
+    broken = turn(('execute_command', {'argv': ['npm', 'build']}, {'error': 'build failed', 'exit_code': 1, 'output': 'e' * 3000}))
     publish = turn(('collaboration_publish', {'changes': []}, {'revisions': [{'document_id': 'd', 'version': 1}]}))
     body = [HumanMessage(content='task', id='task'), *reads, *write, *broken, *publish,
             *[m for i in range(3) for m in turn(read(f'now{i}.py', 'n' * 1500))]]

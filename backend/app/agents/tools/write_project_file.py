@@ -1,5 +1,6 @@
 """Create, replace, or atomically edit text within a role's assigned directories."""
 
+import re
 from pathlib import Path
 
 from app.agents.tools.validation import tool
@@ -10,13 +11,13 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 class TextEdit(BaseModel):
-    model_config = ConfigDict(strict=True, extra='forbid')
+    model_config = ConfigDict(extra='forbid')
     old_text: str = Field(min_length=1)
     new_text: str
 
 
 class FileWrite(BaseModel):
-    model_config = ConfigDict(strict=True, extra='forbid')
+    model_config = ConfigDict(extra='forbid')
     path: str = Field(min_length=1)
     content: str | None = Field(default=None, max_length=100000)
     edits: list[TextEdit] | None = Field(default=None, min_length=1, max_length=100,
@@ -30,8 +31,14 @@ class FileWrite(BaseModel):
         return self
 
 
+def write_view(result: str, arguments: dict) -> str:
+    """The receipt without the 64-character hash (Blog5: 2 of 195 writes used
+    expected_hash; read_project_file(include_hash=true) returns it when needed)."""
+    return re.sub(r'\A(Wrote .+? \(\d+ characters); sha256=\w+\)', r'\1)', result, count=1) if isinstance(result, str) else result
+
+
 def make_write_project_file(allowed_roots: tuple[str, ...]):
-    @tool("write_project_file", args_schema=FileWrite)
+    @tool("write_project_file", args_schema=FileWrite, model_view=write_view)
     def write_project_file(path: str, content: str | None = None, edits: list[TextEdit] | None = None, expected_hash: str | None = None) -> str:
         """Create a file with content, or atomically edit an existing one with
         edits [{old_text, new_text}] (each old_text matches once). One mode only;

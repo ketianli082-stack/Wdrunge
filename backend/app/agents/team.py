@@ -16,10 +16,11 @@ from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, System
 from pydantic import ValidationError
 
 from app.agents.memory import ContextMemory, reminder, is_context_overflow
+from app.agents.context_meter import calibrate
 from app.agents.base import AgentSpec, AgentStatus
 from app.collaboration.tools import Context, active, collaborate, COLLABORATION_TOOLS, collaboration_action, model_collaboration_tools
 from app.collaboration.context import encode_handoff, coordination_update
-from app.agents.leader import LeaderAgent
+from app.agents.leader import LEADER_READ_LIMIT, LeaderAgent, PROJECT_READ_TOOLS
 from app.agents.identity import member_name
 from app.agents.worker import WorkerAgent
 from app.agents.tools.current_utc_time import current_utc_time
@@ -38,7 +39,8 @@ from app.agents.tools._workspace import active_workspace, workspace_root
 from app.agents.tools.development import development_tools
 from app.agents.tools.file_management import make_file_management
 from app.agents.tools.browser_verify import browser_verify
-from app.agents.tools.validation import exception_result, validation_failure, failure_result, normalize_failure, folded_call_failure
+from app.agents.tools.validation import exception_result, validation_failure, failure_result, normalize_failure, folded_call_failure, model_result
+from app.agents.tools.arguments import call_problem, normalize_arguments, problem_failure, screen_response, with_notice
 
 if TYPE_CHECKING:
     from langgraph.checkpoint.base import BaseCheckpointSaver
@@ -49,35 +51,30 @@ ROLE_CONFIG = {
     "product": {
         "name": member_name("product"),
         "prompt": "product.md",
-        "skills": ("requirements.md",),
         "read": ("docs", "README.md", "backend/openapi.json"),
         "write": ("docs/product",),
     },
     "backend": {
         "name": member_name("backend"),
         "prompt": "backend.md",
-        "skills": ("api_contract.md",),
         "read": ("docs", "backend/app", "backend/pyproject.toml", "backend/tests"),
         "write": ("backend/app", "docs/backend"),
     },
     "designer": {
         "name": member_name("designer"),
         "prompt": "designer.md",
-        "skills": ("visual_design.md",),
         "read": ("docs", "frontend/src", "frontend/public"),
         "write": ("frontend/public", "docs/design"),
     },
     "frontend": {
         "name": member_name("frontend"),
         "prompt": "frontend.md",
-        "skills": ("api_contract.md",),
         "read": ("docs", "frontend/src", "frontend/public", "backend/openapi.json"),
         "write": ("frontend/src", "docs/frontend"),
     },
     "testing": {
         "name": member_name("testing"),
         "prompt": "testing.md",
-        "skills": ("test_strategy.md",),
         "read": ("docs", "backend/app", "backend/tests", "frontend/src", "backend/openapi.json"),
         "write": ("backend/tests", "frontend/tests", "docs/testing"),
     },
@@ -144,10 +141,9 @@ class Team:
                     name=config["name"],
                     prompt_file=config["prompt"],
                     tools=tools,
-                    skills=config["skills"],
                 )
             )
-            worker.system_prompt()  # Validate prompt and skill files during startup.
+            worker.system_prompt()  # Validate prompt files during startup.
             self.workers[role] = worker
         self.leader.system_prompt()
         self._lock = asyncio.Lock()
@@ -355,8 +351,13 @@ class Team:
 
         from app.collaboration.reminders import goal_messages, with_goal_state
 
+        # Per call of this turn: the whole result (the model is shown a view of it), what
+        # was done to its arguments, and the notice to put in front of its result.
+        full_results, call_notes, notices = {}, {}, {}
+
         async def record_tool_results(current):
-            # Raw results, before context folding may shorten them.
+            # The call as sent and the whole result, before the model's view of it is cut
+            # down and before context folding may shorten it.
             if not self._store:
                 return
             calls = {call['id']: call for m in current if isinstance(m, AIMessage) for call in m.tool_calls if call.get('id')}
@@ -366,13 +367,23 @@ class Team:
                     call = calls[m.tool_call_id]
                     rows.append({'id': m.tool_call_id, 'tool': call['name'], 'status': 'error' if m.status == 'error' else 'success',
                                  'arguments': json.dumps(call.get('args', {}), ensure_ascii=False, default=str),
-                                 'result': m.content if isinstance(m.content, str) else json.dumps(m.content, ensure_ascii=False, default=str)})
+                                 'notes': call_notes.get(m.tool_call_id),
+                                 'result': full_results.get(m.tool_call_id) or (m.content if isinstance(m.content, str) else json.dumps(m.content, ensure_ascii=False, default=str))})
             try:
                 await self._store.record_tool_calls(conversation_id, 'leader', rows)
             except Exception:
                 logger.warning('Could not record Leader tool calls', exc_info=True)
 
+        def with_notices(current):
+            """Tell the model which arguments of its calls were ignored, in front of their results."""
+            if not notices:
+                return current
+            shown = [m.model_copy(update={'content': with_notice(m.content, notices.pop(m.tool_call_id))})
+                     if isinstance(m, ToolMessage) and m.tool_call_id in notices else m for m in current]
+            return shown
+
         async def invoke(current, *, allow_delegation):
+            current = with_notices(current)
             await record_tool_results(current)
             # The goal reminder is stored once per change (after compaction, which drops
             # reminders) instead of being appended to every call.
@@ -386,7 +397,12 @@ class Team:
                 current = with_goal_state(await prepare(current, force_clean=True), await goal_messages())
                 self.leader_contexts[conversation_id] = current
                 response = await self.leader.next_message(current, allow_delegation=allow_delegation)
-            return current, response
+            calibrate(current, response, memory.schema_tokens)
+            # Unparsable or truncated calls stay answerable (app.agents.tools.arguments).
+            return current, screen_response(response)
+
+        from app.collaboration.tools import enable_tools
+        leader_tools = {t.name: t for t in (*self.leader.executable_tools(), enable_tools, collaborate)}
 
         count = 0
 
@@ -450,9 +466,25 @@ class Team:
             for call in response.tool_calls:
                 call_id = call.get("id") or f"delegation-{count + 1}"
                 tool_name = call.get("name")
+                if problem := call_problem(response, call.get('id')):
+                    call_notes[call_id] = {'problem': problem['kind']}
+                    messages.append(ToolMessage(content=json.dumps(problem_failure(problem, tool_name), ensure_ascii=False),
+                                                tool_call_id=call_id, status='error'))
+                    continue
                 if failure := folded_call_failure(call.get('args')):
                     messages.append(ToolMessage(content=json.dumps(failure, ensure_ascii=False), tool_call_id=call_id, status='error'))
                     continue
+                # Undeclared arguments are dropped (and reported), JSON-encoded arrays decoded.
+                normalized = normalize_arguments(leader_tools.get(tool_name), call.get('args'))
+                repairs = response.additional_kwargs.get('call_repairs', {}).get(call.get('id'))
+                if notes := {**(normalized.notes() or {}), **({'syntax': repairs} if repairs else {})}:
+                    call_notes[call_id] = notes
+                if normalized.failure:
+                    messages.append(ToolMessage(content=json.dumps(normalized.failure, ensure_ascii=False), tool_call_id=call_id, status='error'))
+                    continue
+                if notice := normalized.notice(tool_name):
+                    notices[call_id] = notice
+                call = {**call, 'args': normalized.args}
                 if (tool_name == 'collaborate' or tool_name in COLLABORATION_TOOLS) and active.get():
                     from app.agents.worker import COLLABORATION_LABELS
                     action = collaboration_action(tool_name, call.get('args', {}))
@@ -466,8 +498,10 @@ class Team:
                         result = exception_result(exc, tool_name=tool_name)
                     result = normalize_failure(result, tool_name=tool_name)
                     yield 'activity', {**activity, 'phase': 'failed' if isinstance(result, dict) and result.get('error') else 'completed'}
-                    messages.append(ToolMessage(content=json.dumps(result, ensure_ascii=False), tool_call_id=call_id,
-                                                status='error' if result.get('error') else 'success'))
+                    # The log keeps the whole result; the model gets the fields it can use.
+                    full_results[call_id] = json.dumps(result, ensure_ascii=False)
+                    messages.append(ToolMessage(content=model_result(tool_name, call.get('args', {}), full_results[call_id]),
+                                                tool_call_id=call_id, status='error' if result.get('error') else 'success'))
                     continue
                 if tool_name == "checkpoint_context":
                     if len(response.tool_calls) != 1:
@@ -524,6 +558,22 @@ class Team:
                         content, status = json.dumps(exception_result(exc, tool_name=tool_name), ensure_ascii=False), 'error'
                     yield 'activity', {**activity, 'phase': 'failed' if status == 'error' else 'completed'}
                     messages.append(ToolMessage(content=content, tool_call_id=call_id, status=status))
+                    continue
+                if tool_name in PROJECT_READ_TOOLS:
+                    activity = {'id': uuid4().hex, 'agent': 'leader', 'tool': tool_name, 'description': '核实项目里的文件'}
+                    yield 'activity', {**activity, 'phase': 'running'}
+                    try:
+                        args = dict(call.get('args', {}))
+                        if tool_name == 'read_project_file':
+                            args['limit'] = min(int(args.get('limit') or LEADER_READ_LIMIT), LEADER_READ_LIMIT)
+                        result = await PROJECT_READ_TOOLS[tool_name].ainvoke(args)
+                        content, status = result if isinstance(result, str) else json.dumps(result, ensure_ascii=False), 'success'
+                        if isinstance(result, dict) and result.get('error'):
+                            status = 'error'
+                    except Exception as exc:
+                        content, status = json.dumps(exception_result(exc, tool_name=tool_name), ensure_ascii=False), 'error'
+                    yield 'activity', {**activity, 'phase': 'failed' if status == 'error' else 'completed'}
+                    messages.append(ToolMessage(content=content[:LEADER_READ_LIMIT * 2], tool_call_id=call_id, status=status))
                     continue
                 if tool_name not in {"delegate_task", "delegate_tasks"}:
                     messages.append(ToolMessage(content="Unknown tool call", tool_call_id=call_id))

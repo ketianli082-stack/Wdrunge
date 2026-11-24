@@ -50,6 +50,8 @@ def response_usage(response) -> dict:
         'model': (metadata.get('model_name') or metadata.get('model')) if isinstance(metadata, dict) else None,
         'latency_ms': metadata.get('wdrunge_latency_ms') if isinstance(metadata, dict) else None,
         'retries': metadata.get('wdrunge_retries') if isinstance(metadata, dict) else None,
+        # What the failed attempts of this call were (app.agents.resilience).
+        'retry_errors': metadata.get('wdrunge_retry_errors') if isinstance(metadata, dict) else None,
     }
 
 
@@ -65,5 +67,5 @@ async def record_call(store, agent_id: str, response, purpose: str) -> None:
         return
     cached = usage['cached_tokens'] if isinstance(usage['cached_tokens'], int) else None
     await store.record_agent_usage(agent_id, usage['total_tokens'], usage['input_tokens'] or 0, cached,
-                                   purpose=purpose, **{k: usage[k] for k in ('output_tokens', 'reasoning_tokens', 'model', 'latency_ms', 'retries')},
+                                   purpose=purpose, **{k: usage[k] for k in ('output_tokens', 'reasoning_tokens', 'model', 'latency_ms', 'retries', 'retry_errors')},
                                    **current_scope())
