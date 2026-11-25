@@ -2,7 +2,7 @@
 
 | Item | Required action |
 | --- | --- |
-| Group number and full member names | Confirm against the final report and update root README. |
+| Group number | Confirm against the final report and update root README. |
 | Reliability evidence | Add the original wdrunge-reliability-evidence.txt to evaluation/traces/; match commands and outcomes to report. |
 | Final live cases | Add exact ordinary and changed-request inputs, actual model settings, results and redacted success/failure traces. October reports are historical. |
 | Evaluation results | Add report-aligned metrics, comparison conditions and human acceptance criteria. |
