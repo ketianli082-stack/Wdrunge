@@ -2,7 +2,13 @@
 
 COMP7608B Final Project | 2026–2027 | Version 0.1.0
 
-Group number and member names: see [outstanding submission items](MISSING_ITEMS.md) (pending confirmation).
+## Team members
+
+- Lujia Zhang
+- Jiayi Zhou
+- Ketian Li
+
+Group number: pending confirmation (see [outstanding submission items](MISSING_ITEMS.md)).
 
 Wdrunge develops and revises local websites from natural-language requests. A Leader coordinates Product, Designer, Frontend, Backend and Testing agents using task dependencies, shared artifacts, role-scoped tools, persistent context and delivery checks. Users can inspect team activity, preview the website and submit element or region annotations.
 
