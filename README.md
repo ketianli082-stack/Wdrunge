@@ -136,3 +136,4 @@ Do not commit API keys, .env, generated credentials, private databases or unreda
 
 See [VERSION.txt](VERSION.txt), [integration notes](docs/final-integration.md), [frontend README](frontend/README.md), and [changes](CHANGELOG.md). Source revision is identified by the archive's commit SHA. Package the complete tracked source as a ZIP, with the report PDF submitted separately.
 
+<sub>Source: [GitHub](https://github.com/yefenghua/Wdrunge/tree/main)</sub>
