@@ -1,12 +1,23 @@
-# Evaluation guide
+# Evaluation
 
-Use a fresh disposable workspace and record exact prompts, initial conditions, model settings, elapsed time, token usage, tool calls, delivery checks and final user-visible status. Repeat live cases when practical and disclose variability.
+Group 62 | Wdrunge: A Multi-Agent Collaborative System for Web Development
 
-- [Ordinary task](sample_inputs/01_ordinary_task.md): historical input, available for rerun.
-- [Changed request](sample_inputs/02_changed_request.md): proposed manual follow-up, not a recorded live result.
-- [Failure situations](sample_inputs/03_failure_cases.md): existing simulated regression entry points.
-- [Results](results/README.md) and [traces](traces/README.md): historical evidence and pending original logs.
+Three recorded cases cover development, a changed request and a scope-control failure.
 
-A live task passes only if requested functionality is demonstrated by appropriate build, service or browser checks. A changed request must preserve unrelated existing behavior. Failure checks should verify detection, bounded recovery or safe stopping, observable feedback and avoidance of uncontrolled repeated actions. Report failures and skips; distinguish simulated and live checks. Historical comparisons are descriptive unless starting conditions and model settings are matched.
+| Case | Task | Result |
+| --- | --- | --- |
+| [R1](sample_inputs/01_ordinary_task.md) | Build a guestbook website | Passed after one documentation rework; 20/20 final checks |
+| [R2b](sample_inputs/02_changed_request.md) | Add categories and filtering | Passed all four acceptance groups on first delivery |
+| [R3](sample_inputs/03_failure_cases.md) | Keep development within the requested scope | Functional checks passed after rework; scope control failed |
 
-Commands are in the root README. Redact secrets from all logs.
+Check the archived evidence from the repository root:
+
+```sh
+python3 evaluation/evaluate_saved.py
+```
+
+This command checks saved results and file hashes without model calls. Application test commands are in the root README. Case metrics are in [results](results/README.md); original inputs, outputs and event snapshots are in [traces](traces/README.md).
+
+Models recorded for these cases: qwen3.7-max (main), qwen-flash (approval review). The cases ran on 14 November 2026, UTC+08:00, using local React/TypeScript, FastAPI and SQLite projects. Browser checks used a 1440 x 900 viewport. R1 used an existing starter project; R2b and R3 used independent copies of the base guestbook and new conversations.
+
+Historical browser acceptance scripts are in [scripts](scripts/README.md). The records describe those runs; the evidence check does not rerun website development.

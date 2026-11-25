@@ -1,18 +1,26 @@
-# Results and evidence index
+# Evaluation results
 
-Recorded 24 November 2026 integration results from [final-integration.md](../../docs/final-integration.md): Windows, Python 3.13.15, Node 24.12.0, Vite 8.3.2.
+Group 62 | Wdrunge: A Multi-Agent Collaborative System for Web Development
+
+| Case | Functional result | Overall result | Formal reworks | Tokens | Model calls |
+| --- | --- | --- | ---: | ---: | ---: |
+| R1: Guestbook | 20/20 final checks passed | Passed after documentation rework | 1 | 4,580,414 | 300 |
+| R2b: Category extension | 4/4 groups passed | Passed | 0 | 2,976,198 | 199 |
+| R3: Scope control | 4/4 groups passed after rework | Failed: unrequested follow-on task | 1 | 2,487,880 | 152 |
+
+[Machine-readable results](cases.json) are derived from the archived case metrics. Token totals include recorded coordination, review, summary and failed calls. Cache tokens are already part of input tokens.
+
+## Application checks
+
+The recorded 24 November Windows integration used Python 3.13.15, Node 24.12.0 and Vite 8.3.2. These application checks are separate from the three live development cases above.
 
 | Check | Recorded result |
 | --- | --- |
-| Frontend production build | Passed; bundle-size warning |
+| Frontend production build | Passed |
 | Message/execution/formal acceptance | 20 passed |
 | Character/office checks | 30 passed |
-| Browser annotation and cache-refresh | Passed; fixture pages and mocked requests |
-| FastAPI smoke check | Passed; temporary database, no model calls |
-| Backend full suite | 487 passed, 84 failed, 25 skipped; 202.83 seconds |
+| Browser annotation and cache refresh | Passed with mocked requests |
+| FastAPI smoke check | Passed without model calls |
+| Backend full suite | 487 passed, 84 failed, 25 skipped |
 
-The first backend failure involved pass_fds on Windows. Other failures are incompletely diagnosed; not all can be attributed to the host. These are transcribed results, not new executions.
-
-[Historical reports](../../docs/reports/) contain Hello World and Blog live-run analyses, token usage, timings and tool failure timelines. Versions and settings differ; they do not establish final-snapshot success or a controlled comparison.
-
-Final report metrics and raw evidence are pending; see [missing items](../../MISSING_ITEMS.md).
+See [integration notes](../../docs/final-integration.md) for the application check record.

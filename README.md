@@ -1,6 +1,6 @@
-# Wdrunge — Autonomous Web Development Agent Team
+# Wdrunge: A Multi-Agent Collaborative System for Web Development
 
-COMP7608B Final Project | 2026–2027 | Version 0.1.0
+Group 62 | COMP7608B Final Project | 2026–2027 | Version 0.1.0
 
 ## Team members
 
@@ -8,7 +8,7 @@ COMP7608B Final Project | 2026–2027 | Version 0.1.0
 - Jiayi Zhou
 - Ketian Li
 
-Group number: pending confirmation (see [outstanding submission items](MISSING_ITEMS.md)).
+Group number: 62.
 
 Wdrunge develops and revises local websites from natural-language requests. A Leader coordinates Product, Designer, Frontend, Backend and Testing agents using task dependencies, shared artifacts, role-scoped tools, persistent context and delivery checks. Users can inspect team activity, preview the website and submit element or region annotations.
 
@@ -95,7 +95,15 @@ node scripts/visual-feedback.test.mjs
 node scripts/preview-refresh.test.mjs
 ```
 
-See [evaluation guide](evaluation/README.md) for sample inputs and evidence. The recorded 24 November Windows integration reported 487 passed, 84 failed, 25 skipped in the backend suite. Frontend build, message/character tests, browser fixture tests and a temporary-database API smoke check passed. Browser fixtures mock backend/model calls. Native execution and a fresh setup on the final snapshot remain unverified.
+See [evaluation guide](evaluation/README.md) for three recorded cases: R1 guestbook development, R2b category/filtering extension, and original R3 scope-control failure. Check their saved results and evidence hashes from the repository root:
+
+```sh
+python3 evaluation/evaluate_saved.py
+```
+
+The evidence check makes no model calls. Case metrics, original inputs, acceptance logs and screenshots are included under evaluation/. Recorded live cases are separate from application regression checks.
+
+ The recorded 24 November Windows integration reported 487 passed, 84 failed, 25 skipped in the backend suite. Frontend build, message/character tests, browser fixture tests and a temporary-database API smoke check passed. Browser fixtures mock backend/model calls. Native execution and a fresh setup on the final snapshot remain unverified.
 
 ## Repository layout
 
@@ -114,3 +122,4 @@ Do not commit API keys, .env, generated credentials, private databases or unreda
 ## Submission and version
 
 See [VERSION.txt](VERSION.txt), [integration notes](docs/final-integration.md), [frontend README](frontend/README.md), [changes](CHANGELOG.md) and [missing items](MISSING_ITEMS.md). Source revision is identified by the archive's commit SHA. Package the complete tracked source as a ZIP, with the report PDF submitted separately.
+

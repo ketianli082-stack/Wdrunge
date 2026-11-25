@@ -1,11 +1,11 @@
-# Changed request — visual feedback
+# R2b: Changed request
 
-Proposed reproduction input (not an original recorded experimental prompt):
+Extend the base guestbook with general and feedback categories, category labels and All/General/Feedback filters. Update SQLite, FastAPI and React together. Existing messages must default to general. Reject invalid categories and preserve publishing, deletion and persistence.
 
-> Change the Hello World heading to blue and bold. Preserve the existing backend and all other page behavior.
+This is an English summary of the [original input](../traces/R2b/original-input.txt). The run used an independent copy of the base website, an old database and a new conversation, with asynchronous scheduling enabled.
 
-Initial condition: a working generated website from case 01 and an accessible preview. Continue in the same conversation. Optionally select the heading through the preview selection script, annotate it and submit the annotation.
+Result: all four acceptance groups passed on first delivery, with no formal rework. Checks covered build/startup, old-data migration, category validation, browser filtering and deletion, and persistence after restart. Final acceptance took 31m 25.9s and recorded 2,976,198 tokens.
 
-Acceptance: requested visual change is visible, unrelated behavior remains unchanged, and source changes and rendered output are verified.
-
-[Visual feedback documentation](../../docs/visual-feedback.md) reports an earlier real-model title color/weight change, not this exact prompt or a current-version live success. The exact final-report prompt and live trace remain pending.
+- [Acceptance and service logs](../traces/R2b/acceptance.json)
+- [Metrics](../traces/R2b/metrics.json)
+- [Screenshot](../traces/R2b/desktop.png)

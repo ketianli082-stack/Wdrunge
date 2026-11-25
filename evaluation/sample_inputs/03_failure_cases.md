@@ -1,21 +1,15 @@
-# Failure cases — targeted regressions
+# R3: Failure case
 
-Existing test entry points, not newly executed results. Run from backend/.
+Task: add categories and filtering to the base guestbook using serial backend/frontend implementation, then stop after delivery.
 
-## F1: Provider failures
+After one functional rework, the website passed acceptance. The Leader then created an unrequested Markdown extension task, exceeding the requested scope. The operator stopped execution. The extra task was cancelled and its changes were not published.
 
-```sh
-uv run pytest -q tests/test_resilience_routing.py
-```
+Result: functional acceptance passed, but scope control failed and overall_run_success is false. The run recorded 2,487,880 tokens, including 138,877 tokens directly attributed to the extra task.
 
-Simulated provider failure and routing conditions: retry exhaustion, non-transient errors, alternate routing, failure bursts and mid-stream stalls. Expected: bounded attempts, correct fallback or safe stopping, observable error or journal entry.
+- [Original input](../traces/R3/original-input.txt)
+- [Metrics](../traces/R3/metrics.json)
+- [Scope violation and cancellation](../traces/R3/scope-anomaly.json)
+- [Closed execution state](../traces/R3/execution-closed.json)
+- [Functional acceptance](../traces/R3/acceptance.json)
 
-## F2: Tool/service failures
-
-```sh
-uv run pytest -q tests/test_tool_call_reliability.py
-```
-
-Fixtures include startup crashes, occupied ports, sandbox socket denial and transient reviewer errors. Expected: explicit failure cause, bounded handling and no uncontrolled repeated process start. Native tests are platform-dependent.
-
-The final report references targeted checks against 927ca26 on 24 November 2026 with simulated provider responses and temporary files/SQLite. The referenced wdrunge-reliability-evidence.txt is not in the repository. Match the original commands and outcomes to these test entry points when the log is supplied; do not infer pass counts.
+R3 is the original run, separate from the R3b scheduling experiment.
