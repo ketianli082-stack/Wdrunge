@@ -25,31 +25,11 @@ Resolved dependencies: backend/uv.lock, frontend/package-lock.json, frontend/src
 
 Install the prerequisites above before starting. Both platforms use the same model configuration and application ports.
 
-### Windows (PowerShell)
+### Backend
 
-Backend (from the repository root):
+From the repository root:
 
-```powershell
-cd backend
-Copy-Item .env.example .env
-# Set DASHSCOPE_API_KEY in .env before starting.
-uv sync
-uv run uvicorn app.main:app --host 127.0.0.1 --port 17420
-```
-
-Frontend (in a second PowerShell window, from the repository root):
-
-```powershell
-cd frontend
-npm install
-npm run dev
-```
-
-### macOS (Terminal)
-
-Backend (from the repository root):
-
-```bash
+```sh
 cd backend
 cp .env.example .env
 # Set DASHSCOPE_API_KEY in .env before starting.
@@ -57,9 +37,13 @@ uv sync
 uv run uvicorn app.main:app --host 127.0.0.1 --port 17420
 ```
 
-Frontend (in a second terminal, from the repository root):
+On Windows PowerShell, use `Copy-Item .env.example .env` instead of `cp .env.example .env`.
 
-```bash
+### Frontend
+
+In a second terminal, from the repository root:
+
+```sh
 cd frontend
 npm install
 npm run dev
