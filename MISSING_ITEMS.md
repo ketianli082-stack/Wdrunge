@@ -6,7 +6,7 @@
 | Reliability evidence | Add the original wdrunge-reliability-evidence.txt to evaluation/traces/; match commands and outcomes to report. |
 | Final live cases | Add exact ordinary and changed-request inputs, actual model settings, results and redacted success/failure traces. October reports are historical. |
 | Evaluation results | Add report-aligned metrics, comparison conditions and human acceptance criteria. |
-| AI use | Complete team AI-use declaration and add actual development/report prompts; disclose unavailable records. |
+| Original AI prompt records | Team declaration and representative reconstructed prompts are supplied; add any recoverable original prompts and exact model versions where available. |
 | Attribution | Confirm third-party code, assets and data attribution and team contributions. |
 | Fresh installation | Verify setup, startup, health, build and tests from README on a supported host. |
 | Backend failures | Investigate or disclose the 84 recorded Windows test failures and remaining skips. |
